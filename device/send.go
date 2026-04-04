@@ -375,7 +375,7 @@ top:
 					if len(elem.packet) == 0 {
 						continue // keepalive — no FEC encoding
 					}
-					packets := peer.device.bondMgr.ProcessOutbound(elem.packet, elem.nonce)
+					packets := peer.device.bondMgr.ProcessOutbound(peer.bondPeerID, elem.packet, elem.nonce)
 					if len(packets) > 0 {
 						// First packet is data with FEC header — update element in-place
 						copy(elem.buffer[MessageTransportHeaderSize:], packets[0])

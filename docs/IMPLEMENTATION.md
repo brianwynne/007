@@ -107,9 +107,11 @@ FEC header:
 6. FEC-recovered packets get new message buffers, tracked and freed after TUN write
 
 **Device** (`device/device.go`):
-- `bondManager` interface with `ProcessOutbound`/`ProcessInbound` methods
+- `bondManager` interface with `ProcessOutbound(peerID, ...)`/`ProcessInbound(peerID, ...)` methods
 - `SetBondManager()` — must be called before device is brought up
 - Interface type avoids circular imports between `device` and `bond` packages
+- `nextBondPeerID` atomic counter assigns unique IDs to peers
+- Each peer carries `bondPeerID` (assigned in `NewPeer`) for per-peer FEC isolation
 
 ---
 
@@ -169,7 +171,7 @@ FEC header:
 - [ ] Management API
 
 ## Design Constraints
-- **Single-peer mode**: FEC encoder state is per-device. Multi-peer deployments would interleave packets from different peers in the same FEC block. 007 is designed for dedicated single-peer tunnels.
+- **Per-peer FEC state**: Each peer gets its own FEC encoder/decoder via `peerID`. Multiple devices (e.g. field SIP Reporters) connecting to a single 007 server each have isolated FEC blocks — packets from different peers are never mixed.
 - **Both ends must run 007**: FEC header prepended to all data packets makes them incompatible with standard WireGuard receivers. No negotiation/fallback.
 - **MTU consideration**: FEC adds 5 bytes to data packets and up to 10 bytes to parity packets. With default WireGuard MTU of 1420, parity packets are at the Ethernet fragmentation boundary. Recommend MTU 1412 when FEC is enabled.
 - **Traffic separation**: Only traffic routed to the WireGuard TUN interface enters the bond tunnel. Other system traffic uses normal interfaces. Application binds to tunnel IP or uses policy routing.

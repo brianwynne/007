@@ -28,6 +28,10 @@
 //	  → [REORDER + FEC DECODE HERE] ← bond intercepts before TUN write
 //	  → device.tun.device.Write()
 //
+// FEC state is per-peer: each peer gets its own encoder/decoder so packets
+// from different peers are never mixed in the same FEC block. The peerID
+// parameter in ProcessOutbound/ProcessInbound identifies the peer.
+//
 // The bond manager does NOT modify the encryption or handshake — those
 // remain standard WireGuard. Bond operates on cleartext packets (send side)
 // and decrypted packets (receive side).
@@ -43,13 +47,13 @@ import (
 // Config holds bond configuration.
 type Config struct {
 	// FEC
-	FECEnabled bool // enable forward error correction
+	FECEnabled  bool // enable forward error correction
 	FECAdaptive bool // dynamically adjust FEC ratio
 
 	// Reorder
-	ReorderEnabled  bool          // enable reorder buffer
-	ReorderWindowMs int           // max reorder window (milliseconds)
-	ReorderMinMs    int           // minimum window (milliseconds)
+	ReorderEnabled  bool // enable reorder buffer
+	ReorderWindowMs int  // max reorder window (milliseconds)
+	ReorderMinMs    int  // minimum window (milliseconds)
 
 	// General
 	Enabled bool // master enable for bonding features
@@ -67,25 +71,31 @@ func DefaultConfig() Config {
 	}
 }
 
+// peerState holds per-peer FEC encoder/decoder state.
+type peerState struct {
+	encoder *FECEncoder
+	decoder *FECDecoder
+}
+
 // Manager coordinates FEC encoding/decoding and packet reordering.
 // It sits between wireguard-go's TUN interface and crypto layer.
 type Manager struct {
 	mu     sync.RWMutex
 	config Config
 
-	// FEC
-	encoder *FECEncoder
-	decoder *FECDecoder
+	// Per-peer FEC state
+	peers   map[uint32]*peerState
+	peersMu sync.Mutex
 
-	// Reorder
+	// Reorder (global for now — will be per-peer when wired in)
 	reorderBuf *ReorderBuffer
 
 	// Stats
-	txPackets     atomic.Uint64
-	rxPackets     atomic.Uint64
-	fecRecovered  atomic.Uint64
-	fecFailed     atomic.Uint64
-	reorderGaps   atomic.Uint64
+	txPackets    atomic.Uint64
+	rxPackets    atomic.Uint64
+	fecRecovered atomic.Uint64
+	fecFailed    atomic.Uint64
+	reorderGaps  atomic.Uint64
 
 	// Lifecycle
 	running atomic.Bool
@@ -99,17 +109,9 @@ type Manager struct {
 func NewManager(cfg Config, logger *log.Logger) (*Manager, error) {
 	m := &Manager{
 		config: cfg,
+		peers:  make(map[uint32]*peerState),
 		stopCh: make(chan struct{}),
 		logger: logger,
-	}
-
-	if cfg.FECEnabled {
-		enc, err := NewFECEncoder()
-		if err != nil {
-			return nil, err
-		}
-		m.encoder = enc
-		m.decoder = NewFECDecoder()
 	}
 
 	if cfg.ReorderEnabled {
@@ -117,6 +119,30 @@ func NewManager(cfg Config, logger *log.Logger) (*Manager, error) {
 	}
 
 	return m, nil
+}
+
+// getPeerState returns the FEC state for a peer, creating it if needed.
+func (m *Manager) getPeerState(peerID uint32) *peerState {
+	m.peersMu.Lock()
+	defer m.peersMu.Unlock()
+
+	ps, exists := m.peers[peerID]
+	if !exists {
+		ps = &peerState{}
+		if m.config.FECEnabled {
+			enc, err := NewFECEncoder()
+			if err != nil {
+				if m.logger != nil {
+					m.logger.Printf("007 Bond: failed to create FEC encoder for peer %d: %v", peerID, err)
+				}
+				return ps
+			}
+			ps.encoder = enc
+			ps.decoder = NewFECDecoder()
+		}
+		m.peers[peerID] = ps
+	}
+	return ps
 }
 
 // Start begins background goroutines for adaptation and stats.
@@ -131,7 +157,7 @@ func (m *Manager) Start() {
 	}
 
 	// Adaptive FEC ratio goroutine
-	if m.encoder != nil && m.config.FECAdaptive {
+	if m.config.FECEnabled && m.config.FECAdaptive {
 		go m.fecAdaptLoop()
 	}
 
@@ -154,20 +180,24 @@ func (m *Manager) Stop() {
 // ProcessOutbound handles a packet on the send path.
 // Called after nonce assignment, before encryption.
 //
-// Returns the original packet plus any FEC parity packets that should
-// also be encrypted and sent. Each returned packet is independent and
-// should be encrypted with its own nonce.
+// Returns the data packet (with FEC header) plus any parity packets.
+// Each returned packet is independent and must be encrypted with its own nonce.
 //
 // If FEC is disabled, returns just the original packet unchanged.
-func (m *Manager) ProcessOutbound(packet []byte, nonce uint64) [][]byte {
+func (m *Manager) ProcessOutbound(peerID uint32, packet []byte, nonce uint64) [][]byte {
 	m.txPackets.Add(1)
 
-	if !m.config.FECEnabled || m.encoder == nil {
+	if !m.config.FECEnabled {
 		return [][]byte{packet}
 	}
 
-	// FEC encode — prepends 4-byte header to data, generates parity when block is full
-	encodedData, parityPackets := m.encoder.Encode(packet)
+	ps := m.getPeerState(peerID)
+	if ps.encoder == nil {
+		return [][]byte{packet}
+	}
+
+	// FEC encode — prepends 5-byte header to data, generates parity when block is full
+	encodedData, parityPackets := ps.encoder.Encode(packet)
 
 	result := make([][]byte, 0, 1+len(parityPackets))
 	result = append(result, encodedData)
@@ -178,15 +208,9 @@ func (m *Manager) ProcessOutbound(packet []byte, nonce uint64) [][]byte {
 // ProcessInbound handles a packet on the receive path.
 // Called after decryption and replay filter validation, before TUN write.
 //
-// The packet is inserted into the reorder buffer (if enabled) and/or
-// FEC decoder. Returns packets ready for TUN delivery in-order, or nil
-// if the packet is buffered waiting for earlier sequences.
-//
-// Parameters:
-//   - packet: decrypted packet data
-//   - nonce: WireGuard nonce (sequence number)
-//   - pathID: which network path delivered this packet (for per-path stats)
-func (m *Manager) ProcessInbound(packet []byte, nonce uint64, pathID int) [][]byte {
+// Returns IP packets ready for TUN delivery (FEC header stripped), or nil
+// if the packet is parity-only with no recovery possible yet.
+func (m *Manager) ProcessInbound(peerID uint32, packet []byte, nonce uint64, pathID int) [][]byte {
 	m.rxPackets.Add(1)
 
 	// If neither FEC nor reorder is enabled, pass through
@@ -195,8 +219,11 @@ func (m *Manager) ProcessInbound(packet []byte, nonce uint64, pathID int) [][]by
 	}
 
 	// FEC decode — returns clean IP packets (header stripped, possibly recovered)
-	if m.config.FECEnabled && m.decoder != nil && len(packet) > FECHeaderSize {
-		return m.decoder.Decode(packet)
+	if m.config.FECEnabled && len(packet) > FECHeaderSize {
+		ps := m.getPeerState(peerID)
+		if ps.decoder != nil {
+			return ps.decoder.Decode(packet)
+		}
 	}
 
 	return [][]byte{packet}
@@ -242,29 +269,35 @@ func (m *Manager) fecAdaptLoop() {
 			}
 
 			// Estimate loss rate from TX/RX difference
-			// This is approximate — real loss measurement needs RTCP-like feedback
 			lossRate := 0.0
 			if deltaTx > deltaRx {
 				lossRate = float64(deltaTx-deltaRx) / float64(deltaTx)
 			}
 
-			if err := m.encoder.AdaptRate(lossRate); err != nil && m.logger != nil {
-				m.logger.Printf("007 Bond: FEC adapt error: %v", err)
+			// Adapt all peer encoders
+			m.peersMu.Lock()
+			for _, ps := range m.peers {
+				if ps.encoder != nil {
+					if err := ps.encoder.AdaptRate(lossRate); err != nil && m.logger != nil {
+						m.logger.Printf("007 Bond: FEC adapt error: %v", err)
+					}
+				}
 			}
+			m.peersMu.Unlock()
 		}
 	}
 }
 
 // Stats returns current bond statistics.
 type Stats struct {
-	TxPackets    uint64
-	RxPackets    uint64
-	FECRecovered uint64
-	FECFailed    uint64
-	ReorderGaps  uint64
+	TxPackets       uint64
+	RxPackets       uint64
+	FECRecovered    uint64
+	FECFailed       uint64
+	ReorderGaps     uint64
 	ReorderWindowMs int64
-	InOrder      uint64
-	Reordered    uint64
+	InOrder         uint64
+	Reordered       uint64
 }
 
 // GetStats returns current statistics.
@@ -274,9 +307,17 @@ func (m *Manager) GetStats() Stats {
 		RxPackets: m.rxPackets.Load(),
 	}
 
-	if m.decoder != nil {
-		s.FECRecovered, s.FECFailed = m.decoder.Stats()
+	// Aggregate FEC stats from all peers
+	m.peersMu.Lock()
+	for _, ps := range m.peers {
+		if ps.decoder != nil {
+			recovered, failed := ps.decoder.Stats()
+			s.FECRecovered += recovered
+			s.FECFailed += failed
+		}
 	}
+	m.peersMu.Unlock()
+
 	if m.reorderBuf != nil {
 		s.InOrder, s.Reordered, s.ReorderGaps, s.ReorderWindowMs = m.reorderBuf.Stats()
 	}

@@ -471,7 +471,7 @@ func (peer *Peer) RoutineSequentialReceiver(maxBatchSize int) {
 
 			// 007 Bond: FEC decode — strip header, recover missing packets
 			if device.bondMgr != nil {
-				readyPackets := device.bondMgr.ProcessInbound(elem.packet, elem.counter, 0)
+				readyPackets := device.bondMgr.ProcessInbound(peer.bondPeerID, elem.packet, elem.counter, 0)
 				for pi, pkt := range readyPackets {
 					if len(pkt) == 0 {
 						continue

@@ -57,6 +57,7 @@ type Peer struct {
 	cookieGenerator             CookieGenerator
 	trieEntries                 list.List
 	persistentKeepaliveInterval atomic.Uint32
+	bondPeerID                  uint32 // unique ID for per-peer FEC state in bond manager
 }
 
 func (device *Device) NewPeer(pk NoisePublicKey) (*Peer, error) {
@@ -78,6 +79,7 @@ func (device *Device) NewPeer(pk NoisePublicKey) (*Peer, error) {
 
 	// create peer
 	peer := new(Peer)
+	peer.bondPeerID = device.nextBondPeerID.Add(1)
 
 	peer.cookieGenerator.Init(pk)
 	peer.device = device

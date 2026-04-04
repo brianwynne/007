@@ -86,17 +86,19 @@ type Device struct {
 		mtu    atomic.Int32
 	}
 
-	ipcMutex  sync.RWMutex
-	closed    chan struct{}
-	log       *Logger
-	bondMgr   bondManager // 007 bond manager (nil = disabled)
+	ipcMutex       sync.RWMutex
+	closed         chan struct{}
+	log            *Logger
+	bondMgr        bondManager    // 007 bond manager (nil = disabled)
+	nextBondPeerID atomic.Uint32  // counter for assigning unique peer IDs to bond manager
 }
 
 // bondManager is an interface to avoid circular imports with the bond package.
 // The actual implementation is in bond.Manager.
+// peerID isolates FEC state per peer — each peer gets its own encoder/decoder.
 type bondManager interface {
-	ProcessOutbound(packet []byte, nonce uint64) [][]byte
-	ProcessInbound(packet []byte, nonce uint64, pathID int) [][]byte
+	ProcessOutbound(peerID uint32, packet []byte, nonce uint64) [][]byte
+	ProcessInbound(peerID uint32, packet []byte, nonce uint64, pathID int) [][]byte
 }
 
 // SetBondManager attaches a bond manager to this device.
