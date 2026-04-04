@@ -66,11 +66,14 @@ func DefaultConfig() Config {
 	}
 }
 
-// peerState holds per-peer FEC and reorder state.
+// peerState holds per-peer FEC, reorder, and ARQ state.
 type peerState struct {
 	encoder    *FECEncoder
 	decoder    *FECDecoder
 	reorderBuf *ReorderBuffer
+	retransmit *retransmitBuffer // sender side: recent packets for retransmission
+	nackTrack  *nackTracker      // receiver side: tracks unrecoverable gaps
+	sendFunc   func(data []byte)  // callback to inject packets into send path
 }
 
 // Manager coordinates FEC encoding/decoding and packet reordering.
@@ -129,9 +132,21 @@ func (m *Manager) getPeerState(peerID uint32) *peerState {
 		if m.config.ReorderEnabled {
 			ps.reorderBuf = NewReorderBuffer()
 		}
+		ps.retransmit = &retransmitBuffer{}
+		ps.nackTrack = &nackTracker{}
 		m.peers[peerID] = ps
 	}
 	return ps
+}
+
+// SetPeerSendFunc provides a callback for injecting packets into the
+// WireGuard send path for a specific peer. Used by ARQ for NACKs and
+// retransmissions. Must be called after the peer is created.
+func (m *Manager) SetPeerSendFunc(peerID uint32, fn func(data []byte)) {
+	ps := m.getPeerState(peerID)
+	m.peersMu.Lock()
+	ps.sendFunc = fn
+	m.peersMu.Unlock()
 }
 
 // Start begins background goroutines for adaptation.
@@ -181,6 +196,10 @@ func (m *Manager) ProcessOutbound(peerID uint32, packet []byte, nonce uint64) []
 	}
 
 	ps := m.getPeerState(peerID)
+
+	// Store in retransmit buffer (before FEC encoding, keyed by nonce)
+	ps.retransmit.Store(packet, nonce)
+
 	if ps.encoder == nil {
 		return [][]byte{packet}
 	}
@@ -203,6 +222,12 @@ func (m *Manager) ProcessInbound(peerID uint32, packet []byte, nonce uint64, pat
 	m.rxPackets.Add(1)
 
 	ps := m.getPeerState(peerID)
+
+	// Check for control packets (NACK, etc.) — these are NOT data
+	if isControlPacket(packet) {
+		m.handleControl(ps, packet)
+		return nil
+	}
 
 	// FEC decode
 	if m.config.FECEnabled && ps.decoder != nil && len(packet) > FECHeaderSize {
@@ -228,6 +253,17 @@ func (m *Manager) ProcessInbound(peerID uint32, packet []byte, nonce uint64, pat
 			}
 		}
 
+		// Check for skipped nonces (FEC couldn't recover) → queue for NACK
+		if ps.reorderBuf != nil {
+			skipped := ps.reorderBuf.DrainSkippedNonces()
+			for _, n := range skipped {
+				ps.nackTrack.AddMissing(n)
+			}
+			if len(skipped) > 0 {
+				m.triggerNACK(ps)
+			}
+		}
+
 		return result
 	}
 
@@ -237,6 +273,42 @@ func (m *Manager) ProcessInbound(peerID uint32, packet []byte, nonce uint64, pat
 	}
 
 	return [][]byte{packet}
+}
+
+// handleControl processes a bond control packet (NACK, etc.).
+func (m *Manager) handleControl(ps *peerState, packet []byte) {
+	if len(packet) < FECHeaderSize {
+		return
+	}
+	controlType := packet[2]
+
+	switch controlType {
+	case controlTypeNACK:
+		// Sender received a NACK — retransmit requested packets
+		nonces := parseNACKPacket(packet)
+		if ps.sendFunc == nil {
+			return
+		}
+		for _, nonce := range nonces {
+			data := ps.retransmit.Lookup(nonce)
+			if data != nil {
+				ps.sendFunc(data) // re-inject into send path
+			}
+		}
+		if m.logger != nil && len(nonces) > 0 {
+			m.logger.Printf("007 Bond: retransmitted %d packets on NACK", len(nonces))
+		}
+	}
+}
+
+// triggerNACK generates and sends a NACK for unrecoverable gaps.
+func (m *Manager) triggerNACK(ps *peerState) {
+	nack := ps.nackTrack.GenerateNACK()
+	if nack == nil || ps.sendFunc == nil {
+		return
+	}
+	// Send NACK as a control packet through the WireGuard tunnel
+	ps.sendFunc(nack)
 }
 
 // reorderLoop runs periodic flush and window adaptation for all peers.

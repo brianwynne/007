@@ -308,6 +308,23 @@ func (peer *Peer) Start() {
 	go peer.RoutineSequentialReceiver(batchSize)
 
 	peer.isRunning.Store(true)
+
+	// Register ARQ send callback with bond manager
+	if device.bondMgr != nil {
+		peerRef := peer
+		device.bondMgr.SetPeerSendFunc(peer.bondPeerID, func(data []byte) {
+			if !peerRef.isRunning.Load() {
+				return
+			}
+			elem := device.NewOutboundElement()
+			copy(elem.buffer[MessageTransportHeaderSize:], data)
+			elem.packet = elem.buffer[MessageTransportHeaderSize : MessageTransportHeaderSize+len(data)]
+			container := device.GetOutboundElementsContainer()
+			container.elems = append(container.elems, elem)
+			peerRef.StagePackets(container)
+			peerRef.SendStagedPackets()
+		})
+	}
 }
 
 func (peer *Peer) ZeroAndFlushAll() {

@@ -146,7 +146,23 @@ recovered packets have their original nonce for reorder buffer insertion.
 
 **Goal**: Request retransmission of packets that FEC cannot recover.
 
-**Status**: Not yet implemented.
+**File**: `bond/arq.go`
+
+**Design**:
+- Sender: ring buffer of 512 recent cleartext packets keyed by nonce
+- Receiver: detects unrecoverable gaps via reorder buffer skipped nonces
+- NACK: control packet (blockID=0xFFFF) with list of missing nonces
+- NACK travels encrypted through the WireGuard tunnel
+- Sender retransmits from buffer via SendFunc callback
+- Retransmitted packets re-enter the full send pipeline (new nonce, new FEC)
+- Rate limited: max 1 NACK per 10ms, max 32 nonces per NACK
+
+**Integration**:
+- ProcessOutbound stores each packet in per-peer retransmit buffer
+- ProcessInbound detects control packets (blockID=0xFFFF) and handles NACKs
+- Reorder buffer records skipped nonces via DrainSkippedNonces()
+- SendFunc callback (set via SetPeerSendFunc) injects packets into send path
+- Device registers SendFunc in Peer.Start() using StagePackets/SendStagedPackets
 
 ---
 
@@ -162,7 +178,7 @@ recovered packets have their original nonce for reorder buffer insertion.
 | `bond/fec.go` | IMPLEMENTED | Reed-Solomon FEC encoder/decoder (5-byte header) |
 | `bond/reorder.go` | IMPLEMENTED | Adaptive reorder buffer (not yet wired) |
 | `bond/bond.go` | IMPLEMENTED | Bond manager — ProcessOutbound/ProcessInbound API |
-| `bond/arq.go` | NOT STARTED | NACK-based retransmission |
+| `bond/arq.go` | IMPLEMENTED | NACK-based retransmission + retransmit buffer |
 | `bond/path.go` | NOT STARTED | Path health tracking + RTT |
 | `docs/IMPLEMENTATION.md` | IMPLEMENTED | This file |
 
@@ -179,7 +195,7 @@ recovered packets have their original nonce for reorder buffer insertion.
 - [x] Interface manager — per-path UDP sockets bound to specific local IPs
 
 ## What's NOT Connected Yet
-- [ ] ARQ (NACK retransmission)
+- [x] ARQ — NACK-based retransmission with per-peer retransmit buffer
 - [ ] Path health tracking
 - [ ] Management API
 

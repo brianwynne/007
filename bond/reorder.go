@@ -45,6 +45,9 @@ type ReorderBuffer struct {
 	inOrderCount   uint64
 	reorderedCount uint64
 	gapCount       uint64
+
+	// Skipped nonces for ARQ NACK generation
+	skippedNonces []uint64
 }
 
 // bufferedPacket holds a packet waiting for in-order delivery.
@@ -182,7 +185,10 @@ func (rb *ReorderBuffer) checkGapTimeout(now time.Time) [][]byte {
 		candidate := rb.nextExpect + offset
 		idx := candidate % maxBufferSize
 		if rb.slots[idx] != nil && rb.slots[idx].nonce == candidate {
-			// Found it — skip gap, deliver from here
+			// Found it — record skipped nonces for ARQ, then skip gap
+			for skipped := rb.nextExpect; skipped < candidate; skipped++ {
+				rb.skippedNonces = append(rb.skippedNonces, skipped)
+			}
 			rb.gapCount++
 			rb.nextExpect = candidate
 
@@ -303,6 +309,19 @@ func (rb *ReorderBuffer) Stats() (inOrder, reordered, gaps uint64, windowMs int6
 	rb.mu.Lock()
 	defer rb.mu.Unlock()
 	return rb.inOrderCount, rb.reorderedCount, rb.gapCount, rb.maxWindow.Milliseconds()
+}
+
+// DrainSkippedNonces returns and clears the list of nonces that were
+// skipped due to gap timeouts. Used by ARQ to generate NACKs.
+func (rb *ReorderBuffer) DrainSkippedNonces() []uint64 {
+	rb.mu.Lock()
+	defer rb.mu.Unlock()
+	if len(rb.skippedNonces) == 0 {
+		return nil
+	}
+	nonces := rb.skippedNonces
+	rb.skippedNonces = nil
+	return nonces
 }
 
 // copyBytes returns a copy of the data slice.

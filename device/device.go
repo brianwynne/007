@@ -99,6 +99,7 @@ type Device struct {
 type bondManager interface {
 	ProcessOutbound(peerID uint32, packet []byte, nonce uint64) [][]byte
 	ProcessInbound(peerID uint32, packet []byte, nonce uint64, pathID int) [][]byte
+	SetPeerSendFunc(peerID uint32, fn func(data []byte))
 }
 
 // bondFECOverhead is the bytes FEC adds to each data packet:
