@@ -1,77 +1,113 @@
-# Go Implementation of [WireGuard](https://www.wireguard.com/)
+# 007 Bond — Multi-Path Network Bonding
 
-This is an implementation of WireGuard in Go.
+007 Bond is a multi-path network bonding solution built on [wireguard-go](https://git.zx2c4.com/wireguard-go). It sends every packet simultaneously across all configured network interfaces (ethernet, WiFi, cellular) and uses FEC, reordering, and ARQ to deliver reliable, low-latency connectivity over unreliable links.
 
-## Usage
+Designed for broadcast field contribution where dropping audio is not an option.
 
-Most Linux kernel WireGuard users are used to adding an interface with `ip link add wg0 type wireguard`. With wireguard-go, instead simply run:
-
-```
-$ wireguard-go wg0
-```
-
-This will create an interface and fork into the background. To remove the interface, use the usual `ip link del wg0`, or if your system does not support removing interfaces directly, you may instead remove the control socket via `rm -f /var/run/wireguard/wg0.sock`, which will result in wireguard-go shutting down.
-
-To run wireguard-go without forking to the background, pass `-f` or `--foreground`:
+## How It Works
 
 ```
-$ wireguard-go -f wg0
+APP (e.g. SIP codec)
+        |
+   ┌────┴────┐ TUN interface (bond0)
+   │   007   │ FEC encode → encrypt → multi-path send
+   └──┬───┬──┘
+      |   |
+   eth0  wlan0  ──── all paths simultaneously ────  server
 ```
 
-When an interface is running, you may use [`wg(8)`](https://git.zx2c4.com/wireguard-tools/about/src/man/wg.8) to configure it, as well as the usual `ip(8)` and `ifconfig(8)` commands.
+- Every encrypted packet is sent on ALL configured paths
+- Receiver discards duplicates (WireGuard replay filter)
+- FEC (Reed-Solomon) recovers lost packets without retransmission
+- Reorder buffer delivers packets in sequence despite path latency differences
+- ARQ requests retransmission for anything FEC can't recover
+- Per-path health tracking (RTT, loss, jitter) drives adaptive timeouts
 
-To run with more logging you may set the environment variable `LOG_LEVEL=debug`.
+## Quick Start
 
-## Platforms
+```bash
+# Build
+go build -o 007 .
 
-### Linux
+# Server
+sudo ip tuntap add dev bond0 mode tun
+sudo ./007 -f bond0 &
+sudo wg set bond0 listen-port 51820 private-key ./server.key
+sudo wg set bond0 peer <CLIENT_PUBKEY> allowed-ips 10.7.0.2/32
+sudo ip addr add 10.7.0.1/24 dev bond0
+sudo ip link set bond0 up
 
-This will run on Linux; however you should instead use the kernel module, which is faster and better integrated into the OS. See the [installation page](https://www.wireguard.com/install/) for instructions.
+# Client
+sudo ip tuntap add dev bond0 mode tun
+sudo ./007 -f bond0 &
+sudo wg set bond0 private-key ./client.key \
+  peer <SERVER_PUBKEY> \
+    endpoint server:51820 \
+    allowed-ips 10.7.0.0/24 \
+    persistent-keepalive 25 \
+    bond_endpoint=server:51820@192.168.1.100 \
+    bond_endpoint=server:51820@10.0.0.50
+sudo ip addr add 10.7.0.2/24 dev bond0
+sudo ip link set bond0 up
+```
 
-### macOS
+`bond_endpoint=dest@localip` — send to `dest` via the interface that owns `localip`.
 
-This runs on macOS using the utun driver. It does not yet support sticky sockets, and won't support fwmarks because of Darwin limitations. Since the utun driver cannot have arbitrary interface names, you must either use `utun[0-9]+` for an explicit interface name or `utun` to have the kernel select one for you. If you choose `utun` as the interface name, and the environment variable `WG_TUN_NAME_FILE` is defined, then the actual name of the interface chosen by the kernel is written to the file specified by that variable.
+## Features
 
-### Windows
+| Feature | Description |
+|---------|-------------|
+| Multi-path send | Every packet sent on all configured endpoints simultaneously |
+| FEC | Adaptive Reed-Solomon (K=8-16, M=2-6), adjusts to measured loss |
+| Reorder buffer | Adaptive window (20-200ms), per-path timeout based on measured RTT |
+| ARQ | NACK-based retransmission for gaps FEC can't recover |
+| Path health | Probe/echo RTT, per-path loss and jitter tracking |
+| Per-peer isolation | Multiple devices connect to one server without interference |
+| Interface binding | Per-path UDP sockets bound to specific local IPs |
+| Management API | REST API on :8007 for stats, path health, config |
+| WireGuard compatible | Standard `wg` tool for key management and peer config |
+| Auto MTU | Effective MTU reduced automatically for FEC overhead |
 
-This runs on Windows, but you should instead use it from the more [fully featured Windows app](https://git.zx2c4.com/wireguard-windows/about/), which uses this as a module.
+## Management API
 
-### FreeBSD
+```bash
+curl http://127.0.0.1:8007/api/stats   # FEC, reorder, ARQ stats + paths
+curl http://127.0.0.1:8007/api/paths   # per-path RTT, jitter, loss
+curl http://127.0.0.1:8007/api/config  # current configuration
+curl http://127.0.0.1:8007/api/health  # health check
+```
 
-This will run on FreeBSD. It does not yet support sticky sockets. Fwmark is mapped to `SO_USER_COOKIE`.
+## Environment Variables
 
-### OpenBSD
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `BOND_FEC` | enabled | Set to `0` to disable FEC |
+| `BOND_REORDER` | enabled | Set to `0` to disable reorder buffer |
+| `BOND_API` | `127.0.0.1:8007` | Management API listen address |
+| `LOG_LEVEL` | `error` | Set to `verbose` for debug logging |
 
-This will run on OpenBSD. It does not yet support sticky sockets. Fwmark is mapped to `SO_RTABLE`. Since the tun driver cannot have arbitrary interface names, you must either use `tun[0-9]+` for an explicit interface name or `tun` to have the program select one for you. If you choose `tun` as the interface name, and the environment variable `WG_TUN_NAME_FILE` is defined, then the actual name of the interface chosen by the kernel is written to the file specified by that variable.
+## Documentation
+
+- [Installation and Testing Guide](docs/INSTALL.md) — full setup, 6 test scenarios, troubleshooting
+- [Implementation Log](docs/IMPLEMENTATION.md) — architecture, design decisions, wire formats
 
 ## Building
 
-This requires an installation of the latest version of [Go](https://go.dev/).
+Requires Go 1.23+.
 
+```bash
+go build -o 007 .                                    # Linux (native)
+GOOS=linux GOARCH=arm64 go build -o 007-arm64 .      # Raspberry Pi 4
+GOOS=linux GOARCH=arm go build -o 007-arm .           # Raspberry Pi 3
+go test ./bond/ -v                                    # Run tests
 ```
-$ git clone https://git.zx2c4.com/wireguard-go
-$ cd wireguard-go
-$ make
-```
+
+## Based On
+
+Fork of [wireguard-go](https://git.zx2c4.com/wireguard-go) (MIT License, Copyright 2017-2025 WireGuard LLC).
+
+007 Bond adds the `bond/` package and modifies `device/send.go`, `device/receive.go`, `device/device.go`, `device/peer.go`, and `device/uapi.go` for pipeline integration. The WireGuard encryption, handshake, and key management are unmodified.
 
 ## License
 
-    Copyright (C) 2017-2025 WireGuard LLC. All Rights Reserved.
-    
-    Permission is hereby granted, free of charge, to any person obtaining a copy of
-    this software and associated documentation files (the "Software"), to deal in
-    the Software without restriction, including without limitation the rights to
-    use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies
-    of the Software, and to permit persons to whom the Software is furnished to do
-    so, subject to the following conditions:
-    
-    The above copyright notice and this permission notice shall be included in all
-    copies or substantial portions of the Software.
-    
-    THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-    IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-    FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-    AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-    LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-    OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-    SOFTWARE.
+MIT License. See [LICENSE](LICENSE).
