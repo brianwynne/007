@@ -3,6 +3,7 @@ module golang.zx2c4.com/wireguard
 go 1.23.1
 
 require (
+	github.com/klauspost/reedsolomon v1.12.4
 	golang.org/x/crypto v0.37.0
 	golang.org/x/net v0.39.0
 	golang.org/x/sys v0.32.0
@@ -12,5 +13,6 @@ require (
 
 require (
 	github.com/google/btree v1.1.2 // indirect
+	github.com/klauspost/cpuid/v2 v2.2.8 // indirect
 	golang.org/x/time v0.7.0 // indirect
 )

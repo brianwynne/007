@@ -27,8 +27,9 @@ type Peer struct {
 
 	endpoint struct {
 		sync.Mutex
-		val            conn.Endpoint
-		clearSrcOnTx   bool // signal to val.ClearSrc() prior to next packet transmission
+		val            conn.Endpoint   // primary endpoint (handshake, roaming)
+		bondEndpoints  []conn.Endpoint // additional endpoints for multi-path send
+		clearSrcOnTx   bool            // signal to val.ClearSrc() prior to next packet transmission
 		disableRoaming bool
 	}
 
@@ -131,8 +132,12 @@ func (peer *Peer) SendBuffers(buffers [][]byte) error {
 		endpoint.ClearSrc()
 		peer.endpoint.clearSrcOnTx = false
 	}
+	// Capture bond endpoints under lock
+	bondEndpoints := make([]conn.Endpoint, len(peer.endpoint.bondEndpoints))
+	copy(bondEndpoints, peer.endpoint.bondEndpoints)
 	peer.endpoint.Unlock()
 
+	// Send to primary endpoint
 	err := peer.device.net.bind.Send(buffers, endpoint)
 	if err == nil {
 		var totalLen uint64
@@ -141,7 +146,36 @@ func (peer *Peer) SendBuffers(buffers [][]byte) error {
 		}
 		peer.txBytes.Add(totalLen)
 	}
+
+	// Send to all bond endpoints (multi-path redundancy)
+	// Errors on bond endpoints are non-fatal — primary is authoritative
+	for _, bondEP := range bondEndpoints {
+		peer.device.net.bind.Send(buffers, bondEP)
+	}
+
 	return err
+}
+
+// AddBondEndpoint adds an additional endpoint for multi-path sending.
+// Packets will be sent to all bond endpoints in addition to the primary.
+func (peer *Peer) AddBondEndpoint(ep conn.Endpoint) {
+	peer.endpoint.Lock()
+	defer peer.endpoint.Unlock()
+	peer.endpoint.bondEndpoints = append(peer.endpoint.bondEndpoints, ep)
+}
+
+// ClearBondEndpoints removes all bond endpoints.
+func (peer *Peer) ClearBondEndpoints() {
+	peer.endpoint.Lock()
+	defer peer.endpoint.Unlock()
+	peer.endpoint.bondEndpoints = nil
+}
+
+// BondEndpointCount returns the number of active bond endpoints.
+func (peer *Peer) BondEndpointCount() int {
+	peer.endpoint.Lock()
+	defer peer.endpoint.Unlock()
+	return len(peer.endpoint.bondEndpoints)
 }
 
 func (peer *Peer) String() string {

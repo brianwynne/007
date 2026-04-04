@@ -347,6 +347,18 @@ func (device *Device) handlePeerLine(peer *ipcSetPeer, key, value string) error 
 		defer peer.endpoint.Unlock()
 		peer.endpoint.val = endpoint
 
+	case "bond_endpoint":
+		device.log.Verbosef("%v - UAPI: Adding bond endpoint", peer.Peer)
+		endpoint, err := device.net.bind.ParseEndpoint(value)
+		if err != nil {
+			return ipcErrorf(ipc.IpcErrorInvalid, "failed to set bond endpoint %v: %w", value, err)
+		}
+		peer.AddBondEndpoint(endpoint)
+
+	case "clear_bond_endpoints":
+		device.log.Verbosef("%v - UAPI: Clearing bond endpoints", peer.Peer)
+		peer.ClearBondEndpoints()
+
 	case "persistent_keepalive_interval":
 		device.log.Verbosef("%v - UAPI: Updating persistent keepalive interval", peer.Peer)
 
