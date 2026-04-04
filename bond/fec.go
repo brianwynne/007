@@ -279,10 +279,20 @@ func (fd *FECDecoder) Decode(packet []byte) (data *DecodedPacket, recovered []*D
 		)
 	}
 
-	// Store shard (full packet including header + nonce)
+	// Store shard — data packets stored as full packet (FEC header is part of RS),
+	// parity packets stored WITHOUT outer FEC header (just the RS shard content)
 	if index < len(block.shards) && !block.present[index] {
-		shard := make([]byte, len(packet))
-		copy(shard, packet)
+		var shard []byte
+		if index < k {
+			// Data shard: full packet [FEC header][nonce][data]
+			shard = make([]byte, len(packet))
+			copy(shard, packet)
+		} else {
+			// Parity shard: strip outer FEC header, store RS content only
+			content := packet[FECHeaderSize:]
+			shard = make([]byte, len(content))
+			copy(shard, content)
+		}
 		block.shards[index] = shard
 		block.present[index] = true
 		block.received++
@@ -331,11 +341,10 @@ func (fd *FECDecoder) tryRecover(blockID uint16, block *fecBlock) []*DecodedPack
 		return nil
 	}
 
-	// Pad shards to same length
+	// Pad present shards to same length — leave missing shards nil
+	// (RS library requires nil to identify which shards to reconstruct)
 	for i := range block.shards {
-		if block.shards[i] == nil {
-			block.shards[i] = make([]byte, block.maxLen)
-		} else if len(block.shards[i]) < block.maxLen {
+		if block.shards[i] != nil && len(block.shards[i]) < block.maxLen {
 			padded := make([]byte, block.maxLen)
 			copy(padded, block.shards[i])
 			block.shards[i] = padded

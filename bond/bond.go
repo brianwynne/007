@@ -196,16 +196,12 @@ func (m *Manager) Stop() {
 func (m *Manager) ProcessOutbound(peerID uint32, packet []byte, nonce uint64) [][]byte {
 	m.txPackets.Add(1)
 
-	if !m.config.FECEnabled {
-		return [][]byte{packet}
-	}
-
 	ps := m.getPeerState(peerID)
 
-	// Store in retransmit buffer (before FEC encoding, keyed by nonce)
+	// Always store in retransmit buffer for ARQ (regardless of FEC)
 	ps.retransmit.Store(packet, nonce)
 
-	if ps.encoder == nil {
+	if !m.config.FECEnabled || ps.encoder == nil {
 		return [][]byte{packet}
 	}
 
