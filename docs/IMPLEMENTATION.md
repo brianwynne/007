@@ -179,7 +179,7 @@ recovered packets have their original nonce for reorder buffer insertion.
 | `bond/reorder.go` | IMPLEMENTED | Adaptive reorder buffer (not yet wired) |
 | `bond/bond.go` | IMPLEMENTED | Bond manager — ProcessOutbound/ProcessInbound API |
 | `bond/arq.go` | IMPLEMENTED | NACK-based retransmission + retransmit buffer |
-| `bond/path.go` | NOT STARTED | Path health tracking + RTT |
+| `bond/path.go` | IMPLEMENTED | Path health tracking — probe/echo RTT, loss, jitter |
 | `docs/IMPLEMENTATION.md` | IMPLEMENTED | This file |
 
 ## What's Connected
@@ -196,7 +196,7 @@ recovered packets have their original nonce for reorder buffer insertion.
 
 ## What's NOT Connected Yet
 - [x] ARQ — NACK-based retransmission with per-peer retransmit buffer
-- [ ] Path health tracking
+- [x] Path health tracking — probe/echo RTT, per-path loss + jitter
 - [ ] Management API
 
 ## Design Constraints

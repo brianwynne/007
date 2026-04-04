@@ -66,14 +66,15 @@ func DefaultConfig() Config {
 	}
 }
 
-// peerState holds per-peer FEC, reorder, and ARQ state.
+// peerState holds per-peer FEC, reorder, ARQ, and path health state.
 type peerState struct {
 	encoder    *FECEncoder
 	decoder    *FECDecoder
 	reorderBuf *ReorderBuffer
 	retransmit *retransmitBuffer // sender side: recent packets for retransmission
 	nackTrack  *nackTracker      // receiver side: tracks unrecoverable gaps
-	sendFunc   func(data []byte)  // callback to inject packets into send path
+	pathTrack  *pathTracker      // per-path health metrics
+	sendFunc   func(data []byte) // callback to inject packets into send path
 }
 
 // Manager coordinates FEC encoding/decoding and packet reordering.
@@ -134,6 +135,7 @@ func (m *Manager) getPeerState(peerID uint32) *peerState {
 		}
 		ps.retransmit = &retransmitBuffer{}
 		ps.nackTrack = &nackTracker{}
+		ps.pathTrack = newPathTracker()
 		m.peers[peerID] = ps
 	}
 	return ps
@@ -164,6 +166,9 @@ func (m *Manager) Start() {
 	if m.config.ReorderEnabled {
 		go m.reorderLoop()
 	}
+
+	// Path health probing goroutine
+	go m.probeLoop()
 
 	if m.logger != nil {
 		m.logger.Println("007 Bond: manager started")
@@ -222,6 +227,9 @@ func (m *Manager) ProcessInbound(peerID uint32, packet []byte, nonce uint64, pat
 	m.rxPackets.Add(1)
 
 	ps := m.getPeerState(peerID)
+
+	// Track per-path receive stats
+	ps.pathTrack.RecordReceive(pathID)
 
 	// Check for control packets (NACK, etc.) — these are NOT data
 	if isControlPacket(packet) {
@@ -292,11 +300,30 @@ func (m *Manager) handleControl(ps *peerState, packet []byte) {
 		for _, nonce := range nonces {
 			data := ps.retransmit.Lookup(nonce)
 			if data != nil {
-				ps.sendFunc(data) // re-inject into send path
+				ps.sendFunc(data)
 			}
 		}
 		if m.logger != nil && len(nonces) > 0 {
 			m.logger.Printf("007 Bond: retransmitted %d packets on NACK", len(nonces))
+		}
+
+	case controlTypeProbe:
+		// Receiver got a probe — echo it back
+		echo := buildEchoPacket(packet)
+		if echo != nil && ps.sendFunc != nil {
+			ps.sendFunc(echo)
+		}
+
+	case controlTypeEcho:
+		// Sender got an echo — compute RTT
+		tsNano, pathID, ok := parseProbeEcho(packet)
+		if ok {
+			rtt := time.Duration(uint64(time.Now().UnixNano()) - tsNano)
+			ps.pathTrack.UpdateRTT(pathID, rtt)
+			// Feed RTT into reorder buffer for per-path timeout
+			if ps.reorderBuf != nil {
+				ps.reorderBuf.UpdatePathRTT(pathID, rtt)
+			}
 		}
 	}
 }
@@ -340,6 +367,29 @@ func (m *Manager) reorderLoop() {
 			for _, ps := range m.peers {
 				if ps.reorderBuf != nil {
 					ps.reorderBuf.AdaptWindow()
+				}
+			}
+			m.peersMu.Unlock()
+		}
+	}
+}
+
+// probeLoop periodically sends probe packets for RTT measurement.
+func (m *Manager) probeLoop() {
+	ticker := time.NewTicker(probeInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-m.stopCh:
+			return
+		case <-ticker.C:
+			m.peersMu.Lock()
+			for _, ps := range m.peers {
+				if ps.sendFunc != nil {
+					// Send probe on default path (pathID 0)
+					probe := buildProbePacket(0)
+					ps.sendFunc(probe)
 				}
 			}
 			m.peersMu.Unlock()
@@ -391,14 +441,15 @@ func (m *Manager) fecAdaptLoop() {
 
 // Stats returns current bond statistics.
 type Stats struct {
-	TxPackets       uint64
-	RxPackets       uint64
-	FECRecovered    uint64
-	FECFailed       uint64
-	ReorderInOrder  uint64
+	TxPackets        uint64
+	RxPackets        uint64
+	FECRecovered     uint64
+	FECFailed        uint64
+	ReorderInOrder   uint64
 	ReorderReordered uint64
-	ReorderGaps     uint64
-	ReorderWindowMs int64
+	ReorderGaps      uint64
+	ReorderWindowMs  int64
+	Paths            []PathHealthSnapshot
 }
 
 // GetStats returns current statistics aggregated across all peers.
@@ -423,6 +474,9 @@ func (m *Manager) GetStats() Stats {
 			if windowMs > s.ReorderWindowMs {
 				s.ReorderWindowMs = windowMs
 			}
+		}
+		if ps.pathTrack != nil {
+			s.Paths = append(s.Paths, ps.pathTrack.GetAll()...)
 		}
 	}
 	m.peersMu.Unlock()
