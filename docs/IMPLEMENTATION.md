@@ -175,8 +175,10 @@ recovered packets have their original nonce for reorder buffer insertion.
 - [x] ProcessInbound wired into device/receive.go (with IP validation + buffer management)
 - [x] Reorder buffer wired into receive pipeline (per-peer, synchronous API)
 
+## What's Connected (continued)
+- [x] Interface manager — per-path UDP sockets bound to specific local IPs
+
 ## What's NOT Connected Yet
-- [ ] Interface manager (bind sockets to physical interfaces)
 - [ ] ARQ (NACK retransmission)
 - [ ] Path health tracking
 - [ ] Management API

@@ -8,6 +8,8 @@ package device
 import (
 	"container/list"
 	"errors"
+	"net"
+	"net/netip"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -27,9 +29,9 @@ type Peer struct {
 
 	endpoint struct {
 		sync.Mutex
-		val            conn.Endpoint   // primary endpoint (handshake, roaming)
-		bondEndpoints  []conn.Endpoint // additional endpoints for multi-path send
-		clearSrcOnTx   bool            // signal to val.ClearSrc() prior to next packet transmission
+		val            conn.Endpoint // primary endpoint (handshake, roaming)
+		bondPaths      []BondPath    // multi-path send via per-interface sockets
+		clearSrcOnTx   bool          // signal to val.ClearSrc() prior to next packet transmission
 		disableRoaming bool
 	}
 
@@ -116,6 +118,42 @@ func (device *Device) NewPeer(pk NoisePublicKey) (*Peer, error) {
 	return peer, nil
 }
 
+// BondPath represents a multi-path send channel with its own UDP socket
+// bound to a specific local IP address, ensuring traffic exits via
+// the correct physical interface.
+type BondPath struct {
+	Endpoint conn.Endpoint  // destination address
+	LocalIP  netip.Addr     // local IP this socket is bound to
+	conn     *net.UDPConn   // dedicated socket bound to LocalIP
+}
+
+// Send transmits buffers via this path's dedicated socket.
+func (bp *BondPath) Send(buffers [][]byte) error {
+	if bp.conn == nil {
+		return errors.New("bond path socket not open")
+	}
+	dstAddrPort, err := netip.ParseAddrPort(bp.Endpoint.DstToString())
+	if err != nil {
+		return err
+	}
+	dst := net.UDPAddrFromAddrPort(dstAddrPort)
+	for _, buf := range buffers {
+		_, err := bp.conn.WriteToUDP(buf, dst)
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// Close closes the path's dedicated socket.
+func (bp *BondPath) Close() error {
+	if bp.conn != nil {
+		return bp.conn.Close()
+	}
+	return nil
+}
+
 func (peer *Peer) SendBuffers(buffers [][]byte) error {
 	peer.device.net.RLock()
 	defer peer.device.net.RUnlock()
@@ -134,12 +172,12 @@ func (peer *Peer) SendBuffers(buffers [][]byte) error {
 		endpoint.ClearSrc()
 		peer.endpoint.clearSrcOnTx = false
 	}
-	// Capture bond endpoints under lock
-	bondEndpoints := make([]conn.Endpoint, len(peer.endpoint.bondEndpoints))
-	copy(bondEndpoints, peer.endpoint.bondEndpoints)
+	// Snapshot bond paths under lock
+	bondPaths := make([]BondPath, len(peer.endpoint.bondPaths))
+	copy(bondPaths, peer.endpoint.bondPaths)
 	peer.endpoint.Unlock()
 
-	// Send to primary endpoint
+	// Send to primary endpoint via standard bind
 	err := peer.device.net.bind.Send(buffers, endpoint)
 	if err == nil {
 		var totalLen uint64
@@ -149,35 +187,60 @@ func (peer *Peer) SendBuffers(buffers [][]byte) error {
 		peer.txBytes.Add(totalLen)
 	}
 
-	// Send to all bond endpoints (multi-path redundancy)
-	// Errors on bond endpoints are non-fatal — primary is authoritative
-	for _, bondEP := range bondEndpoints {
-		peer.device.net.bind.Send(buffers, bondEP)
+	// Send to all bond paths via dedicated per-interface sockets
+	// Errors on bond paths are non-fatal — primary is authoritative
+	for i := range bondPaths {
+		bondPaths[i].Send(buffers)
 	}
 
 	return err
 }
 
-// AddBondEndpoint adds an additional endpoint for multi-path sending.
-// Packets will be sent to all bond endpoints in addition to the primary.
-func (peer *Peer) AddBondEndpoint(ep conn.Endpoint) {
+// AddBondPath adds a multi-path send channel bound to a specific local IP.
+// The localIP determines which physical interface the traffic exits through.
+// The dest endpoint is the remote address to send to on this path.
+func (peer *Peer) AddBondPath(dest conn.Endpoint, localIP netip.Addr) error {
+	// Create UDP socket bound to the local IP
+	var network string
+	var localAddr *net.UDPAddr
+	if localIP.Is4() {
+		network = "udp4"
+		localAddr = &net.UDPAddr{IP: localIP.AsSlice(), Port: 0}
+	} else {
+		network = "udp6"
+		localAddr = &net.UDPAddr{IP: localIP.AsSlice(), Port: 0}
+	}
+
+	udpConn, err := net.ListenUDP(network, localAddr)
+	if err != nil {
+		return err
+	}
+
 	peer.endpoint.Lock()
 	defer peer.endpoint.Unlock()
-	peer.endpoint.bondEndpoints = append(peer.endpoint.bondEndpoints, ep)
+	peer.endpoint.bondPaths = append(peer.endpoint.bondPaths, BondPath{
+		Endpoint: dest,
+		LocalIP:  localIP,
+		conn:     udpConn,
+	})
+	return nil
 }
 
-// ClearBondEndpoints removes all bond endpoints.
-func (peer *Peer) ClearBondEndpoints() {
+// ClearBondPaths closes and removes all bond paths.
+func (peer *Peer) ClearBondPaths() {
 	peer.endpoint.Lock()
 	defer peer.endpoint.Unlock()
-	peer.endpoint.bondEndpoints = nil
+	for i := range peer.endpoint.bondPaths {
+		peer.endpoint.bondPaths[i].Close()
+	}
+	peer.endpoint.bondPaths = nil
 }
 
-// BondEndpointCount returns the number of active bond endpoints.
-func (peer *Peer) BondEndpointCount() int {
+// BondPathCount returns the number of active bond paths.
+func (peer *Peer) BondPathCount() int {
 	peer.endpoint.Lock()
 	defer peer.endpoint.Unlock()
-	return len(peer.endpoint.bondEndpoints)
+	return len(peer.endpoint.bondPaths)
 }
 
 func (peer *Peer) String() string {
@@ -310,6 +373,9 @@ func (peer *Peer) Stop() {
 	peer.device.queue.encryption.wg.Done() // no more writes to encryption queue from us
 
 	peer.ZeroAndFlushAll()
+
+	// Close bond path sockets
+	peer.ClearBondPaths()
 }
 
 func (peer *Peer) SetEndpointFromPacket(endpoint conn.Endpoint) {

@@ -348,16 +348,27 @@ func (device *Device) handlePeerLine(peer *ipcSetPeer, key, value string) error 
 		peer.endpoint.val = endpoint
 
 	case "bond_endpoint":
+		// Format: dest:port@localip  (e.g., "1.2.3.4:51820@192.168.1.100")
 		device.log.Verbosef("%v - UAPI: Adding bond endpoint", peer.Peer)
-		endpoint, err := device.net.bind.ParseEndpoint(value)
-		if err != nil {
-			return ipcErrorf(ipc.IpcErrorInvalid, "failed to set bond endpoint %v: %w", value, err)
+		parts := splitBondEndpoint(value)
+		if len(parts) != 2 {
+			return ipcErrorf(ipc.IpcErrorInvalid, "bond_endpoint requires dest@localip format: %v", value)
 		}
-		peer.AddBondEndpoint(endpoint)
+		endpoint, err := device.net.bind.ParseEndpoint(parts[0])
+		if err != nil {
+			return ipcErrorf(ipc.IpcErrorInvalid, "failed to parse bond endpoint dest %v: %w", parts[0], err)
+		}
+		localIP, err := netip.ParseAddr(parts[1])
+		if err != nil {
+			return ipcErrorf(ipc.IpcErrorInvalid, "failed to parse bond local IP %v: %w", parts[1], err)
+		}
+		if err := peer.AddBondPath(endpoint, localIP); err != nil {
+			return ipcErrorf(ipc.IpcErrorInvalid, "failed to create bond path %v: %w", value, err)
+		}
 
 	case "clear_bond_endpoints":
-		device.log.Verbosef("%v - UAPI: Clearing bond endpoints", peer.Peer)
-		peer.ClearBondEndpoints()
+		device.log.Verbosef("%v - UAPI: Clearing bond paths", peer.Peer)
+		peer.ClearBondPaths()
 
 	case "persistent_keepalive_interval":
 		device.log.Verbosef("%v - UAPI: Updating persistent keepalive interval", peer.Peer)
@@ -477,4 +488,18 @@ func (device *Device) IpcHandle(socket net.Conn) {
 		}
 		buffered.Flush()
 	}
+}
+
+// splitBondEndpoint splits "dest:port@localip" into ["dest:port", "localip"].
+// Handles IPv6 addresses in brackets: "[::1]:51820@[::2]" → ["[::1]:51820", "::2"].
+func splitBondEndpoint(s string) []string {
+	idx := strings.LastIndex(s, "@")
+	if idx < 0 {
+		return nil
+	}
+	localIP := s[idx+1:]
+	// Strip brackets from IPv6 local IP
+	localIP = strings.TrimPrefix(localIP, "[")
+	localIP = strings.TrimSuffix(localIP, "]")
+	return []string{s[:idx], localIP}
 }
