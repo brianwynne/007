@@ -86,9 +86,23 @@ type Device struct {
 		mtu    atomic.Int32
 	}
 
-	ipcMutex sync.RWMutex
-	closed   chan struct{}
-	log      *Logger
+	ipcMutex  sync.RWMutex
+	closed    chan struct{}
+	log       *Logger
+	bondMgr   bondManager // 007 bond manager (nil = disabled)
+}
+
+// bondManager is an interface to avoid circular imports with the bond package.
+// The actual implementation is in bond.Manager.
+type bondManager interface {
+	ProcessOutbound(packet []byte, nonce uint64) [][]byte
+	ProcessInbound(packet []byte, nonce uint64, pathID int) [][]byte
+}
+
+// SetBondManager attaches a bond manager to this device.
+// Must be called before the device is brought up.
+func (device *Device) SetBondManager(mgr bondManager) {
+	device.bondMgr = mgr
 }
 
 // deviceState represents the state of a Device.

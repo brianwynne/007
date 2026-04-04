@@ -444,6 +444,7 @@ func (peer *Peer) RoutineSequentialReceiver(maxBatchSize int) {
 		validTailPacket := -1
 		dataPacketReceived := false
 		rxBytesLen := uint64(0)
+		var bondExtraBufs []*[MaxMessageSize]byte
 		for i, elem := range elemsContainer.elems {
 			if elem.packet == nil {
 				// decryption failed
@@ -467,6 +468,57 @@ func (peer *Peer) RoutineSequentialReceiver(maxBatchSize int) {
 				continue
 			}
 			dataPacketReceived = true
+
+			// 007 Bond: FEC decode — strip header, recover missing packets
+			if device.bondMgr != nil {
+				readyPackets := device.bondMgr.ProcessInbound(elem.packet, elem.counter, 0)
+				for pi, pkt := range readyPackets {
+					if len(pkt) == 0 {
+						continue
+					}
+					var buf *[MaxMessageSize]byte
+					if pi == 0 {
+						buf = elem.buffer
+					} else {
+						buf = device.GetMessageBuffer()
+						bondExtraBufs = append(bondExtraBufs, buf)
+					}
+					copy(buf[MessageTransportOffsetContent:], pkt)
+
+					// Validate IP header and allowed IPs
+					pktLen := len(pkt)
+					validPkt := false
+					switch pkt[0] >> 4 {
+					case 4:
+						if pktLen >= ipv4.HeaderLen {
+							length := int(binary.BigEndian.Uint16(pkt[IPv4offsetTotalLength : IPv4offsetTotalLength+2]))
+							if length <= pktLen && length >= ipv4.HeaderLen {
+								src := pkt[IPv4offsetSrc : IPv4offsetSrc+net.IPv4len]
+								if device.allowedips.Lookup(src) == peer {
+									pktLen = length
+									validPkt = true
+								}
+							}
+						}
+					case 6:
+						if pktLen >= ipv6.HeaderLen {
+							length := int(binary.BigEndian.Uint16(pkt[IPv6offsetPayloadLength:IPv6offsetPayloadLength+2])) + ipv6.HeaderLen
+							if length <= pktLen {
+								src := pkt[IPv6offsetSrc : IPv6offsetSrc+net.IPv6len]
+								if device.allowedips.Lookup(src) == peer {
+									pktLen = length
+									validPkt = true
+								}
+							}
+						}
+					}
+
+					if validPkt {
+						bufs = append(bufs, buf[:MessageTransportOffsetContent+pktLen])
+					}
+				}
+				continue
+			}
 
 			switch elem.packet[0] >> 4 {
 			case 4:
@@ -525,6 +577,10 @@ func (peer *Peer) RoutineSequentialReceiver(maxBatchSize int) {
 			if err != nil && !device.isClosed() {
 				device.log.Errorf("Failed to write packets to TUN device: %v", err)
 			}
+		}
+		// Free extra buffers allocated for FEC-recovered packets
+		for _, buf := range bondExtraBufs {
+			device.PutMessageBuffer(buf)
 		}
 		for _, elem := range elemsContainer.elems {
 			device.PutMessageBuffer(elem.buffer)

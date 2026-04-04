@@ -109,7 +109,7 @@ func NewManager(cfg Config, logger *log.Logger) (*Manager, error) {
 			return nil, err
 		}
 		m.encoder = enc
-		m.decoder = NewFECDecoder(256)
+		m.decoder = NewFECDecoder()
 	}
 
 	if cfg.ReorderEnabled {
@@ -166,17 +166,11 @@ func (m *Manager) ProcessOutbound(packet []byte, nonce uint64) [][]byte {
 		return [][]byte{packet}
 	}
 
-	// FEC encode — may return additional parity packets
-	parityPackets := m.encoder.Encode(packet)
+	// FEC encode — prepends 4-byte header to data, generates parity when block is full
+	encodedData, parityPackets := m.encoder.Encode(packet)
 
-	if len(parityPackets) == 0 {
-		return [][]byte{packet}
-	}
-
-	// Return original + parity packets
-	// Each parity packet needs its own nonce and encryption
 	result := make([][]byte, 0, 1+len(parityPackets))
-	result = append(result, packet)
+	result = append(result, encodedData)
 	result = append(result, parityPackets...)
 	return result
 }
@@ -200,28 +194,9 @@ func (m *Manager) ProcessInbound(packet []byte, nonce uint64, pathID int) [][]by
 		return [][]byte{packet}
 	}
 
-	// FEC decode (if packet has FEC header)
+	// FEC decode — returns clean IP packets (header stripped, possibly recovered)
 	if m.config.FECEnabled && m.decoder != nil && len(packet) > FECHeaderSize {
-		m.decoder.Decode(packet)
-		// Recovered packets come via decoder output channel
-		// For now, also pass the data portion through
-		packet = packet[FECHeaderSize:]
-	}
-
-	// Reorder buffer
-	if m.config.ReorderEnabled && m.reorderBuf != nil {
-		m.reorderBuf.Insert(packet, nonce, pathID)
-
-		// Collect all ready packets from the output channel
-		var ready [][]byte
-		for {
-			select {
-			case pkt := <-m.reorderBuf.Output():
-				ready = append(ready, pkt.Data)
-			default:
-				return ready
-			}
-		}
+		return m.decoder.Decode(packet)
 	}
 
 	return [][]byte{packet}

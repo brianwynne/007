@@ -368,6 +368,42 @@ top:
 
 				elem.keypair = keypair
 			}
+			// 007 Bond: FEC encode — prepend header to data packets, generate parity
+			if peer.device.bondMgr != nil {
+				var parityElems []*QueueOutboundElement
+				for _, elem := range elemsContainer.elems[:i] {
+					if len(elem.packet) == 0 {
+						continue // keepalive — no FEC encoding
+					}
+					packets := peer.device.bondMgr.ProcessOutbound(elem.packet, elem.nonce)
+					if len(packets) > 0 {
+						// First packet is data with FEC header — update element in-place
+						copy(elem.buffer[MessageTransportHeaderSize:], packets[0])
+						elem.packet = elem.buffer[MessageTransportHeaderSize : MessageTransportHeaderSize+len(packets[0])]
+					}
+					// Additional packets are parity — create new elements with own nonces
+					for j := 1; j < len(packets); j++ {
+						pe := peer.device.NewOutboundElement()
+						pe.peer = peer
+						pe.nonce = keypair.sendNonce.Add(1) - 1
+						if pe.nonce >= RejectAfterMessages {
+							keypair.sendNonce.Store(RejectAfterMessages)
+							peer.device.PutMessageBuffer(pe.buffer)
+							peer.device.PutOutboundElement(pe)
+							break
+						}
+						pe.keypair = keypair
+						copy(pe.buffer[MessageTransportHeaderSize:], packets[j])
+						pe.packet = pe.buffer[MessageTransportHeaderSize : MessageTransportHeaderSize+len(packets[j])]
+						parityElems = append(parityElems, pe)
+					}
+				}
+				if len(parityElems) > 0 {
+					elemsContainer.elems = append(elemsContainer.elems[:i], parityElems...)
+					i += len(parityElems)
+				}
+			}
+
 			elemsContainer.Lock()
 			elemsContainer.elems = elemsContainer.elems[:i]
 
