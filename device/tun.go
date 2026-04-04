@@ -32,6 +32,10 @@ func (device *Device) RoutineTUNEventReader() {
 				tooLarge = fmt.Sprintf(" (too large, capped at %v)", MaxContentSize)
 				mtu = MaxContentSize
 			}
+			// Reduce effective MTU for FEC header overhead when bond is enabled
+			if device.bondMgr != nil {
+				mtu -= bondFECOverhead
+			}
 			old := device.tun.mtu.Swap(int32(mtu))
 			if int(old) != mtu {
 				device.log.Verbosef("MTU updated: %v%s", mtu, tooLarge)

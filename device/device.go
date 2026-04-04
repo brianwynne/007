@@ -101,10 +101,20 @@ type bondManager interface {
 	ProcessInbound(peerID uint32, packet []byte, nonce uint64, pathID int) [][]byte
 }
 
+// bondFECOverhead is the maximum bytes FEC adds to a packet (5-byte header).
+// Used to reduce the effective MTU so padding and fragmentation are correct.
+const bondFECOverhead = 5
+
 // SetBondManager attaches a bond manager to this device.
 // Must be called before the device is brought up.
+// Reduces the effective MTU to account for FEC header overhead.
 func (device *Device) SetBondManager(mgr bondManager) {
 	device.bondMgr = mgr
+	if mgr != nil {
+		mtu := device.tun.mtu.Load()
+		device.tun.mtu.Store(mtu - int32(bondFECOverhead))
+		device.log.Verbosef("Bond: effective MTU reduced from %d to %d (FEC overhead)", mtu, mtu-int32(bondFECOverhead))
+	}
 }
 
 // deviceState represents the state of a Device.
