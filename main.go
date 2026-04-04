@@ -15,6 +15,7 @@ import (
 	"strconv"
 
 	"golang.org/x/sys/unix"
+	"golang.zx2c4.com/wireguard/bond"
 	"golang.zx2c4.com/wireguard/conn"
 	"golang.zx2c4.com/wireguard/device"
 	"golang.zx2c4.com/wireguard/ipc"
@@ -34,36 +35,15 @@ const (
 
 func printUsage() {
 	fmt.Printf("Usage: %s [-f/--foreground] INTERFACE-NAME\n", os.Args[0])
-}
-
-func warning() {
-	switch runtime.GOOS {
-	case "linux", "freebsd", "openbsd":
-		if os.Getenv(ENV_WG_PROCESS_FOREGROUND) == "1" {
-			return
-		}
-	default:
-		return
-	}
-
-	fmt.Fprintln(os.Stderr, "┌──────────────────────────────────────────────────────┐")
-	fmt.Fprintln(os.Stderr, "│                                                      │")
-	fmt.Fprintln(os.Stderr, "│   Running wireguard-go is not required because this  │")
-	fmt.Fprintln(os.Stderr, "│   kernel has first class support for WireGuard. For  │")
-	fmt.Fprintln(os.Stderr, "│   information on installing the kernel module,       │")
-	fmt.Fprintln(os.Stderr, "│   please visit:                                      │")
-	fmt.Fprintln(os.Stderr, "│         https://www.wireguard.com/install/           │")
-	fmt.Fprintln(os.Stderr, "│                                                      │")
-	fmt.Fprintln(os.Stderr, "└──────────────────────────────────────────────────────┘")
+	fmt.Printf("\n007 Bond — Multi-path network bonding with FEC and reordering\n")
+	fmt.Printf("Configure bond paths via UAPI: bond_endpoint=dest:port@localip\n")
 }
 
 func main() {
 	if len(os.Args) == 2 && os.Args[1] == "--version" {
-		fmt.Printf("wireguard-go v%s\n\nUserspace WireGuard daemon for %s-%s.\nInformation available at https://www.wireguard.com.\nCopyright (C) Jason A. Donenfeld <Jason@zx2c4.com>.\n", Version, runtime.GOOS, runtime.GOARCH)
+		fmt.Printf("007 Bond v%s\n\nMulti-path network bonding for %s-%s.\nBased on wireguard-go. https://github.com/brianwynne/007\n", Version, runtime.GOOS, runtime.GOARCH)
 		return
 	}
-
-	warning()
 
 	var foreground bool
 	var interfaceName string
@@ -222,9 +202,26 @@ func main() {
 		return
 	}
 
-	device := device.NewDevice(tdev, conn.NewDefaultBind(), logger)
+	dev := device.NewDevice(tdev, conn.NewDefaultBind(), logger)
 
-	logger.Verbosef("Device started")
+	// 007 Bond: Create and attach bond manager
+	bondCfg := bond.DefaultConfig()
+	// Allow disabling bond features via environment
+	if os.Getenv("BOND_FEC") == "0" {
+		bondCfg.FECEnabled = false
+	}
+	if os.Getenv("BOND_REORDER") == "0" {
+		bondCfg.ReorderEnabled = false
+	}
+	bondMgr, err := bond.NewManager(bondCfg, nil)
+	if err != nil {
+		logger.Errorf("Failed to create bond manager: %v", err)
+		os.Exit(ExitSetupFailed)
+	}
+	dev.SetBondManager(bondMgr)
+	bondMgr.Start()
+
+	logger.Verbosef("007 Bond started (FEC=%v, Reorder=%v)", bondCfg.FECEnabled, bondCfg.ReorderEnabled)
 
 	errs := make(chan error)
 	term := make(chan os.Signal, 1)
@@ -242,7 +239,7 @@ func main() {
 				errs <- err
 				return
 			}
-			go device.IpcHandle(conn)
+			go dev.IpcHandle(conn)
 		}
 	}()
 
@@ -256,13 +253,14 @@ func main() {
 	select {
 	case <-term:
 	case <-errs:
-	case <-device.Wait():
+	case <-dev.Wait():
 	}
 
 	// clean up
 
+	bondMgr.Stop()
 	uapi.Close()
-	device.Close()
+	dev.Close()
 
 	logger.Verbosef("Shutting down")
 }
