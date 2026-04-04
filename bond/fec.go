@@ -226,14 +226,16 @@ func NewFECDecoder() *FECDecoder {
 }
 
 // Decode processes an incoming packet (data or parity) with FEC header.
-// Returns IP packets ready for TUN delivery (FEC header stripped).
+// Returns two sets of packets:
+//   - data: the current packet's payload (nil for parity packets)
+//   - recovered: any packets recovered via RS reconstruction
 //
-// For data packets (index < K): returns the payload immediately.
-// For parity packets (index >= K): attempts recovery of missing data packets.
-// Returns nil if no packets are ready (e.g. parity arrived but can't recover yet).
-func (fd *FECDecoder) Decode(packet []byte) [][]byte {
+// Both have the FEC header stripped and are ready for TUN delivery.
+// The caller should reorder 'data' (it has a known nonce) but deliver
+// 'recovered' immediately (their original nonces are not available).
+func (fd *FECDecoder) Decode(packet []byte) (data []byte, recovered [][]byte) {
 	if len(packet) < FECHeaderSize {
-		return nil
+		return nil, nil
 	}
 
 	blockID := binary.BigEndian.Uint16(packet[0:2])
@@ -242,7 +244,7 @@ func (fd *FECDecoder) Decode(packet []byte) [][]byte {
 	m := int(packet[4])
 
 	if k == 0 || m == 0 {
-		return nil
+		return nil, nil
 	}
 
 	fd.mu.Lock()
@@ -278,22 +280,19 @@ func (fd *FECDecoder) Decode(packet []byte) [][]byte {
 		}
 	}
 
-	var result [][]byte
-
-	// Data packet (index < K): deliver payload immediately
+	// Data packet (index < K): extract payload
 	if index < k {
 		payload := make([]byte, len(packet)-FECHeaderSize)
 		copy(payload, packet[FECHeaderSize:])
-		result = append(result, payload)
+		data = payload
 	}
 
 	// Check if we can recover missing data packets
 	if block.received >= k {
-		recovered := fd.tryRecover(blockID, block)
-		result = append(result, recovered...)
+		recovered = fd.tryRecover(blockID, block)
 	}
 
-	return result
+	return data, recovered
 }
 
 // tryRecover attempts to reconstruct missing data packets using FEC.

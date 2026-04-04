@@ -119,14 +119,22 @@ FEC header:
 
 **Goal**: Deliver packets to TUN in sequence order despite multi-path arrival timing differences.
 
-**File**: `bond/reorder.go` — IMPLEMENTED but not wired into receive pipeline yet.
+**File**: `bond/reorder.go`
 
 **Design**:
 - Ring buffer (64 slots, zero-alloc after init)
+- Synchronous API: `Insert()` returns packets ready for delivery
 - Uses WireGuard nonce (64-bit counter) as sequence number
 - Per-path timeout based on measured RTT: `RTT + 2*RTTVar + 10ms`
 - Adaptive window: 80ms default, 20ms min, 200ms max
-- Gap handling: skip after per-path timeout, deliver consecutive buffered packets
+- Gap handling: gap timeout checked on each Insert call + periodic Flush
+- Per-peer: each peer gets its own reorder buffer (nonces are per-peer)
+
+**Integration with FEC**:
+- FEC `Decode()` returns `(data, recovered)` separately
+- Data packets → reorder buffer (have known WireGuard nonce)
+- FEC-recovered packets → delivered immediately, bypass reorder (no nonce available)
+- Periodic Flush (10ms) advances `nextExpect` during idle periods
 
 ---
 
@@ -161,10 +169,9 @@ FEC header:
 - [x] Bond manager API (bond/bond.go)
 - [x] ProcessOutbound wired into device/send.go (keepalive-safe)
 - [x] ProcessInbound wired into device/receive.go (with IP validation + buffer management)
-- [x] Reorder buffer code (bond/reorder.go, not wired into pipeline)
+- [x] Reorder buffer wired into receive pipeline (per-peer, synchronous API)
 
 ## What's NOT Connected Yet
-- [ ] Reorder buffer integration into receive pipeline
 - [ ] Interface manager (bind sockets to physical interfaces)
 - [ ] ARQ (NACK retransmission)
 - [ ] Path health tracking
