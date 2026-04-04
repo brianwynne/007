@@ -221,7 +221,15 @@ func main() {
 	dev.SetBondManager(bondMgr)
 	bondMgr.Start()
 
-	logger.Verbosef("007 Bond started (FEC=%v, Reorder=%v)", bondCfg.FECEnabled, bondCfg.ReorderEnabled)
+	// Management API
+	apiAddr := os.Getenv("BOND_API")
+	if apiAddr == "" {
+		apiAddr = "127.0.0.1:8007"
+	}
+	bondAPI := bond.NewAPI(bondMgr, apiAddr)
+	bondAPI.Start()
+
+	logger.Verbosef("007 Bond started (FEC=%v, Reorder=%v, API=%s)", bondCfg.FECEnabled, bondCfg.ReorderEnabled, apiAddr)
 
 	errs := make(chan error)
 	term := make(chan os.Signal, 1)
@@ -258,6 +266,7 @@ func main() {
 
 	// clean up
 
+	bondAPI.Stop()
 	bondMgr.Stop()
 	uapi.Close()
 	dev.Close()

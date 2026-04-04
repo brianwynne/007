@@ -197,7 +197,7 @@ recovered packets have their original nonce for reorder buffer insertion.
 ## What's NOT Connected Yet
 - [x] ARQ — NACK-based retransmission with per-peer retransmit buffer
 - [x] Path health tracking — probe/echo RTT, per-path loss + jitter
-- [ ] Management API
+- [x] Management API — REST on :8007 (stats, paths, config, health)
 
 ## Design Constraints
 - **Per-peer FEC state**: Each peer gets its own FEC encoder/decoder via `peerID`. Multiple devices (e.g. field SIP Reporters) connecting to a single 007 server each have isolated FEC blocks — packets from different peers are never mixed.
