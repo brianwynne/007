@@ -189,5 +189,37 @@ type ReorderBuffer struct {
 | `bond/reorder.go` | NEW | Adaptive reorder buffer |
 | `bond/arq.go` | NEW | NACK-based retransmission |
 | `bond/path.go` | NEW | Path health tracking + RTT |
-| `bond/bond.go` | NEW | Bond manager (ties components together) |
-| `docs/IMPLEMENTATION.md` | NEW | This file |
+| `bond/bond.go` | IMPLEMENTED | Bond manager — ProcessOutbound/ProcessInbound API |
+| `docs/IMPLEMENTATION.md` | IMPLEMENTED | This file |
+
+## Integration Status
+
+### Bond Manager API (`bond/bond.go`)
+
+The manager exposes two main methods for integration with wireguard-go:
+
+**`ProcessOutbound(packet, nonce) [][]byte`**
+- Called: after nonce assignment in `SendStagedPackets()` (device/send.go:356)
+- Input: cleartext packet + its assigned nonce
+- Output: original packet + any FEC parity packets
+- Each output packet encrypted independently with its own nonce
+
+**`ProcessInbound(packet, nonce, pathID) [][]byte`**
+- Called: after decryption in `RoutineSequentialReceiver()` (device/receive.go:453)
+- Input: decrypted packet + nonce + which path delivered it
+- Output: in-order packets ready for TUN write (may be empty if buffering)
+
+### What's Connected
+- [x] Multi-path send (peer.go SendBuffers)
+- [x] UAPI bond_endpoint config (uapi.go)
+- [x] FEC encoder/decoder (bond/fec.go)
+- [x] Reorder buffer (bond/reorder.go)
+- [x] Bond manager API (bond/bond.go)
+
+### What's NOT Connected Yet
+- [ ] Wire ProcessOutbound into device/send.go pipeline
+- [ ] Wire ProcessInbound into device/receive.go pipeline
+- [ ] Interface manager (bind sockets to physical interfaces)
+- [ ] ARQ (NACK retransmission)
+- [ ] Path health tracking
+- [ ] Management API
