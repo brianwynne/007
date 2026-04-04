@@ -101,9 +101,9 @@ type bondManager interface {
 	ProcessInbound(peerID uint32, packet []byte, nonce uint64, pathID int) [][]byte
 }
 
-// bondFECOverhead is the maximum bytes FEC adds to a packet (5-byte header).
-// Used to reduce the effective MTU so padding and fragmentation are correct.
-const bondFECOverhead = 5
+// bondFECOverhead is the bytes FEC adds to each data packet:
+// 5-byte FEC header + 8-byte embedded nonce = 13 bytes.
+const bondFECOverhead = 13
 
 // SetBondManager attaches a bond manager to this device.
 // Must be called before the device is brought up.

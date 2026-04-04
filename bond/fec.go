@@ -18,20 +18,27 @@ import (
 // Design decisions:
 //   - Uses klauspost/reedsolomon (production-ready, 1GB/s+, ARM optimised)
 //   - Adaptive K,M: adjusts based on measured loss rate every 500ms
-//   - FEC header (5 bytes) prepended to each packet before encryption
+//   - FEC header (5 bytes) + nonce (8 bytes) prepended before encryption
+//   - The nonce is part of the RS-encoded data, so it's recovered with the payload
 //   - Encoder groups K packets, generates M parity packets
 //   - Decoder recovers any M lost packets from remaining K
 //
-// FEC header format (5 bytes):
+// Wire format per data packet:
 //
-//	[BlockID (16 bits)][Index (8 bits)][K value (8 bits)][M value (8 bits)]
-//	BlockID: which FEC block this packet belongs to
-//	Index:   position within block (0..K-1 = data, K..K+M-1 = parity)
-//	K:       number of data packets in this block
-//	M:       number of parity packets in this block
+//	[FEC header (5 bytes)][WireGuard nonce (8 bytes)][IP packet]
+//
+// FEC header:
+//
+//	[BlockID (16 bits)][Index (8 bits)][K (8 bits)][M (8 bits)]
+//
+// The nonce is embedded in the FEC-protected region so that recovered
+// packets have their original nonce available for reorder buffer insertion.
 
 const (
-	FECHeaderSize = 5 // bytes
+	FECHeaderSize    = 5 // block management header
+	fecNonceSize     = 8 // WireGuard nonce (uint64)
+	FECPayloadOffset = FECHeaderSize + fecNonceSize // 13 — where IP data starts
+	FECOverhead      = FECPayloadOffset             // total bytes added to each data packet
 
 	// Adaptive FEC presets
 	fecLowLossK  = 16 // clean network: 12.5% overhead
@@ -50,6 +57,12 @@ const (
 	fecBlockTimeoutMs = 50  // max ms to wait for a complete FEC block
 	fecLossWindowSize = 200 // packets in loss measurement window
 )
+
+// DecodedPacket holds a decoded packet with its WireGuard nonce.
+type DecodedPacket struct {
+	Data  []byte // IP packet (FEC header + nonce stripped)
+	Nonce uint64 // WireGuard nonce — available for reorder buffer
+}
 
 // FECEncoder groups outgoing packets and generates parity packets.
 type FECEncoder struct {
@@ -108,19 +121,21 @@ func NewFECEncoder() (*FECEncoder, error) {
 }
 
 // Encode adds a data packet to the current FEC block.
-// Always returns encodedData: the packet with 5-byte FEC header prepended.
-// When the block is full (K packets collected), also returns M parity packets.
-func (fe *FECEncoder) Encode(data []byte) (encodedData []byte, parityPackets [][]byte) {
+// The nonce is embedded in the FEC-protected payload so it can be recovered.
+// Returns encodedData: [FEC header (5)][nonce (8)][IP data].
+// When the block is full (K packets), also returns M parity packets.
+func (fe *FECEncoder) Encode(data []byte, nonce uint64) (encodedData []byte, parityPackets [][]byte) {
 	fe.mu.Lock()
 	defer fe.mu.Unlock()
 
-	// Prepend FEC header to data packet
-	headerData := make([]byte, FECHeaderSize+len(data))
+	// Build: [FEC header (5)][nonce (8)][IP data]
+	headerData := make([]byte, FECPayloadOffset+len(data))
 	binary.BigEndian.PutUint16(headerData[0:2], fe.blockID)
 	headerData[2] = byte(fe.blockIdx) // index within block
 	headerData[3] = byte(fe.k)       // K value
 	headerData[4] = byte(fe.m)       // M value
-	copy(headerData[FECHeaderSize:], data)
+	binary.BigEndian.PutUint64(headerData[FECHeaderSize:FECPayloadOffset], nonce)
+	copy(headerData[FECPayloadOffset:], data)
 
 	fe.currentBlock[fe.blockIdx] = headerData
 	fe.blockIdx++
@@ -185,7 +200,6 @@ func (fe *FECEncoder) generateParity() [][]byte {
 }
 
 // AdaptRate adjusts K,M based on measured loss rate.
-// Call every 500ms.
 func (fe *FECEncoder) AdaptRate(lossRate float64) error {
 	fe.mu.Lock()
 	defer fe.mu.Unlock()
@@ -200,7 +214,7 @@ func (fe *FECEncoder) AdaptRate(lossRate float64) error {
 	}
 
 	if newK == fe.k && newM == fe.m {
-		return nil // no change
+		return nil
 	}
 
 	enc, err := reedsolomon.New(newK, newM)
@@ -208,7 +222,6 @@ func (fe *FECEncoder) AdaptRate(lossRate float64) error {
 		return err
 	}
 
-	// Flush current block (send what we have without parity)
 	fe.blockIdx = 0
 	fe.currentBlock = make([][]byte, newK)
 	fe.k = newK
@@ -226,14 +239,13 @@ func NewFECDecoder() *FECDecoder {
 }
 
 // Decode processes an incoming packet (data or parity) with FEC header.
-// Returns two sets of packets:
-//   - data: the current packet's payload (nil for parity packets)
-//   - recovered: any packets recovered via RS reconstruction
+// Returns:
+//   - data: the current data packet with nonce (nil for parity packets)
+//   - recovered: any packets recovered via RS reconstruction, each with nonce
 //
-// Both have the FEC header stripped and are ready for TUN delivery.
-// The caller should reorder 'data' (it has a known nonce) but deliver
-// 'recovered' immediately (their original nonces are not available).
-func (fd *FECDecoder) Decode(packet []byte) (data []byte, recovered [][]byte) {
+// Both data and recovered packets have the embedded nonce extracted, so all
+// can be fed through the reorder buffer.
+func (fd *FECDecoder) Decode(packet []byte) (data *DecodedPacket, recovered []*DecodedPacket) {
 	if len(packet) < FECHeaderSize {
 		return nil, nil
 	}
@@ -261,14 +273,13 @@ func (fd *FECDecoder) Decode(packet []byte) (data []byte, recovered [][]byte) {
 		}
 		fd.blocks[blockID] = block
 
-		// Timeout to clean up incomplete blocks
 		block.timer = time.AfterFunc(
 			time.Duration(fecBlockTimeoutMs)*time.Millisecond,
 			func() { fd.blockTimeout(blockID) },
 		)
 	}
 
-	// Store shard
+	// Store shard (full packet including header + nonce)
 	if index < len(block.shards) && !block.present[index] {
 		shard := make([]byte, len(packet))
 		copy(shard, packet)
@@ -280,11 +291,12 @@ func (fd *FECDecoder) Decode(packet []byte) (data []byte, recovered [][]byte) {
 		}
 	}
 
-	// Data packet (index < K): extract payload
-	if index < k {
-		payload := make([]byte, len(packet)-FECHeaderSize)
-		copy(payload, packet[FECHeaderSize:])
-		data = payload
+	// Data packet (index < K): extract nonce + IP payload
+	if index < k && len(packet) >= FECPayloadOffset {
+		nonce := binary.BigEndian.Uint64(packet[FECHeaderSize:FECPayloadOffset])
+		payload := make([]byte, len(packet)-FECPayloadOffset)
+		copy(payload, packet[FECPayloadOffset:])
+		data = &DecodedPacket{Data: payload, Nonce: nonce}
 	}
 
 	// Check if we can recover missing data packets
@@ -296,9 +308,8 @@ func (fd *FECDecoder) Decode(packet []byte) (data []byte, recovered [][]byte) {
 }
 
 // tryRecover attempts to reconstruct missing data packets using FEC.
-// Returns recovered IP packets (FEC header stripped).
-func (fd *FECDecoder) tryRecover(blockID uint16, block *fecBlock) [][]byte {
-	// Check which data packets are missing
+// Returns recovered packets with their embedded nonces extracted.
+func (fd *FECDecoder) tryRecover(blockID uint16, block *fecBlock) []*DecodedPacket {
 	var missing []int
 	for i := 0; i < block.k; i++ {
 		if !block.present[i] {
@@ -307,7 +318,6 @@ func (fd *FECDecoder) tryRecover(blockID uint16, block *fecBlock) [][]byte {
 	}
 
 	if len(missing) == 0 {
-		// All data packets already received — clean up
 		if block.timer != nil {
 			block.timer.Stop()
 		}
@@ -315,7 +325,6 @@ func (fd *FECDecoder) tryRecover(blockID uint16, block *fecBlock) [][]byte {
 		return nil
 	}
 
-	// Need Reed-Solomon decoder with exact K,M from sender
 	enc, err := reedsolomon.New(block.k, block.m)
 	if err != nil {
 		fd.failedCount++
@@ -333,26 +342,25 @@ func (fd *FECDecoder) tryRecover(blockID uint16, block *fecBlock) [][]byte {
 		}
 	}
 
-	// Attempt reconstruction
 	err = enc.Reconstruct(block.shards)
 	if err != nil {
 		fd.failedCount++
 		return nil
 	}
 
-	// Extract recovered data packets (strip FEC header)
-	var recovered [][]byte
+	// Extract recovered data packets — nonce is at bytes 5-13 of each shard
+	var recovered []*DecodedPacket
 	for _, idx := range missing {
 		shard := block.shards[idx]
-		if len(shard) > FECHeaderSize {
-			payload := make([]byte, len(shard)-FECHeaderSize)
-			copy(payload, shard[FECHeaderSize:])
+		if len(shard) >= FECPayloadOffset {
+			nonce := binary.BigEndian.Uint64(shard[FECHeaderSize:FECPayloadOffset])
+			payload := make([]byte, len(shard)-FECPayloadOffset)
+			copy(payload, shard[FECPayloadOffset:])
 			fd.recoveredCount++
-			recovered = append(recovered, payload)
+			recovered = append(recovered, &DecodedPacket{Data: payload, Nonce: nonce})
 		}
 	}
 
-	// Clean up block
 	if block.timer != nil {
 		block.timer.Stop()
 	}
@@ -362,8 +370,6 @@ func (fd *FECDecoder) tryRecover(blockID uint16, block *fecBlock) [][]byte {
 }
 
 // blockTimeout cleans up an incomplete FEC block.
-// Recovery is only done synchronously in Decode — the timer just prevents
-// stale blocks from accumulating when packets are permanently lost.
 func (fd *FECDecoder) blockTimeout(blockID uint16) {
 	fd.mu.Lock()
 	defer fd.mu.Unlock()

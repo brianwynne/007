@@ -51,15 +51,18 @@
 - Parity packets sent alongside data packets
 - Adaptive: adjusts K,M based on measured loss rate every 500ms
 
-**Packet format for FEC (5 bytes)**:
+**Packet format for FEC (13 bytes overhead per data packet)**:
 ```
-[FEC header][IP packet data]  ← this is the cleartext before WireGuard encryption
+[FEC header (5)][WG nonce (8)][IP packet]  ← cleartext before WireGuard encryption
 
-FEC header:
+FEC header (5 bytes):
   - Block ID (16 bits): which FEC block this packet belongs to
   - Index (8 bits): position within block (0..K-1 = data, K..K+M-1 = parity)
   - K value (8 bits): number of data packets in this block
   - M value (8 bits): number of parity packets in this block
+
+The WireGuard nonce is embedded in the FEC-protected region so that
+recovered packets have their original nonce for reorder buffer insertion.
 ```
 
 **Adaptive FEC presets** (adjusted every 500ms based on measured loss):
@@ -131,9 +134,10 @@ FEC header:
 - Per-peer: each peer gets its own reorder buffer (nonces are per-peer)
 
 **Integration with FEC**:
-- FEC `Decode()` returns `(data, recovered)` separately
-- Data packets → reorder buffer (have known WireGuard nonce)
-- FEC-recovered packets → delivered immediately, bypass reorder (no nonce available)
+- WireGuard nonce embedded in FEC-protected payload (8 bytes after FEC header)
+- FEC `Decode()` returns `DecodedPacket{Data, Nonce}` for both data and recovered
+- ALL packets (data and FEC-recovered) go through reorder buffer with correct nonce
+- FEC recovery reconstructs the nonce alongside the IP payload via Reed-Solomon
 - Periodic Flush (10ms) advances `nextExpect` during idle periods
 
 ---
@@ -180,5 +184,5 @@ FEC header:
 ## Design Constraints
 - **Per-peer FEC state**: Each peer gets its own FEC encoder/decoder via `peerID`. Multiple devices (e.g. field SIP Reporters) connecting to a single 007 server each have isolated FEC blocks — packets from different peers are never mixed.
 - **Both ends must run 007**: FEC header prepended to all data packets makes them incompatible with standard WireGuard receivers. No negotiation/fallback.
-- **MTU consideration**: FEC adds 5 bytes to data packets and up to 10 bytes to parity packets. With default WireGuard MTU of 1420, parity packets are at the Ethernet fragmentation boundary. Recommend MTU 1412 when FEC is enabled.
+- **MTU auto-adjustment**: FEC adds 13 bytes per data packet (5 header + 8 nonce). Effective MTU is automatically reduced by 13 when bond manager is attached. No user configuration needed.
 - **Traffic separation**: Only traffic routed to the WireGuard TUN interface enters the bond tunnel. Other system traffic uses normal interfaces. Application binds to tunnel IP or uses policy routing.

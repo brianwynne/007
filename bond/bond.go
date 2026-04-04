@@ -185,8 +185,8 @@ func (m *Manager) ProcessOutbound(peerID uint32, packet []byte, nonce uint64) []
 		return [][]byte{packet}
 	}
 
-	// FEC encode — prepends 5-byte header to data, generates parity when block is full
-	encodedData, parityPackets := ps.encoder.Encode(packet)
+	// FEC encode — prepends header + nonce, generates parity when block is full
+	encodedData, parityPackets := ps.encoder.Encode(packet, nonce)
 
 	result := make([][]byte, 0, 1+len(parityPackets))
 	result = append(result, encodedData)
@@ -210,17 +210,23 @@ func (m *Manager) ProcessInbound(peerID uint32, packet []byte, nonce uint64, pat
 
 		var result [][]byte
 
-		// Data packet → reorder using WireGuard nonce
+		// Data packet → reorder using its embedded nonce
 		if data != nil {
 			if m.config.ReorderEnabled && ps.reorderBuf != nil {
-				result = append(result, ps.reorderBuf.Insert(data, nonce, pathID)...)
+				result = append(result, ps.reorderBuf.Insert(data.Data, data.Nonce, pathID)...)
 			} else {
-				result = append(result, data)
+				result = append(result, data.Data)
 			}
 		}
 
-		// Recovered packets → deliver immediately (no reorder — already late)
-		result = append(result, recovered...)
+		// Recovered packets → also reorder (nonce recovered from FEC payload)
+		for _, rec := range recovered {
+			if m.config.ReorderEnabled && ps.reorderBuf != nil {
+				result = append(result, ps.reorderBuf.Insert(rec.Data, rec.Nonce, pathID)...)
+			} else {
+				result = append(result, rec.Data)
+			}
+		}
 
 		return result
 	}
