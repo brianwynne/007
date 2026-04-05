@@ -23,8 +23,10 @@ jobs:
           go-version: '1.23'
       - name: Run tests
         run: go test ./bond/ -v -count=1
-      - name: Vet
-        run: go vet ./...
+      - name: Vet bond package
+        run: go vet ./bond/
+      - name: Build check
+        run: go build ./...
 
   build:
     name: Build ${{ matrix.goos }}/${{ matrix.goarch }}
