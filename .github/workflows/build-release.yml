@@ -1,0 +1,111 @@
+name: Build and Release
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Version tag (e.g. v0.1.0)'
+        required: false
+
+permissions:
+  contents: write
+
+jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.23'
+      - name: Run tests
+        run: go test ./bond/ -v -count=1
+      - name: Vet
+        run: go vet ./...
+
+  build:
+    name: Build ${{ matrix.goos }}/${{ matrix.goarch }}
+    needs: test
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - goos: linux
+            goarch: amd64
+            suffix: linux-amd64
+          - goos: linux
+            goarch: arm64
+            suffix: linux-arm64
+          - goos: linux
+            goarch: arm
+            suffix: linux-arm
+          - goos: windows
+            goarch: amd64
+            suffix: windows-amd64.exe
+          - goos: windows
+            goarch: arm64
+            suffix: windows-arm64.exe
+          - goos: darwin
+            goarch: arm64
+            suffix: darwin-arm64
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.23'
+
+      - name: Set version
+        run: |
+          VERSION="${{ github.event.release.tag_name || github.event.inputs.tag || 'dev' }}"
+          echo "VERSION=${VERSION}" >> $GITHUB_ENV
+          echo "package main" > version.go
+          echo "" >> version.go
+          echo "const Version = \"${VERSION}\"" >> version.go
+
+      - name: Build
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: 0
+        run: go build -ldflags="-s -w" -o 007-${{ matrix.suffix }} .
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: 007-${{ matrix.suffix }}
+          path: 007-${{ matrix.suffix }}
+
+      - name: Upload to release
+        if: github.event_name == 'release'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: 007-${{ matrix.suffix }}
+
+  checksums:
+    name: Generate checksums
+    needs: build
+    runs-on: ubuntu-latest
+    if: github.event_name == 'release'
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Generate SHA256 checksums
+        run: |
+          cd artifacts
+          sha256sum 007-* > ../SHA256SUMS
+          cat ../SHA256SUMS
+
+      - name: Upload checksums to release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: SHA256SUMS
