@@ -48,8 +48,12 @@ type ReorderBuffer struct {
 	duplicateCount uint64
 	lateCount      uint64
 
-	// Skipped nonces for ARQ NACK generation
+	// Skipped nonces — populated on gap timeout (confirmed loss)
 	skippedNonces []uint64
+
+	// Early NACK candidates — populated when gap first detected (speculative)
+	// Allows ARQ to send NACKs before the gap times out
+	earlyNACK []uint64
 
 	// Packets released by background Flush, delivered on next InsertAt
 	pendingFlush [][]byte
@@ -176,6 +180,11 @@ func (rb *ReorderBuffer) InsertAt(data []byte, nonce uint64, pathID int, now tim
 	if rb.gapStart.IsZero() {
 		rb.gapStart = now
 		rb.gapPathID = pathID
+		// Record missing nonces as early NACK candidates so ARQ can
+		// request retransmission BEFORE the gap times out
+		for seq := rb.nextExpect; seq < nonce; seq++ {
+			rb.earlyNACK = append(rb.earlyNACK, seq)
+		}
 	}
 
 	return result
@@ -337,6 +346,21 @@ func (rb *ReorderBuffer) Stats() (inOrder, reordered, gaps, duplicates, late uin
 	rb.mu.Lock()
 	defer rb.mu.Unlock()
 	return rb.inOrderCount, rb.reorderedCount, rb.gapCount, rb.duplicateCount, rb.lateCount, rb.maxWindow.Milliseconds()
+}
+
+// DrainEarlyNACK returns and clears nonces detected as missing BEFORE
+// the gap times out. This allows ARQ to send NACKs immediately when a
+// gap is first detected, giving the retransmit time to arrive before
+// the gap timeout fires.
+func (rb *ReorderBuffer) DrainEarlyNACK() []uint64 {
+	rb.mu.Lock()
+	defer rb.mu.Unlock()
+	if len(rb.earlyNACK) == 0 {
+		return nil
+	}
+	nonces := rb.earlyNACK
+	rb.earlyNACK = nil
+	return nonces
 }
 
 // DrainSkippedNonces returns and clears the list of nonces that were

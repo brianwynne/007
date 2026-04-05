@@ -259,10 +259,14 @@ func (m *Manager) getPeerState(peerID uint32) *peerState {
 				m.logger.Error("failed to create FEC encoder", "peer", peerID, "err", err)
 			} else {
 				ps.encoder = enc
-				// Auto-compute block timeout from K and packet interval
+				// Auto-compute block timeout from K and packet interval,
+				// capped by latency budget to prevent exceeding playout deadline
 				blockTimeout := m.config.FECBlockTimeoutMs
 				if blockTimeout <= 0 {
 					blockTimeout = m.config.FECLowK*m.config.PacketIntervalMs + 50
+				}
+				if m.config.LatencyBudgetMs > 0 && blockTimeout > m.config.LatencyBudgetMs {
+					blockTimeout = m.config.LatencyBudgetMs
 				}
 				ps.decoder = NewFECDecoder(blockTimeout, 256)
 			}
@@ -412,8 +416,20 @@ func (m *Manager) ProcessInbound(peerID uint32, packet []byte, nonce uint64, pat
 
 		// Check for skipped nonces (FEC couldn't recover) → queue for NACK
 		if ps.reorderBuf != nil {
+			// Early NACKs — request retransmit immediately when gap detected
+			// (before gap timeout fires), giving RTT time for retransmit to arrive
+			if m.config.ARQEnabled {
+				earlyNonces := ps.reorderBuf.DrainEarlyNACK()
+				for _, n := range earlyNonces {
+					ps.nackTrack.AddMissing(n)
+				}
+				if len(earlyNonces) > 0 {
+					m.triggerNACK(ps)
+				}
+			}
+
+			// Skipped nonces from gap timeout — confirmed losses
 			skipped := ps.reorderBuf.DrainSkippedNonces()
-			// Record losses for path health tracking and FEC adaptation
 			for range skipped {
 				ps.pathTrack.RecordLoss(pathID)
 			}
