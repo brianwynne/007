@@ -411,9 +411,16 @@ func (m *Manager) ProcessInbound(peerID uint32, packet []byte, nonce uint64, pat
 		}
 
 		// Check for skipped nonces (FEC couldn't recover) → queue for NACK
-		if ps.reorderBuf != nil && m.config.ARQEnabled {
+		if ps.reorderBuf != nil {
 			skipped := ps.reorderBuf.DrainSkippedNonces()
+			// Record losses for path health tracking and FEC adaptation
+			for range skipped {
+				ps.pathTrack.RecordLoss(pathID)
+			}
 			for _, n := range skipped {
+				if !m.config.ARQEnabled {
+					continue
+				}
 				// Only NACK if retransmit can arrive within latency budget
 				if m.config.ARQDeadlineCheck && m.config.LatencyBudgetMs > 0 {
 					paths := ps.pathTrack.GetAll()
@@ -625,10 +632,18 @@ func (m *Manager) probeLoop() {
 		case <-ticker.C:
 			m.peersMu.Lock()
 			for _, ps := range m.peers {
-				if ps.sendFunc != nil {
-					// Send probe on default path (pathID 0)
-					probe := buildProbePacket(0)
-					ps.sendFunc(probe)
+				if ps.sendFunc == nil {
+					continue
+				}
+				// Send probe for each known path
+				paths := ps.pathTrack.GetAll()
+				if len(paths) == 0 {
+					// No paths seen yet — probe on default
+					ps.sendFunc(buildProbePacket(0))
+				} else {
+					for _, p := range paths {
+						ps.sendFunc(buildProbePacket(p.PathID))
+					}
 				}
 			}
 			m.peersMu.Unlock()

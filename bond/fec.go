@@ -180,8 +180,11 @@ func (fe *FECEncoder) Encode(data []byte, nonce uint64) (encodedData []byte, par
 	// Block full — generate parity
 	parityPackets = fe.generateParity()
 
-	// Advance to next block
+	// Advance to next block (skip 0xFFFF — reserved for control packets)
 	fe.blockID++
+	if fe.blockID == 0xFFFF {
+		fe.blockID++
+	}
 	fe.blockIdx = 0
 	fe.currentBlock = make([][]byte, fe.k)
 
