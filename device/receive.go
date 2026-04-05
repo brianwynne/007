@@ -8,6 +8,7 @@ package device
 import (
 	"encoding/binary"
 	"errors"
+	"hash/fnv"
 	"net"
 	"sync"
 	"time"
@@ -17,6 +18,18 @@ import (
 	"golang.org/x/net/ipv6"
 	"golang.zx2c4.com/wireguard/conn"
 )
+
+// endpointPathID derives a stable path identifier from a packet's source
+// endpoint. Different sender source IPs (from different bond paths) produce
+// different pathIDs, enabling per-path health tracking on the receiver.
+func endpointPathID(ep conn.Endpoint) int {
+	if ep == nil {
+		return 0
+	}
+	h := fnv.New32a()
+	h.Write([]byte(ep.DstToString()))
+	return int(h.Sum32() & 0x7FFFFFFF)
+}
 
 type QueueHandshakeElement struct {
 	msgType  uint32
@@ -471,7 +484,8 @@ func (peer *Peer) RoutineSequentialReceiver(maxBatchSize int) {
 
 			// 007 Bond: FEC decode — strip header, recover missing packets
 			if device.bondMgr != nil {
-				readyPackets := device.bondMgr.ProcessInbound(peer.bondPeerID, elem.packet, elem.counter, 0)
+				pathID := endpointPathID(elem.endpoint)
+				readyPackets := device.bondMgr.ProcessInbound(peer.bondPeerID, elem.packet, elem.counter, pathID)
 				for pi, pkt := range readyPackets {
 					if len(pkt) == 0 {
 						continue
