@@ -7,15 +7,16 @@ package main
 
 import (
 	"fmt"
+	"log"
 	"os"
 	"os/signal"
 
 	"golang.org/x/sys/windows"
 
+	"golang.zx2c4.com/wireguard/bond"
 	"golang.zx2c4.com/wireguard/conn"
 	"golang.zx2c4.com/wireguard/device"
 	"golang.zx2c4.com/wireguard/ipc"
-
 	"golang.zx2c4.com/wireguard/tun"
 )
 
@@ -25,22 +26,27 @@ const (
 )
 
 func main() {
+	if len(os.Args) == 2 && os.Args[1] == "--version" {
+		fmt.Printf("007 Bond v%s\n\nMulti-path network bonding for windows-%s.\nBased on wireguard-go. https://github.com/brianwynne/007\n", Version, "amd64")
+		return
+	}
+
 	if len(os.Args) != 2 {
+		fmt.Printf("Usage: %s INTERFACE-NAME\n", os.Args[0])
+		fmt.Printf("\n007 Bond — Multi-path network bonding with FEC and reordering\n")
 		os.Exit(ExitSetupFailed)
 	}
 	interfaceName := os.Args[1]
-
-	fmt.Fprintln(os.Stderr, "Warning: this is a test program for Windows, mainly used for debugging this Go package. For a real WireGuard for Windows client, the repo you want is <https://git.zx2c4.com/wireguard-windows/>, which includes this code as a module.")
 
 	logger := device.NewLogger(
 		device.LogLevelVerbose,
 		fmt.Sprintf("(%s) ", interfaceName),
 	)
-	logger.Verbosef("Starting wireguard-go version %s", Version)
+	logger.Verbosef("Starting 007 Bond version %s", Version)
 
-	tun, err := tun.CreateTUN(interfaceName, 0)
+	tunDev, err := tun.CreateTUN(interfaceName, 0)
 	if err == nil {
-		realInterfaceName, err2 := tun.Name()
+		realInterfaceName, err2 := tunDev.Name()
 		if err2 == nil {
 			interfaceName = realInterfaceName
 		}
@@ -49,8 +55,37 @@ func main() {
 		os.Exit(ExitSetupFailed)
 	}
 
-	device := device.NewDevice(tun, conn.NewDefaultBind(), logger)
-	err = device.Up()
+	dev := device.NewDevice(tunDev, conn.NewDefaultBind(), logger)
+
+	// 007 Bond: Create and attach bond manager
+	bondCfg := bond.DefaultConfig()
+	if os.Getenv("BOND_FEC") == "0" {
+		bondCfg.FECEnabled = false
+	}
+	if os.Getenv("BOND_REORDER") == "0" {
+		bondCfg.ReorderEnabled = false
+	}
+	bondLogger := bond.NewStdLogger(log.New(os.Stderr, fmt.Sprintf("(%s) ", interfaceName), log.LstdFlags))
+	bondMgr, err := bond.NewManager(bondCfg, bondLogger)
+	if err != nil {
+		logger.Errorf("Failed to create bond manager: %v", err)
+		os.Exit(ExitSetupFailed)
+	}
+	dev.SetBondManager(bondMgr)
+	bondMgr.Start()
+
+	// Management API
+	apiAddr := os.Getenv("BOND_API")
+	if apiAddr == "" {
+		apiAddr = "127.0.0.1:8007"
+	}
+	apiKey := os.Getenv("BOND_API_KEY")
+	bondAPI := bond.NewAPI(bondMgr, apiAddr, apiKey)
+	bondAPI.Start()
+
+	logger.Verbosef("007 Bond started (FEC=%v, Reorder=%v, API=%s)", bondCfg.FECEnabled, bondCfg.ReorderEnabled, apiAddr)
+
+	err = dev.Up()
 	if err != nil {
 		logger.Errorf("Failed to bring up device: %v", err)
 		os.Exit(ExitSetupFailed)
@@ -73,12 +108,10 @@ func main() {
 				errs <- err
 				return
 			}
-			go device.IpcHandle(conn)
+			go dev.IpcHandle(conn)
 		}
 	}()
 	logger.Verbosef("UAPI listener started")
-
-	// wait for program to terminate
 
 	signal.Notify(term, os.Interrupt)
 	signal.Notify(term, os.Kill)
@@ -87,13 +120,13 @@ func main() {
 	select {
 	case <-term:
 	case <-errs:
-	case <-device.Wait():
+	case <-dev.Wait():
 	}
 
-	// clean up
-
+	bondAPI.Stop()
+	bondMgr.Stop()
 	uapi.Close()
-	device.Close()
+	dev.Close()
 
 	logger.Verbosef("Shutting down")
 }
