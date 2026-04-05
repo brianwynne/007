@@ -29,8 +29,9 @@ import (
 // Rate limiting: max 1 NACK per 10ms to avoid flooding.
 
 const (
-	controlBlockID = 0xFFFF // reserved FEC blockID for control packets
-	controlTypeNACK = 1
+	controlBlockID      = 0xFFFF // reserved FEC blockID for control packets
+	controlTypeNACK     = 1
+	controlTypeRetransmit = 4
 
 	retransmitBufSize = 512   // packets in retransmit ring buffer
 	maxNACKNonces     = 32    // max nonces per NACK packet
@@ -193,6 +194,34 @@ func parseNACKPacket(pkt []byte) []uint64 {
 		nonces[i] = binary.BigEndian.Uint64(pkt[offset : offset+8])
 	}
 	return nonces
+}
+
+// buildRetransmitPacket creates a control packet carrying a retransmitted
+// IP payload with its original dataSeq, so the receiver can insert it
+// at the correct position in the reorder buffer.
+// Format: [blockID=0xFFFF][type=4][k=0][m=0][dataSeq (8)][IP payload]
+func buildRetransmitPacket(dataSeq uint64, payload []byte) []byte {
+	pkt := make([]byte, FECHeaderSize+8+len(payload))
+	binary.BigEndian.PutUint16(pkt[0:2], controlBlockID)
+	pkt[2] = controlTypeRetransmit
+	pkt[3] = 0
+	pkt[4] = 0
+	binary.BigEndian.PutUint64(pkt[FECHeaderSize:FECHeaderSize+8], dataSeq)
+	copy(pkt[FECHeaderSize+8:], payload)
+	return pkt
+}
+
+// parseRetransmitPacket extracts dataSeq and IP payload from a RETRANSMIT packet.
+func parseRetransmitPacket(pkt []byte) (dataSeq uint64, payload []byte) {
+	if len(pkt) < FECHeaderSize+8 {
+		return 0, nil
+	}
+	dataSeq = binary.BigEndian.Uint64(pkt[FECHeaderSize : FECHeaderSize+8])
+	if len(pkt) > FECHeaderSize+8 {
+		payload = make([]byte, len(pkt)-FECHeaderSize-8)
+		copy(payload, pkt[FECHeaderSize+8:])
+	}
+	return dataSeq, payload
 }
 
 // isControlPacket checks if a packet is a bond control message (not data).

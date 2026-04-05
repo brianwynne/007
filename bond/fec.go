@@ -58,10 +58,10 @@ const (
 	fecLossWindowSize = 200 // packets in loss measurement window
 )
 
-// DecodedPacket holds a decoded packet with its WireGuard nonce.
+// DecodedPacket holds a decoded packet with its data sequence number.
 type DecodedPacket struct {
-	Data  []byte // IP packet (FEC header + nonce stripped)
-	Nonce uint64 // WireGuard nonce — available for reorder buffer
+	Data    []byte // IP packet (FEC header + seq stripped)
+	DataSeq uint64 // data-only sequence number for reorder buffer
 }
 
 // FECEncoder groups outgoing packets and generates parity packets.
@@ -72,6 +72,11 @@ type FECEncoder struct {
 	blockID uint16
 	encoder reedsolomon.Encoder
 	config  Config // configurable thresholds and ratios
+
+	// Data sequence counter — increments only for data packets,
+	// never for parity or control. Used for reorder buffer ordering
+	// to avoid phantom gaps from parity nonces.
+	dataSeq uint64
 
 	// Current block being filled
 	currentBlock [][]byte // K data packets
@@ -88,10 +93,14 @@ type FECDecoder struct {
 	mu sync.Mutex
 
 	// Active blocks waiting for completion
-	blocks map[uint16]*fecBlock
+	blocks    map[uint16]*fecBlock
+	maxBlocks int // cap on concurrent blocks (0 = 256 default)
 
 	// Cached RS encoders — avoids expensive reedsolomon.New() on every recovery
 	rsCache map[uint32]reedsolomon.Encoder // key: k<<16 | m
+
+	// Block timeout
+	blockTimeoutMs int // 0 = use fecBlockTimeoutMs constant
 
 	// Stats
 	recoveredCount uint64
@@ -137,20 +146,24 @@ func NewFECEncoder(cfg Config) (*FECEncoder, error) {
 }
 
 // Encode adds a data packet to the current FEC block.
-// The nonce is embedded in the FEC-protected payload so it can be recovered.
-// Returns encodedData: [FEC header (5)][nonce (8)][IP data].
-// When the block is full (K packets), also returns M parity packets.
-func (fe *FECEncoder) Encode(data []byte, nonce uint64) (encodedData []byte, parityPackets [][]byte) {
+// A data-only sequence number (dataSeq) is embedded in the FEC-protected
+// payload. This counter only increments for data packets, never parity,
+// so the reorder buffer sees a contiguous sequence with no phantom gaps.
+// Returns encodedData, any parity packets, and the assigned dataSeq.
+func (fe *FECEncoder) Encode(data []byte, nonce uint64) (encodedData []byte, parityPackets [][]byte, dataSeq uint64) {
 	fe.mu.Lock()
 	defer fe.mu.Unlock()
 
-	// Build: [FEC header (5)][nonce (8)][IP data]
+	dataSeq = fe.dataSeq
+	fe.dataSeq++
+
+	// Build: [FEC header (5)][dataSeq (8)][IP data]
 	headerData := make([]byte, FECPayloadOffset+len(data))
 	binary.BigEndian.PutUint16(headerData[0:2], fe.blockID)
 	headerData[2] = byte(fe.blockIdx) // index within block
 	headerData[3] = byte(fe.k)       // K value
 	headerData[4] = byte(fe.m)       // M value
-	binary.BigEndian.PutUint64(headerData[FECHeaderSize:FECPayloadOffset], nonce)
+	binary.BigEndian.PutUint64(headerData[FECHeaderSize:FECPayloadOffset], dataSeq)
 	copy(headerData[FECPayloadOffset:], data)
 
 	fe.currentBlock[fe.blockIdx] = headerData
@@ -161,7 +174,7 @@ func (fe *FECEncoder) Encode(data []byte, nonce uint64) (encodedData []byte, par
 
 	// Block not full yet
 	if fe.blockIdx < fe.k {
-		return encodedData, nil
+		return encodedData, nil, dataSeq
 	}
 
 	// Block full — generate parity
@@ -172,7 +185,7 @@ func (fe *FECEncoder) Encode(data []byte, nonce uint64) (encodedData []byte, par
 	fe.blockIdx = 0
 	fe.currentBlock = make([][]byte, fe.k)
 
-	return encodedData, parityPackets
+	return encodedData, parityPackets, dataSeq
 }
 
 // generateParity creates M parity packets from the current K data packets.
@@ -263,10 +276,15 @@ func (fe *FECEncoder) AdaptRate(lossRate float64) error {
 }
 
 // NewFECDecoder creates a new FEC decoder.
-func NewFECDecoder() *FECDecoder {
+func NewFECDecoder(blockTimeoutMs, maxBlocks int) *FECDecoder {
+	if maxBlocks <= 0 {
+		maxBlocks = 256
+	}
 	return &FECDecoder{
-		blocks:  make(map[uint16]*fecBlock),
-		rsCache: make(map[uint32]reedsolomon.Encoder),
+		blocks:         make(map[uint16]*fecBlock),
+		maxBlocks:      maxBlocks,
+		rsCache:        make(map[uint32]reedsolomon.Encoder),
+		blockTimeoutMs: blockTimeoutMs,
 	}
 }
 
@@ -311,6 +329,30 @@ func (fd *FECDecoder) Decode(packet []byte) (data *DecodedPacket, recovered []*D
 
 	block, exists := fd.blocks[blockID]
 	if !exists {
+		// Evict oldest block if at capacity
+		if len(fd.blocks) >= fd.maxBlocks {
+			var oldestID uint16
+			var oldestTime time.Time
+			for id, b := range fd.blocks {
+				if oldestTime.IsZero() || b.created.Before(oldestTime) {
+					oldestID = id
+					oldestTime = b.created
+				}
+			}
+			if old, ok := fd.blocks[oldestID]; ok {
+				if old.timer != nil {
+					old.timer.Stop()
+				}
+				delete(fd.blocks, oldestID)
+				fd.failedCount++
+			}
+		}
+
+		timeout := fd.blockTimeoutMs
+		if timeout <= 0 {
+			timeout = fecBlockTimeoutMs
+		}
+
 		block = &fecBlock{
 			k:       k,
 			m:       m,
@@ -321,7 +363,7 @@ func (fd *FECDecoder) Decode(packet []byte) (data *DecodedPacket, recovered []*D
 		fd.blocks[blockID] = block
 
 		block.timer = time.AfterFunc(
-			time.Duration(fecBlockTimeoutMs)*time.Millisecond,
+			time.Duration(timeout)*time.Millisecond,
 			func() { fd.blockTimeout(blockID) },
 		)
 	}
@@ -348,12 +390,12 @@ func (fd *FECDecoder) Decode(packet []byte) (data *DecodedPacket, recovered []*D
 		}
 	}
 
-	// Data packet (index < K): extract nonce + IP payload
+	// Data packet (index < K): extract dataSeq + IP payload
 	if index < k && len(packet) >= FECPayloadOffset {
-		nonce := binary.BigEndian.Uint64(packet[FECHeaderSize:FECPayloadOffset])
+		seq := binary.BigEndian.Uint64(packet[FECHeaderSize:FECPayloadOffset])
 		payload := make([]byte, len(packet)-FECPayloadOffset)
 		copy(payload, packet[FECPayloadOffset:])
-		data = &DecodedPacket{Data: payload, Nonce: nonce}
+		data = &DecodedPacket{Data: payload, DataSeq: seq}
 	}
 
 	// Check if we can recover missing data packets
@@ -404,16 +446,16 @@ func (fd *FECDecoder) tryRecover(blockID uint16, block *fecBlock) []*DecodedPack
 		return nil
 	}
 
-	// Extract recovered data packets — nonce is at bytes 5-13 of each shard
+	// Extract recovered data packets — dataSeq is at bytes 5-13 of each shard
 	var recovered []*DecodedPacket
 	for _, idx := range missing {
 		shard := block.shards[idx]
 		if len(shard) >= FECPayloadOffset {
-			nonce := binary.BigEndian.Uint64(shard[FECHeaderSize:FECPayloadOffset])
+			seq := binary.BigEndian.Uint64(shard[FECHeaderSize:FECPayloadOffset])
 			payload := make([]byte, len(shard)-FECPayloadOffset)
 			copy(payload, shard[FECPayloadOffset:])
 			fd.recoveredCount++
-			recovered = append(recovered, &DecodedPacket{Data: payload, Nonce: nonce})
+			recovered = append(recovered, &DecodedPacket{Data: payload, DataSeq: seq})
 		}
 	}
 

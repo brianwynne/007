@@ -13,31 +13,29 @@ func TestManager_ProcessOutboundInbound_Roundtrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	mgr.Start()
+	defer mgr.Stop()
 
 	peerID := uint32(1)
+	K := cfg.FECLowK // 8
 
-	// Send K=16 packets through outbound, collect all encoded packets
+	// Send K packets through outbound
 	var allEncoded [][]byte
-	var originalNonces []uint64
-	for i := 0; i < 16; i++ {
+	for i := 0; i < K; i++ {
 		pkt := []byte{byte(i), 0xDE, 0xAD}
-		nonce := uint64(i)
-		originalNonces = append(originalNonces, nonce)
-		encoded := mgr.ProcessOutbound(peerID, pkt, nonce)
+		encoded := mgr.ProcessOutbound(peerID, pkt, uint64(i))
 		allEncoded = append(allEncoded, encoded...)
 	}
 
-	// Feed all encoded packets through inbound — should recover all originals
+	// Feed all through inbound
 	var received [][]byte
 	for i, enc := range allEncoded {
-		// Use the nonce from the first 16 (data packets)
-		nonce := uint64(i)
-		result := mgr.ProcessInbound(peerID, enc, nonce, 0)
+		result := mgr.ProcessInbound(peerID, enc, uint64(i), 0)
 		received = append(received, result...)
 	}
 
-	if len(received) != 16 {
-		t.Fatalf("expected 16 received packets, got %d", len(received))
+	if len(received) != K {
+		t.Fatalf("expected %d received packets, got %d", K, len(received))
 	}
 
 	for i, pkt := range received {
@@ -57,10 +55,10 @@ func TestManager_ProcessInbound_WithRecovery(t *testing.T) {
 	}
 
 	peerID := uint32(1)
+	K := cfg.FECLowK // 8
 
-	// Encode 16 packets
 	var allEncoded [][]byte
-	for i := 0; i < 16; i++ {
+	for i := 0; i < K; i++ {
 		pkt := make([]byte, 20)
 		pkt[0] = byte(i)
 		encoded := mgr.ProcessOutbound(peerID, pkt, uint64(i))
@@ -71,15 +69,14 @@ func TestManager_ProcessInbound_WithRecovery(t *testing.T) {
 	var received [][]byte
 	for i, enc := range allEncoded {
 		if i == 3 {
-			continue // lost
+			continue
 		}
 		result := mgr.ProcessInbound(peerID, enc, uint64(i), 0)
 		received = append(received, result...)
 	}
 
-	// Should have all 16 (15 direct + 1 recovered)
-	if len(received) != 16 {
-		t.Fatalf("expected 16 packets (with recovery), got %d", len(received))
+	if len(received) != K {
+		t.Fatalf("expected %d packets (with recovery), got %d", K, len(received))
 	}
 }
 
@@ -118,46 +115,44 @@ func TestManager_PerPeerIsolation(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Two peers encoding independently
 	peer1 := uint32(1)
 	peer2 := uint32(2)
+	K := cfg.FECLowK // 8
+	expectedTotal := K + cfg.FECLowM // 10
 
-	// Peer 1 sends 16 packets
 	var peer1Encoded [][]byte
-	for i := 0; i < 16; i++ {
-		pkt := []byte{1, byte(i)} // peer 1 marker
+	for i := 0; i < K; i++ {
+		pkt := []byte{1, byte(i)}
 		encoded := mgr.ProcessOutbound(peer1, pkt, uint64(i))
 		peer1Encoded = append(peer1Encoded, encoded...)
 	}
 
-	// Peer 2 sends 16 packets
 	var peer2Encoded [][]byte
-	for i := 0; i < 16; i++ {
-		pkt := []byte{2, byte(i)} // peer 2 marker
+	for i := 0; i < K; i++ {
+		pkt := []byte{2, byte(i)}
 		encoded := mgr.ProcessOutbound(peer2, pkt, uint64(i))
 		peer2Encoded = append(peer2Encoded, encoded...)
 	}
 
-	// Both should have 18 packets (16 data + 2 parity)
-	if len(peer1Encoded) != 18 {
-		t.Errorf("peer1: %d encoded, want 18", len(peer1Encoded))
+	if len(peer1Encoded) != expectedTotal {
+		t.Errorf("peer1: %d encoded, want %d", len(peer1Encoded), expectedTotal)
 	}
-	if len(peer2Encoded) != 18 {
-		t.Errorf("peer2: %d encoded, want 18", len(peer2Encoded))
+	if len(peer2Encoded) != expectedTotal {
+		t.Errorf("peer2: %d encoded, want %d", len(peer2Encoded), expectedTotal)
 	}
 
 	// Decode peer 1's packets (drop one) — should recover
 	var peer1Received [][]byte
 	for i, enc := range peer1Encoded {
-		if i == 5 {
+		if i == 3 {
 			continue
 		}
 		result := mgr.ProcessInbound(peer1, enc, uint64(i), 0)
 		peer1Received = append(peer1Received, result...)
 	}
 
-	if len(peer1Received) != 16 {
-		t.Errorf("peer1: %d received, want 16", len(peer1Received))
+	if len(peer1Received) != K {
+		t.Errorf("peer1: %d received, want %d", len(peer1Received), K)
 	}
 
 	// Verify peer 1's data is not contaminated by peer 2
@@ -198,12 +193,12 @@ func TestManager_ARQRetransmit(t *testing.T) {
 
 	peerID := uint32(1)
 
-	// Store some packets via ProcessOutbound
+	// Store some packets via ProcessOutbound (keyed by nonce when FEC disabled)
 	for i := 0; i < 10; i++ {
 		mgr.ProcessOutbound(peerID, []byte{byte(i), 0xBE, 0xEF}, uint64(i))
 	}
 
-	// Set up send func to capture retransmitted packets
+	// Capture retransmitted packets (now RETRANSMIT control packets)
 	var retransmitted [][]byte
 	mgr.SetPeerSendFunc(peerID, func(data []byte) {
 		cp := make([]byte, len(data))
@@ -211,7 +206,7 @@ func TestManager_ARQRetransmit(t *testing.T) {
 		retransmitted = append(retransmitted, cp)
 	})
 
-	// Simulate receiving a NACK for nonces 3 and 7
+	// NACK for nonces 3 and 7
 	nack := buildNACKPacket([]uint64{3, 7})
 	mgr.ProcessInbound(peerID, nack, 0, 0)
 
@@ -219,9 +214,24 @@ func TestManager_ARQRetransmit(t *testing.T) {
 		t.Fatalf("expected 2 retransmissions, got %d", len(retransmitted))
 	}
 
-	// Verify retransmitted data
-	if retransmitted[0][0] != 3 || retransmitted[1][0] != 7 {
-		t.Errorf("retransmitted wrong packets: [%d, %d]", retransmitted[0][0], retransmitted[1][0])
+	// Retransmitted packets are RETRANSMIT control packets — parse them
+	for i, pkt := range retransmitted {
+		if !isControlPacket(pkt) {
+			t.Errorf("retransmit %d: not a control packet", i)
+			continue
+		}
+		seq, payload := parseRetransmitPacket(pkt)
+		if payload == nil {
+			t.Errorf("retransmit %d: nil payload", i)
+			continue
+		}
+		expectedSeq := []uint64{3, 7}[i]
+		if seq != expectedSeq {
+			t.Errorf("retransmit %d: seq=%d, want %d", i, seq, expectedSeq)
+		}
+		if payload[0] != byte(expectedSeq) {
+			t.Errorf("retransmit %d: data[0]=%d, want %d", i, payload[0], expectedSeq)
+		}
 	}
 }
 

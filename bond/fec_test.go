@@ -6,89 +6,90 @@ import (
 	"testing"
 )
 
+// testConfig returns a config with explicit K=8, M=2 for predictable tests.
+func testConfig() Config {
+	cfg := DefaultConfig()
+	cfg.FECLowK = 8
+	cfg.FECLowM = 2
+	return cfg
+}
+
 func TestFECEncoderDecoder_Roundtrip(t *testing.T) {
-	enc, err := NewFECEncoder(DefaultConfig())
+	cfg := testConfig() // K=8, M=2
+	enc, err := NewFECEncoder(cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
-	dec := NewFECDecoder()
+	dec := NewFECDecoder(200, 256)
 
-	// Send K=16 packets through encoder, collect encoded data + parity
+	// Send K=8 packets through encoder
 	var encoded [][]byte
-	var nonces []uint64
-	for i := 0; i < 16; i++ {
+	for i := 0; i < 8; i++ {
 		pkt := []byte{byte(i), 0xAA, 0xBB, 0xCC}
-		nonce := uint64(100 + i)
-		nonces = append(nonces, nonce)
-		data, parity := enc.Encode(pkt, nonce)
+		data, parity, _ := enc.Encode(pkt, uint64(100+i))
 		encoded = append(encoded, data)
 		if parity != nil {
 			encoded = append(encoded, parity...)
 		}
 	}
 
-	// Should have 16 data + 2 parity = 18 packets
-	if len(encoded) != 18 {
-		t.Fatalf("expected 18 encoded packets, got %d", len(encoded))
+	// Should have 8 data + 2 parity = 10 packets
+	if len(encoded) != 10 {
+		t.Fatalf("expected 10 encoded packets, got %d", len(encoded))
 	}
 
-	// Decode all data packets — should get payloads back
-	for i := 0; i < 16; i++ {
-		data, recovered := dec.Decode(encoded[i])
+	// Decode all — should get payloads back with sequential dataSeq
+	for i := 0; i < 8; i++ {
+		data, _ := dec.Decode(encoded[i])
 		if data == nil {
 			t.Fatalf("packet %d: expected data, got nil", i)
 		}
-		if data.Nonce != nonces[i] {
-			t.Errorf("packet %d: nonce=%d, want %d", i, data.Nonce, nonces[i])
+		if data.DataSeq != uint64(i) {
+			t.Errorf("packet %d: dataSeq=%d, want %d", i, data.DataSeq, i)
 		}
 		expected := []byte{byte(i), 0xAA, 0xBB, 0xCC}
 		if !bytes.Equal(data.Data, expected) {
 			t.Errorf("packet %d: data=%v, want %v", i, data.Data, expected)
 		}
-		_ = recovered // may trigger cleanup
 	}
 }
 
 func TestFECRecovery_SingleLoss(t *testing.T) {
-	enc, err := NewFECEncoder(DefaultConfig())
+	cfg := testConfig() // K=8, M=2
+	enc, err := NewFECEncoder(cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
-	dec := NewFECDecoder()
+	dec := NewFECDecoder(200, 256)
 
-	// Encode 16 packets
+	// Encode 8 packets
 	var encoded [][]byte
-	for i := 0; i < 16; i++ {
+	for i := 0; i < 8; i++ {
 		pkt := make([]byte, 100)
 		pkt[0] = byte(i)
-		binary.BigEndian.PutUint32(pkt[4:8], uint32(i))
-		data, parity := enc.Encode(pkt, uint64(i))
+		data, parity, _ := enc.Encode(pkt, uint64(i))
 		encoded = append(encoded, data)
 		if parity != nil {
 			encoded = append(encoded, parity...)
 		}
 	}
 
-	// Drop packet 5, feed rest to decoder
-	lostIdx := 5
+	// Drop packet 3 (data index 3), feed rest to decoder
+	lostIdx := 3
 	var recovered []*DecodedPacket
 	for i, pkt := range encoded {
 		if i == lostIdx {
-			continue // simulate loss
+			continue
 		}
-		data, rec := dec.Decode(pkt)
-		_ = data
+		_, rec := dec.Decode(pkt)
 		recovered = append(recovered, rec...)
 	}
 
-	// Should have recovered exactly 1 packet
 	if len(recovered) != 1 {
 		t.Fatalf("expected 1 recovered packet, got %d", len(recovered))
 	}
-
-	// Verify recovered data
-	if recovered[0].Nonce != uint64(lostIdx) {
-		t.Errorf("recovered nonce=%d, want %d", recovered[0].Nonce, lostIdx)
+	if recovered[0].DataSeq != uint64(lostIdx) {
+		t.Errorf("recovered dataSeq=%d, want %d", recovered[0].DataSeq, lostIdx)
 	}
 	if recovered[0].Data[0] != byte(lostIdx) {
 		t.Errorf("recovered data[0]=%d, want %d", recovered[0].Data[0], lostIdx)
@@ -96,26 +97,26 @@ func TestFECRecovery_SingleLoss(t *testing.T) {
 }
 
 func TestFECRecovery_TwoLoss(t *testing.T) {
-	enc, err := NewFECEncoder(DefaultConfig())
+	cfg := testConfig() // K=8, M=2 — can recover exactly 2
+	enc, err := NewFECEncoder(cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
-	dec := NewFECDecoder()
+	dec := NewFECDecoder(200, 256)
 
-	// Default K=16, M=2 — can recover up to 2 lost packets
 	var encoded [][]byte
-	for i := 0; i < 16; i++ {
+	for i := 0; i < 8; i++ {
 		pkt := make([]byte, 50)
 		pkt[0] = byte(i)
-		data, parity := enc.Encode(pkt, uint64(i))
+		data, parity, _ := enc.Encode(pkt, uint64(i))
 		encoded = append(encoded, data)
 		if parity != nil {
 			encoded = append(encoded, parity...)
 		}
 	}
 
-	// Drop packets 3 and 10
-	drop := map[int]bool{3: true, 10: true}
+	// Drop packets 2 and 5 (both in same block)
+	drop := map[int]bool{2: true, 5: true}
 	var recovered []*DecodedPacket
 	for i, pkt := range encoded {
 		if drop[i] {
@@ -128,37 +129,35 @@ func TestFECRecovery_TwoLoss(t *testing.T) {
 	if len(recovered) != 2 {
 		t.Fatalf("expected 2 recovered packets, got %d", len(recovered))
 	}
-
-	// Verify nonces
-	nonces := map[uint64]bool{}
+	seqs := map[uint64]bool{}
 	for _, r := range recovered {
-		nonces[r.Nonce] = true
+		seqs[r.DataSeq] = true
 	}
-	if !nonces[3] || !nonces[10] {
-		t.Errorf("expected nonces 3 and 10, got %v", nonces)
+	if !seqs[2] || !seqs[5] {
+		t.Errorf("expected dataSeqs 2 and 5, got %v", seqs)
 	}
 }
 
 func TestFECRecovery_TooManyLost(t *testing.T) {
-	enc, err := NewFECEncoder(DefaultConfig())
+	cfg := testConfig() // K=8, M=2 — 3 lost in same block is unrecoverable
+	enc, err := NewFECEncoder(cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
-	dec := NewFECDecoder()
+	dec := NewFECDecoder(200, 256)
 
-	// K=16, M=2 — 3 lost packets is unrecoverable
 	var encoded [][]byte
-	for i := 0; i < 16; i++ {
+	for i := 0; i < 8; i++ {
 		pkt := []byte{byte(i)}
-		data, parity := enc.Encode(pkt, uint64(i))
+		data, parity, _ := enc.Encode(pkt, uint64(i))
 		encoded = append(encoded, data)
 		if parity != nil {
 			encoded = append(encoded, parity...)
 		}
 	}
 
-	// Drop 3 packets
-	drop := map[int]bool{1: true, 7: true, 12: true}
+	// Drop 3 data packets from the same block (indices 1, 4, 6)
+	drop := map[int]bool{1: true, 4: true, 6: true}
 	var recovered []*DecodedPacket
 	for i, pkt := range encoded {
 		if drop[i] {
@@ -169,20 +168,17 @@ func TestFECRecovery_TooManyLost(t *testing.T) {
 	}
 
 	if len(recovered) != 0 {
-		t.Errorf("expected 0 recovered packets with 3 lost, got %d", len(recovered))
+		t.Errorf("expected 0 recovered packets with 3 lost (M=2), got %d", len(recovered))
 	}
 }
 
 func TestFECKeepaliveBypass(t *testing.T) {
-	// Empty packets (keepalives) should NOT be FEC-encoded
-	// This is handled at the device level, but verify encoder handles empty data
-	enc, err := NewFECEncoder(DefaultConfig())
+	enc, err := NewFECEncoder(testConfig())
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	data, parity := enc.Encode([]byte{}, 0)
-	// Should still produce encoded data (FEC header + nonce + empty payload)
+	data, parity, _ := enc.Encode([]byte{}, 0)
 	if len(data) != FECPayloadOffset {
 		t.Errorf("encoded empty packet length=%d, want %d", len(data), FECPayloadOffset)
 	}
@@ -192,20 +188,20 @@ func TestFECKeepaliveBypass(t *testing.T) {
 }
 
 func TestFECHeaderFormat(t *testing.T) {
-	enc, err := NewFECEncoder(DefaultConfig())
+	cfg := testConfig() // K=8, M=2
+	enc, err := NewFECEncoder(cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	pkt := []byte{0x45, 0x00, 0x00, 0x1c} // IPv4-like
-	data, _ := enc.Encode(pkt, 12345)
+	pkt := []byte{0x45, 0x00, 0x00, 0x1c}
+	data, _, seq := enc.Encode(pkt, 12345)
 
-	// Check FEC header
 	blockID := binary.BigEndian.Uint16(data[0:2])
 	index := data[2]
 	k := data[3]
 	m := data[4]
-	nonce := binary.BigEndian.Uint64(data[FECHeaderSize:FECPayloadOffset])
+	embeddedSeq := binary.BigEndian.Uint64(data[FECHeaderSize:FECPayloadOffset])
 
 	if blockID != 0 {
 		t.Errorf("blockID=%d, want 0", blockID)
@@ -213,33 +209,72 @@ func TestFECHeaderFormat(t *testing.T) {
 	if index != 0 {
 		t.Errorf("index=%d, want 0", index)
 	}
-	if k != 16 {
-		t.Errorf("K=%d, want 16", k)
+	if k != 8 {
+		t.Errorf("K=%d, want 8", k)
 	}
 	if m != 2 {
 		t.Errorf("M=%d, want 2", m)
 	}
-	if nonce != 12345 {
-		t.Errorf("nonce=%d, want 12345", nonce)
+	if embeddedSeq != seq {
+		t.Errorf("embedded seq=%d, want %d", embeddedSeq, seq)
 	}
-
-	// Payload should match original
 	if !bytes.Equal(data[FECPayloadOffset:], pkt) {
 		t.Errorf("payload mismatch")
 	}
 }
 
 func TestFECControlPacketNotDecoded(t *testing.T) {
-	dec := NewFECDecoder()
-
-	// Control packet (blockID = 0xFFFF) should not be decoded as FEC
+	dec := NewFECDecoder(100, 256)
 	pkt := make([]byte, 20)
 	binary.BigEndian.PutUint16(pkt[0:2], controlBlockID)
 	pkt[2] = controlTypeNACK
 
 	data, recovered := dec.Decode(pkt)
-	// k=0, m=0 → should return nil
 	if data != nil || recovered != nil {
 		t.Error("control packet should not produce decoded data")
+	}
+}
+
+func TestFECDataSeqContiguous(t *testing.T) {
+	// Verify dataSeq increments only for data packets, never for parity
+	cfg := testConfig() // K=8, M=2
+	enc, err := NewFECEncoder(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var seqs []uint64
+	for i := 0; i < 16; i++ {
+		_, _, seq := enc.Encode([]byte{byte(i)}, uint64(100+i))
+		seqs = append(seqs, seq)
+	}
+
+	// dataSeq should be 0,1,2,...,15 (contiguous, no gaps from parity)
+	for i, seq := range seqs {
+		if seq != uint64(i) {
+			t.Errorf("dataSeq[%d]=%d, want %d (parity gap?)", i, seq, i)
+		}
+	}
+}
+
+func TestFECBlockCap(t *testing.T) {
+	dec := NewFECDecoder(100, 4) // max 4 concurrent blocks
+
+	// Create 6 blocks — should cap at 4, evicting oldest
+	for blockID := uint16(0); blockID < 6; blockID++ {
+		pkt := make([]byte, FECPayloadOffset+10)
+		binary.BigEndian.PutUint16(pkt[0:2], blockID)
+		pkt[2] = 0 // index 0
+		pkt[3] = 8 // K=8
+		pkt[4] = 2 // M=2
+		dec.Decode(pkt)
+	}
+
+	dec.mu.Lock()
+	n := len(dec.blocks)
+	dec.mu.Unlock()
+
+	if n > 4 {
+		t.Errorf("block count=%d, should be capped at 4", n)
 	}
 }

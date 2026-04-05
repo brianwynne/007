@@ -48,6 +48,9 @@ type ReorderBuffer struct {
 
 	// Skipped nonces for ARQ NACK generation
 	skippedNonces []uint64
+
+	// Packets released by background Flush, delivered on next InsertAt
+	pendingFlush [][]byte
 }
 
 // bufferedPacket holds a packet waiting for in-order delivery.
@@ -111,6 +114,13 @@ func (rb *ReorderBuffer) InsertAt(data []byte, nonce uint64, pathID int, now tim
 	rb.mu.Lock()
 	defer rb.mu.Unlock()
 
+	// Drain any packets released by background Flush
+	var result [][]byte
+	if len(rb.pendingFlush) > 0 {
+		result = append(result, rb.pendingFlush...)
+		rb.pendingFlush = nil
+	}
+
 	// Update path stats
 	ps := rb.getPathStats(pathID)
 	ps.LastSeen = now
@@ -123,8 +133,7 @@ func (rb *ReorderBuffer) InsertAt(data []byte, nonce uint64, pathID int, now tim
 	}
 
 	// Check gap timeout before processing new packet
-	var result [][]byte
-	result = rb.checkGapTimeout(now)
+	result = append(result, rb.checkGapTimeout(now)...)
 
 	// Duplicate or late — already delivered or skipped
 	if nonce < rb.nextExpect {
@@ -168,12 +177,15 @@ func (rb *ReorderBuffer) InsertAt(data []byte, nonce uint64, pathID int, now tim
 	return result
 }
 
-// Flush checks for timed-out gaps and delivers any ready packets.
-// Call periodically (e.g., every 10-20ms) from a background goroutine.
-func (rb *ReorderBuffer) Flush() [][]byte {
+// Flush checks for timed-out gaps. Packets released are stored in
+// pendingFlush and delivered on the next InsertAt call.
+func (rb *ReorderBuffer) Flush() {
 	rb.mu.Lock()
 	defer rb.mu.Unlock()
-	return rb.checkGapTimeout(time.Now())
+	flushed := rb.checkGapTimeout(time.Now())
+	if len(flushed) > 0 {
+		rb.pendingFlush = append(rb.pendingFlush, flushed...)
+	}
 }
 
 // checkGapTimeout checks if we've been waiting for nextExpect too long.

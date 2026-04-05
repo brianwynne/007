@@ -217,3 +217,26 @@ Claude must check for: latency violations, unbounded recovery behaviour, missing
 This system is judged by how it behaves under failure, not how it behaves under ideal conditions.
 
 All code must be written with impaired networks as the default scenario, not the exception.
+
+## Verification Workflow
+
+For any changes affecting RTP, SIP, bonding, scheduler logic, interface selection, FEC, Reed-Solomon, ARQ, path scoring, playout, jitter buffering, resequencing, failover, or degraded-mode behaviour:
+
+- use the architecture-reviewer agent
+- use the rtp-verifier agent
+- use the sip-verifier agent
+- use the recovery-verifier agent
+- use the observability-reviewer agent
+- use the security-reviewer agent
+- use the impairment-tester agent when behaviour may change under loss, jitter, reordering, duplication, asymmetry, roaming, or failover
+
+Preferred skills:
+- /verify-transport
+- /run-impairment-suite
+- /review-pr
+
+Do not consider work complete until:
+- protocol correctness has been reviewed
+- impairment scenarios have been considered
+- observability impact has been reviewed
+- production risk has been stated explicitly

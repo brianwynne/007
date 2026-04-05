@@ -156,12 +156,12 @@ func DefaultConfig() Config {
 
 		FECEnabled:        true,
 		FECAdaptive:       true,
-		FECBlockTimeoutMs: 50,
+		FECBlockTimeoutMs: 0, // 0 = auto-compute from K * PacketIntervalMs + 50ms
 		FECLossWindow:     200,
 		FECAdaptIntervalMs: 500,
-		FECLowK: 16, FECLowM: 2,
-		FECMedK: 12, FECMedM: 4,
-		FECHighK: 8, FECHighM: 6,
+		FECLowK: 8, FECLowM: 2,   // 160ms fill at 50pps, within 200ms budget
+		FECMedK: 6, FECMedM: 3,   // 120ms fill, 50% overhead
+		FECHighK: 4, FECHighM: 4, // 80ms fill, 100% overhead, recovers 4
 		FECLowThreshold:  0.01,
 		FECHighThreshold: 0.05,
 
@@ -190,10 +190,11 @@ type peerState struct {
 	encoder    *FECEncoder
 	decoder    *FECDecoder
 	reorderBuf *ReorderBuffer
-	retransmit *retransmitBuffer // sender side: recent packets for retransmission
-	nackTrack  *nackTracker      // receiver side: tracks unrecoverable gaps
-	pathTrack  *pathTracker      // per-path health metrics
-	sendFunc   func(data []byte) // callback to inject packets into send path
+	retransmit        *retransmitBuffer // sender side: recent packets for retransmission
+	nackTrack         *nackTracker      // receiver side: tracks unrecoverable gaps
+	pathTrack         *pathTracker      // per-path health metrics
+	sendFunc          func(data []byte) // callback to inject packets into send path
+	lastNACKProcessed time.Time         // sender-side NACK rate limit
 }
 
 // Manager coordinates FEC encoding/decoding and packet reordering.
@@ -252,7 +253,12 @@ func (m *Manager) getPeerState(peerID uint32) *peerState {
 				m.logger.Error("failed to create FEC encoder", "peer", peerID, "err", err)
 			} else {
 				ps.encoder = enc
-				ps.decoder = NewFECDecoder()
+				// Auto-compute block timeout from K and packet interval
+				blockTimeout := m.config.FECBlockTimeoutMs
+				if blockTimeout <= 0 {
+					blockTimeout = m.config.FECLowK*m.config.PacketIntervalMs + 50
+				}
+				ps.decoder = NewFECDecoder(blockTimeout, 256)
 			}
 		}
 		if m.config.ReorderEnabled {
@@ -335,15 +341,17 @@ func (m *Manager) ProcessOutbound(peerID uint32, packet []byte, nonce uint64) []
 
 	ps := m.getPeerState(peerID)
 
-	// Always store in retransmit buffer for ARQ (regardless of FEC)
-	ps.retransmit.Store(packet, nonce)
-
 	if !m.config.FECEnabled || ps.encoder == nil {
+		// No FEC — store with nonce as fallback sequence number
+		ps.retransmit.Store(packet, nonce)
 		return [][]byte{packet}
 	}
 
-	// FEC encode — prepends header + nonce, generates parity when block is full
-	encodedData, parityPackets := ps.encoder.Encode(packet, nonce)
+	// FEC encode — prepends header + dataSeq, generates parity when block is full
+	encodedData, parityPackets, dataSeq := ps.encoder.Encode(packet, nonce)
+
+	// Store with dataSeq (not WG nonce) so ARQ can retransmit with correct sequence
+	ps.retransmit.Store(packet, dataSeq)
 
 	result := make([][]byte, 0, 1+len(parityPackets))
 	result = append(result, encodedData)
@@ -367,10 +375,9 @@ func (m *Manager) ProcessInbound(peerID uint32, packet []byte, nonce uint64, pat
 	// Track per-path receive stats
 	ps.pathTrack.RecordReceive(pathID)
 
-	// Check for control packets (NACK, etc.) — these are NOT data
+	// Check for control packets (NACK, retransmit, etc.)
 	if isControlPacket(packet) {
-		m.handleControl(ps, packet)
-		return nil
+		return m.handleControl(ps, packet, pathID)
 	}
 
 	// FEC decode
@@ -379,19 +386,19 @@ func (m *Manager) ProcessInbound(peerID uint32, packet []byte, nonce uint64, pat
 
 		var result [][]byte
 
-		// Data packet → reorder using its embedded nonce
+		// Data packet → reorder using its dataSeq (contiguous, no phantom gaps)
 		if data != nil {
 			if m.config.ReorderEnabled && ps.reorderBuf != nil {
-				result = append(result, ps.reorderBuf.InsertAt(data.Data, data.Nonce, pathID, now)...)
+				result = append(result, ps.reorderBuf.InsertAt(data.Data, data.DataSeq, pathID, now)...)
 			} else {
 				result = append(result, data.Data)
 			}
 		}
 
-		// Recovered packets → also reorder (nonce recovered from FEC payload)
+		// Recovered packets → also reorder (dataSeq recovered from FEC payload)
 		for _, rec := range recovered {
 			if m.config.ReorderEnabled && ps.reorderBuf != nil {
-				result = append(result, ps.reorderBuf.InsertAt(rec.Data, rec.Nonce, pathID, now)...)
+				result = append(result, ps.reorderBuf.InsertAt(rec.Data, rec.DataSeq, pathID, now)...)
 			} else {
 				result = append(result, rec.Data)
 			}
@@ -435,48 +442,64 @@ func (m *Manager) ProcessInbound(peerID uint32, packet []byte, nonce uint64, pat
 }
 
 // handleControl processes a bond control packet (NACK, etc.).
-func (m *Manager) handleControl(ps *peerState, packet []byte) {
+func (m *Manager) handleControl(ps *peerState, packet []byte, pathID int) [][]byte {
 	if len(packet) < FECHeaderSize {
-		return
+		return nil
 	}
 	controlType := packet[2]
 
 	switch controlType {
 	case controlTypeNACK:
-		// Sender received a NACK — retransmit requested packets
-		nonces := parseNACKPacket(packet)
-		if ps.sendFunc == nil {
-			return
+		// Sender-side rate limit on NACK processing (prevents amplification)
+		now := time.Now()
+		if now.Sub(ps.lastNACKProcessed) < time.Duration(m.config.ARQRateLimitMs)*time.Millisecond {
+			return nil
 		}
-		for _, nonce := range nonces {
-			data := ps.retransmit.Lookup(nonce)
+		ps.lastNACKProcessed = now
+
+		seqs := parseNACKPacket(packet)
+		if ps.sendFunc == nil {
+			return nil
+		}
+		sent := 0
+		for _, seq := range seqs {
+			data := ps.retransmit.Lookup(seq)
 			if data != nil {
-				ps.sendFunc(data)
+				ps.sendFunc(buildRetransmitPacket(seq, data))
+				sent++
 			}
 		}
-		if len(nonces) > 0 {
-			m.logger.Info("retransmitted on NACK", "count", len(nonces))
+		if sent > 0 {
+			m.logger.Info("retransmitted on NACK", "count", sent, "requested", len(seqs))
+		}
+
+	case controlTypeRetransmit:
+		// Receiver got a retransmit — extract dataSeq and payload,
+		// insert into reorder buffer at the correct position
+		seq, payload := parseRetransmitPacket(packet)
+		if payload != nil && ps.reorderBuf != nil {
+			return ps.reorderBuf.InsertAt(payload, seq, pathID, time.Now())
+		} else if payload != nil {
+			return [][]byte{payload}
 		}
 
 	case controlTypeProbe:
-		// Receiver got a probe — echo it back
 		echo := buildEchoPacket(packet)
 		if echo != nil && ps.sendFunc != nil {
 			ps.sendFunc(echo)
 		}
 
 	case controlTypeEcho:
-		// Sender got an echo — compute RTT
-		tsNano, pathID, ok := parseProbeEcho(packet)
+		tsNano, pID, ok := parseProbeEcho(packet)
 		if ok {
 			rtt := time.Duration(uint64(time.Now().UnixNano()) - tsNano)
-			ps.pathTrack.UpdateRTT(pathID, rtt)
-			// Feed RTT into reorder buffer for per-path timeout
+			ps.pathTrack.UpdateRTT(pID, rtt)
 			if ps.reorderBuf != nil {
-				ps.reorderBuf.UpdatePathRTT(pathID, rtt)
+				ps.reorderBuf.UpdatePathRTT(pID, rtt)
 			}
 		}
 	}
+	return nil
 }
 
 // triggerNACK generates and sends a NACK for unrecoverable gaps.
