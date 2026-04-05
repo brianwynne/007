@@ -320,14 +320,17 @@ func (fd *FECDecoder) Decode(packet []byte) (data *DecodedPacket, recovered []*D
 	k := int(packet[3])
 	m := int(packet[4])
 
-	if k == 0 || m == 0 {
-		return nil, nil
+	if k == 0 || m == 0 || k+m > 128 {
+		return nil, nil // invalid or excessively large K+M
 	}
 
 	fd.mu.Lock()
 	defer fd.mu.Unlock()
 
 	block, exists := fd.blocks[blockID]
+	if exists && (k != block.k || m != block.m) {
+		return nil, nil // K/M mismatch for existing block — reject
+	}
 	if !exists {
 		// Evict oldest block if at capacity
 		if len(fd.blocks) >= fd.maxBlocks {

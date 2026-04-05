@@ -185,6 +185,9 @@ func parseNACKPacket(pkt []byte) []uint64 {
 		return nil
 	}
 	count := int(binary.BigEndian.Uint16(pkt[FECHeaderSize : FECHeaderSize+2]))
+	if count > maxNACKNonces {
+		count = maxNACKNonces // cap to prevent over-allocation
+	}
 	if len(pkt) < FECHeaderSize+2+count*8 {
 		return nil
 	}

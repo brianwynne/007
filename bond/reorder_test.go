@@ -19,7 +19,7 @@ func TestReorderBuffer_InOrder(t *testing.T) {
 		}
 	}
 
-	inOrder, reordered, gaps, _ := rb.Stats()
+	inOrder, reordered, gaps, _, _, _ := rb.Stats()
 	if inOrder != 10 {
 		t.Errorf("inOrder=%d, want 10", inOrder)
 	}
@@ -79,7 +79,7 @@ func TestReorderBuffer_GapTimeout(t *testing.T) {
 		t.Fatalf("expected at least 1 result after gap timeout, got %d", len(result))
 	}
 
-	_, _, gaps, _ := rb.Stats()
+	_, _, gaps, _, _, _ := rb.Stats()
 	if gaps != 1 {
 		t.Errorf("gaps=%d, want 1", gaps)
 	}
@@ -131,7 +131,7 @@ func TestReorderBuffer_Flush(t *testing.T) {
 	// Flush should skip the gap
 	rb.Flush()
 
-	_, _, gaps, _ := rb.Stats()
+	_, _, gaps, _, _, _ := rb.Stats()
 	if gaps != 1 {
 		t.Errorf("gaps=%d after flush, want 1", gaps)
 	}

@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strings"
 	"time"
 )
 
@@ -23,17 +24,29 @@ import (
 type API struct {
 	mgr    *Manager
 	server *http.Server
+	apiKey string // optional API key for authentication
 }
 
 // NewAPI creates a management API server.
-func NewAPI(mgr *Manager, listenAddr string) *API {
-	a := &API{mgr: mgr}
+// listenAddr defaults to 127.0.0.1:8007 if empty.
+// apiKey is optional — if set, all requests must include X-API-Key header.
+func NewAPI(mgr *Manager, listenAddr, apiKey string) *API {
+	if listenAddr == "" {
+		listenAddr = "127.0.0.1:8007"
+	}
+	// Warn if binding to all interfaces
+	if strings.HasPrefix(listenAddr, ":") || strings.HasPrefix(listenAddr, "0.0.0.0:") {
+		mgr.logger.Warn("API server binding to all interfaces — consider restricting to localhost",
+			"addr", listenAddr)
+	}
+
+	a := &API{mgr: mgr, apiKey: apiKey}
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("/api/stats", a.handleStats)
-	mux.HandleFunc("/api/paths", a.handlePaths)
-	mux.HandleFunc("/api/config", a.handleConfig)
-	mux.HandleFunc("/api/health", a.handleHealth)
+	mux.HandleFunc("/api/stats", a.auth(a.handleStats))
+	mux.HandleFunc("/api/paths", a.auth(a.handlePaths))
+	mux.HandleFunc("/api/config", a.auth(a.handleConfig))
+	mux.HandleFunc("/api/health", a.handleHealth) // health check unauthenticated
 
 	a.server = &http.Server{
 		Addr:         listenAddr,
@@ -43,6 +56,20 @@ func NewAPI(mgr *Manager, listenAddr string) *API {
 	}
 
 	return a
+}
+
+// auth wraps a handler with API key authentication (if configured).
+func (a *API) auth(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if a.apiKey != "" {
+			key := r.Header.Get("X-API-Key")
+			if key != a.apiKey {
+				http.Error(w, "unauthorized", http.StatusUnauthorized)
+				return
+			}
+		}
+		next(w, r)
+	}
 }
 
 // Start begins serving the API in a background goroutine.
@@ -61,17 +88,25 @@ func (a *API) Stop() {
 
 // statsResponse is the JSON response for /api/stats.
 type statsResponse struct {
-	SystemState      string             `json:"system_state"`
-	TxPackets        uint64             `json:"tx_packets"`
-	RxPackets        uint64             `json:"rx_packets"`
-	DropPackets      uint64             `json:"drop_packets"`
-	FECRecovered     uint64             `json:"fec_recovered"`
-	FECFailed        uint64             `json:"fec_failed"`
-	ReorderInOrder   uint64             `json:"reorder_in_order"`
-	ReorderReordered uint64             `json:"reorder_reordered"`
-	ReorderGaps      uint64             `json:"reorder_gaps"`
-	ReorderWindowMs  int64              `json:"reorder_window_ms"`
-	Paths            []pathResponse     `json:"paths"`
+	SystemState       string             `json:"system_state"`
+	TxPackets         uint64             `json:"tx_packets"`
+	RxPackets         uint64             `json:"rx_packets"`
+	DropPackets       uint64             `json:"drop_packets"`
+	DuplicatePackets  uint64             `json:"duplicate_packets"`
+	FECRecovered      uint64             `json:"fec_recovered"`
+	FECFailed         uint64             `json:"fec_failed"`
+	ReorderInOrder    uint64             `json:"reorder_in_order"`
+	ReorderReordered  uint64             `json:"reorder_reordered"`
+	ReorderGaps       uint64             `json:"reorder_gaps"`
+	ReorderDuplicates uint64             `json:"reorder_duplicates"`
+	ReorderLate       uint64             `json:"reorder_late"`
+	ReorderWindowMs   int64              `json:"reorder_window_ms"`
+	NACKsSent         uint64             `json:"nacks_sent"`
+	NACKsReceived     uint64             `json:"nacks_received"`
+	ARQRetransmitOK   uint64             `json:"arq_retransmit_ok"`
+	ARQRetransmitMiss uint64             `json:"arq_retransmit_miss"`
+	ARQDeadlineSkip   uint64             `json:"arq_deadline_skip"`
+	Paths             []pathResponse     `json:"paths"`
 }
 
 type pathResponse struct {
@@ -95,16 +130,24 @@ func (a *API) handleStats(w http.ResponseWriter, r *http.Request) {
 	s := a.mgr.GetStats()
 
 	resp := statsResponse{
-		SystemState:      s.SystemState,
-		TxPackets:        s.TxPackets,
-		RxPackets:        s.RxPackets,
-		DropPackets:      s.DropPackets,
-		FECRecovered:     s.FECRecovered,
-		FECFailed:        s.FECFailed,
-		ReorderInOrder:   s.ReorderInOrder,
-		ReorderReordered: s.ReorderReordered,
-		ReorderGaps:      s.ReorderGaps,
-		ReorderWindowMs:  s.ReorderWindowMs,
+		SystemState:       s.SystemState,
+		TxPackets:         s.TxPackets,
+		RxPackets:         s.RxPackets,
+		DropPackets:       s.DropPackets,
+		DuplicatePackets:  s.DuplicatePackets,
+		FECRecovered:      s.FECRecovered,
+		FECFailed:         s.FECFailed,
+		ReorderInOrder:    s.ReorderInOrder,
+		ReorderReordered:  s.ReorderReordered,
+		ReorderGaps:       s.ReorderGaps,
+		ReorderDuplicates: s.ReorderDuplicates,
+		ReorderLate:       s.ReorderLate,
+		ReorderWindowMs:   s.ReorderWindowMs,
+		NACKsSent:         s.NACKsSent,
+		NACKsReceived:     s.NACKsReceived,
+		ARQRetransmitOK:   s.ARQRetransmitOK,
+		ARQRetransmitMiss: s.ARQRetransmitMiss,
+		ARQDeadlineSkip:   s.ARQDeadlineSkip,
 	}
 
 	for _, p := range s.Paths {

@@ -93,8 +93,10 @@ type PathHealth struct {
 	lossIdx    int
 
 	// State transition tracking
-	stableCount int       // consecutive stable checks for recovery
-	failedSince time.Time // when path entered failed state
+	stableCount  int       // consecutive stable checks for recovery
+	failedSince  time.Time // when path entered failed state
+	stateChanged bool      // set when state transitions (cleared by DrainStateChanges)
+	prevState    PathState // previous state for logging
 }
 
 // pathTracker manages health metrics for all paths of a peer.
@@ -239,6 +241,13 @@ func (pt *pathTracker) GetAll() []PathHealthSnapshot {
 // updateState computes the path state from current metrics.
 // Caller must hold ph.mu.
 func (ph *PathHealth) updateState() {
+	prev := ph.State
+	defer func() {
+		if ph.State != prev {
+			ph.stateChanged = true
+			ph.prevState = prev
+		}
+	}()
 	switch {
 	case ph.Loss > 0.50 || ph.BurstLoss > 20:
 		if ph.State != PathFailed {
@@ -279,6 +288,38 @@ func (pt *pathTracker) RecordDrop(pathID int) {
 	ph.mu.Lock()
 	ph.DropCount++
 	ph.mu.Unlock()
+}
+
+// StateChange represents a path state transition for logging.
+type StateChange struct {
+	PathID int
+	From   PathState
+	To     PathState
+	Loss   float64
+	RTT    time.Duration
+}
+
+// DrainStateChanges returns and clears any pending state transitions.
+func (pt *pathTracker) DrainStateChanges() []StateChange {
+	pt.mu.Lock()
+	defer pt.mu.Unlock()
+
+	var changes []StateChange
+	for _, ph := range pt.paths {
+		ph.mu.Lock()
+		if ph.stateChanged {
+			changes = append(changes, StateChange{
+				PathID: ph.PathID,
+				From:   ph.prevState,
+				To:     ph.State,
+				Loss:   ph.Loss,
+				RTT:    ph.RTT,
+			})
+			ph.stateChanged = false
+		}
+		ph.mu.Unlock()
+	}
+	return changes
 }
 
 func (pt *pathTracker) getOrCreate(pathID int) *PathHealth {

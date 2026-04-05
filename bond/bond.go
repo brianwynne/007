@@ -211,9 +211,15 @@ type Manager struct {
 	systemState atomic.Int32 // SystemState enum
 
 	// Stats
-	txPackets   atomic.Uint64
-	rxPackets   atomic.Uint64
-	dropPackets atomic.Uint64
+	txPackets        atomic.Uint64
+	rxPackets        atomic.Uint64
+	dropPackets      atomic.Uint64
+	duplicatePackets atomic.Uint64
+	nacksSent        atomic.Uint64
+	nacksReceived    atomic.Uint64
+	arqRetransmitOK  atomic.Uint64
+	arqRetransmitMiss atomic.Uint64
+	arqDeadlineSkip  atomic.Uint64
 
 	// Lifecycle
 	running atomic.Bool
@@ -420,6 +426,7 @@ func (m *Manager) ProcessInbound(peerID uint32, packet []byte, nonce uint64, pat
 						}
 					}
 					if !canArrive && len(paths) > 0 {
+						m.arqDeadlineSkip.Add(1)
 						continue // retransmit would exceed budget
 					}
 				}
@@ -457,6 +464,7 @@ func (m *Manager) handleControl(ps *peerState, packet []byte, pathID int) [][]by
 		}
 		ps.lastNACKProcessed = now
 
+		m.nacksReceived.Add(1)
 		seqs := parseNACKPacket(packet)
 		if ps.sendFunc == nil {
 			return nil
@@ -466,11 +474,14 @@ func (m *Manager) handleControl(ps *peerState, packet []byte, pathID int) [][]by
 			data := ps.retransmit.Lookup(seq)
 			if data != nil {
 				ps.sendFunc(buildRetransmitPacket(seq, data))
+				m.arqRetransmitOK.Add(1)
 				sent++
+			} else {
+				m.arqRetransmitMiss.Add(1)
 			}
 		}
 		if sent > 0 {
-			m.logger.Info("retransmitted on NACK", "count", sent, "requested", len(seqs))
+			m.logger.Info("retransmitted on NACK", "count", sent, "requested", len(seqs), "missed", len(seqs)-sent)
 		}
 
 	case controlTypeRetransmit:
@@ -508,8 +519,8 @@ func (m *Manager) triggerNACK(ps *peerState) {
 	if nack == nil || ps.sendFunc == nil {
 		return
 	}
-	// Send NACK as a control packet through the WireGuard tunnel
 	ps.sendFunc(nack)
+	m.nacksSent.Add(1)
 }
 
 // reorderLoop runs periodic flush and window adaptation for all peers.
@@ -536,14 +547,32 @@ func (m *Manager) reorderLoop() {
 			}
 			m.peersMu.Unlock()
 		case <-adaptTicker.C:
-			// Adapt window for all peers + update system state
+			// Adapt window, log state changes, update system state
 			m.peersMu.Lock()
 			for _, ps := range m.peers {
 				if ps.reorderBuf != nil {
 					ps.reorderBuf.AdaptWindow()
 				}
+				// Log path state transitions
+				if ps.pathTrack != nil {
+					for _, sc := range ps.pathTrack.DrainStateChanges() {
+						m.logger.Warn("path state changed",
+							"path_id", sc.PathID,
+							"from", sc.From.String(),
+							"to", sc.To.String(),
+							"loss", sc.Loss,
+							"rtt_ms", sc.RTT.Milliseconds())
+					}
+				}
 			}
+			prev := SystemState(m.systemState.Load())
 			m.updateSystemState()
+			curr := SystemState(m.systemState.Load())
+			if curr != prev {
+				m.logger.Warn("system state changed",
+					"from", prev.String(),
+					"to", curr.String())
+			}
 			m.peersMu.Unlock()
 		}
 	}
@@ -612,36 +641,33 @@ func (m *Manager) fecAdaptLoop() {
 	ticker := time.NewTicker(time.Duration(m.config.FECAdaptIntervalMs) * time.Millisecond)
 	defer ticker.Stop()
 
-	var lastTx, lastRx uint64
-
 	for {
 		select {
 		case <-m.ctx.Done():
 			return
 		case <-ticker.C:
-			tx := m.txPackets.Load()
-			rx := m.rxPackets.Load()
-
-			deltaTx := tx - lastTx
-			deltaRx := rx - lastRx
-			lastTx = tx
-			lastRx = rx
-
-			if deltaTx == 0 {
-				continue
-			}
-
-			lossRate := 0.0
-			if deltaTx > deltaRx {
-				lossRate = float64(deltaTx-deltaRx) / float64(deltaTx)
-			}
-
+			// Per-peer FEC adaptation using per-path loss data
 			m.peersMu.Lock()
 			for _, ps := range m.peers {
-				if ps.encoder != nil {
-					if err := ps.encoder.AdaptRate(lossRate); err != nil {
-						m.logger.Error("FEC adapt error", "err", err, "loss_rate", lossRate)
+				if ps.encoder == nil || ps.pathTrack == nil {
+					continue
+				}
+				// Use max loss across all paths for this peer
+				var maxLoss float64
+				for _, p := range ps.pathTrack.GetAll() {
+					if p.Loss > maxLoss {
+						maxLoss = p.Loss
 					}
+				}
+				prevK, prevM := ps.encoder.k, ps.encoder.m
+				if err := ps.encoder.AdaptRate(maxLoss); err != nil {
+					m.logger.Error("FEC adapt error", "err", err, "loss_rate", maxLoss)
+				}
+				if ps.encoder.k != prevK || ps.encoder.m != prevM {
+					m.logger.Info("FEC ratio changed",
+						"prev_k", prevK, "prev_m", prevM,
+						"new_k", ps.encoder.k, "new_m", ps.encoder.m,
+						"loss_rate", maxLoss)
 				}
 			}
 			m.peersMu.Unlock()
@@ -651,26 +677,40 @@ func (m *Manager) fecAdaptLoop() {
 
 // Stats returns current bond statistics.
 type Stats struct {
-	SystemState      string
-	TxPackets        uint64
-	RxPackets        uint64
-	DropPackets      uint64
-	FECRecovered     uint64
-	FECFailed        uint64
-	ReorderInOrder   uint64
-	ReorderReordered uint64
-	ReorderGaps      uint64
-	ReorderWindowMs  int64
-	Paths            []PathHealthSnapshot
+	SystemState       string
+	TxPackets         uint64
+	RxPackets         uint64
+	DropPackets       uint64
+	DuplicatePackets  uint64
+	FECRecovered      uint64
+	FECFailed         uint64
+	ReorderInOrder    uint64
+	ReorderReordered  uint64
+	ReorderGaps       uint64
+	ReorderDuplicates uint64
+	ReorderLate       uint64
+	ReorderWindowMs   int64
+	NACKsSent         uint64
+	NACKsReceived     uint64
+	ARQRetransmitOK   uint64
+	ARQRetransmitMiss uint64
+	ARQDeadlineSkip   uint64
+	Paths             []PathHealthSnapshot
 }
 
 // GetStats returns current statistics aggregated across all peers.
 func (m *Manager) GetStats() Stats {
 	s := Stats{
-		SystemState: SystemState(m.systemState.Load()).String(),
-		TxPackets:   m.txPackets.Load(),
-		RxPackets:   m.rxPackets.Load(),
-		DropPackets: m.dropPackets.Load(),
+		SystemState:       SystemState(m.systemState.Load()).String(),
+		TxPackets:         m.txPackets.Load(),
+		RxPackets:         m.rxPackets.Load(),
+		DropPackets:       m.dropPackets.Load(),
+		DuplicatePackets:  m.duplicatePackets.Load(),
+		NACKsSent:         m.nacksSent.Load(),
+		NACKsReceived:     m.nacksReceived.Load(),
+		ARQRetransmitOK:   m.arqRetransmitOK.Load(),
+		ARQRetransmitMiss: m.arqRetransmitMiss.Load(),
+		ARQDeadlineSkip:   m.arqDeadlineSkip.Load(),
 	}
 
 	m.peersMu.Lock()
@@ -681,10 +721,14 @@ func (m *Manager) GetStats() Stats {
 			s.FECFailed += failed
 		}
 		if ps.reorderBuf != nil {
-			inOrder, reordered, gaps, windowMs := ps.reorderBuf.Stats()
+			inOrder, reordered, gaps, dups, late, windowMs := ps.reorderBuf.Stats()
 			s.ReorderInOrder += inOrder
 			s.ReorderReordered += reordered
 			s.ReorderGaps += gaps
+			s.ReorderDuplicates += dups
+			s.ReorderLate += late
+			s.DuplicatePackets += dups
+			s.DropPackets += late // late packets are effectively dropped
 			if windowMs > s.ReorderWindowMs {
 				s.ReorderWindowMs = windowMs
 			}

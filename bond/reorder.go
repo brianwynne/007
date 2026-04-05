@@ -45,6 +45,8 @@ type ReorderBuffer struct {
 	inOrderCount   uint64
 	reorderedCount uint64
 	gapCount       uint64
+	duplicateCount uint64
+	lateCount      uint64
 
 	// Skipped nonces for ARQ NACK generation
 	skippedNonces []uint64
@@ -137,6 +139,7 @@ func (rb *ReorderBuffer) InsertAt(data []byte, nonce uint64, pathID int, now tim
 
 	// Duplicate or late — already delivered or skipped
 	if nonce < rb.nextExpect {
+		rb.lateCount++
 		return result
 	}
 
@@ -157,6 +160,7 @@ func (rb *ReorderBuffer) InsertAt(data []byte, nonce uint64, pathID int, now tim
 	// Future packet — buffer it
 	idx := nonce % maxBufferSize
 	if rb.slots[idx] != nil && rb.slots[idx].nonce == nonce {
+		rb.duplicateCount++
 		return result // duplicate
 	}
 
@@ -329,10 +333,10 @@ func (rb *ReorderBuffer) AdaptWindow() {
 }
 
 // Stats returns current buffer statistics.
-func (rb *ReorderBuffer) Stats() (inOrder, reordered, gaps uint64, windowMs int64) {
+func (rb *ReorderBuffer) Stats() (inOrder, reordered, gaps, duplicates, late uint64, windowMs int64) {
 	rb.mu.Lock()
 	defer rb.mu.Unlock()
-	return rb.inOrderCount, rb.reorderedCount, rb.gapCount, rb.maxWindow.Milliseconds()
+	return rb.inOrderCount, rb.reorderedCount, rb.gapCount, rb.duplicateCount, rb.lateCount, rb.maxWindow.Milliseconds()
 }
 
 // DrainSkippedNonces returns and clears the list of nonces that were

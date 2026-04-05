@@ -228,7 +228,8 @@ func main() {
 	if apiAddr == "" {
 		apiAddr = "127.0.0.1:8007"
 	}
-	bondAPI := bond.NewAPI(bondMgr, apiAddr)
+	apiKey := os.Getenv("BOND_API_KEY")
+	bondAPI := bond.NewAPI(bondMgr, apiAddr, apiKey)
 	bondAPI.Start()
 
 	logger.Verbosef("007 Bond started (FEC=%v, Reorder=%v, API=%s)", bondCfg.FECEnabled, bondCfg.ReorderEnabled, apiAddr)
