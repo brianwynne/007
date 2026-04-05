@@ -89,6 +89,9 @@ type FECDecoder struct {
 	// Active blocks waiting for completion
 	blocks map[uint16]*fecBlock
 
+	// Cached RS encoders — avoids expensive reedsolomon.New() on every recovery
+	rsCache map[uint32]reedsolomon.Encoder // key: k<<16 | m
+
 	// Stats
 	recoveredCount uint64
 	failedCount    uint64
@@ -234,8 +237,24 @@ func (fe *FECEncoder) AdaptRate(lossRate float64) error {
 // NewFECDecoder creates a new FEC decoder.
 func NewFECDecoder() *FECDecoder {
 	return &FECDecoder{
-		blocks: make(map[uint16]*fecBlock),
+		blocks:  make(map[uint16]*fecBlock),
+		rsCache: make(map[uint32]reedsolomon.Encoder),
 	}
+}
+
+// getCachedRS returns a cached RS encoder for the given K,M pair.
+// Caller must hold fd.mu.
+func (fd *FECDecoder) getCachedRS(k, m int) (reedsolomon.Encoder, error) {
+	key := uint32(k)<<16 | uint32(m)
+	if enc, ok := fd.rsCache[key]; ok {
+		return enc, nil
+	}
+	enc, err := reedsolomon.New(k, m)
+	if err != nil {
+		return nil, err
+	}
+	fd.rsCache[key] = enc
+	return enc, nil
 }
 
 // Decode processes an incoming packet (data or parity) with FEC header.
@@ -335,7 +354,7 @@ func (fd *FECDecoder) tryRecover(blockID uint16, block *fecBlock) []*DecodedPack
 		return nil
 	}
 
-	enc, err := reedsolomon.New(block.k, block.m)
+	enc, err := fd.getCachedRS(block.k, block.m)
 	if err != nil {
 		fd.failedCount++
 		return nil

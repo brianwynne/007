@@ -43,16 +43,17 @@ const (
 type SendFunc func(data []byte)
 
 // retransmitBuffer stores recent cleartext packets for retransmission.
+// Uses a ring buffer for bounded memory + a map for O(1) lookup by nonce.
 type retransmitBuffer struct {
 	mu      sync.Mutex
-	packets [retransmitBufSize]retransmitEntry
-	head    int // next write position
+	entries [retransmitBufSize]retransmitEntry
+	index   map[uint64]int // nonce → ring buffer position
+	head    int            // next write position
 }
 
 type retransmitEntry struct {
 	data  []byte
 	nonce uint64
-	valid bool
 }
 
 // Store saves a cleartext packet and its nonce for potential retransmission.
@@ -60,30 +61,42 @@ func (rb *retransmitBuffer) Store(data []byte, nonce uint64) {
 	rb.mu.Lock()
 	defer rb.mu.Unlock()
 
+	if rb.index == nil {
+		rb.index = make(map[uint64]int, retransmitBufSize)
+	}
+
+	// Evict old entry at this ring position
+	old := rb.entries[rb.head]
+	if old.data != nil {
+		delete(rb.index, old.nonce)
+	}
+
 	cp := make([]byte, len(data))
 	copy(cp, data)
-	rb.packets[rb.head] = retransmitEntry{
-		data:  cp,
-		nonce: nonce,
-		valid: true,
-	}
+	rb.entries[rb.head] = retransmitEntry{data: cp, nonce: nonce}
+	rb.index[nonce] = rb.head
 	rb.head = (rb.head + 1) % retransmitBufSize
 }
 
-// Lookup finds a packet by nonce. Returns nil if not found or expired.
+// Lookup finds a packet by nonce in O(1). Returns nil if not found or expired.
 func (rb *retransmitBuffer) Lookup(nonce uint64) []byte {
 	rb.mu.Lock()
 	defer rb.mu.Unlock()
 
-	for i := range rb.packets {
-		if rb.packets[i].valid && rb.packets[i].nonce == nonce {
-			// Return a copy
-			cp := make([]byte, len(rb.packets[i].data))
-			copy(cp, rb.packets[i].data)
-			return cp
-		}
+	if rb.index == nil {
+		return nil
 	}
-	return nil
+	pos, ok := rb.index[nonce]
+	if !ok {
+		return nil
+	}
+	entry := rb.entries[pos]
+	if entry.nonce != nonce {
+		return nil // stale index entry
+	}
+	cp := make([]byte, len(entry.data))
+	copy(cp, entry.data)
+	return cp
 }
 
 // nackTracker generates NACKs for unrecoverable gaps on the receive side.

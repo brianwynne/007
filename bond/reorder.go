@@ -94,10 +94,14 @@ func NewReorderBuffer() *ReorderBuffer {
 //   - Buffered consecutive packets follow it (flushed)
 //   - A gap has timed out (skipped, buffered packets flushed)
 func (rb *ReorderBuffer) Insert(data []byte, nonce uint64, pathID int) [][]byte {
+	return rb.InsertAt(data, nonce, pathID, time.Now())
+}
+
+// InsertAt is like Insert but accepts a pre-computed timestamp to avoid
+// redundant time.Now() calls when processing multiple packets.
+func (rb *ReorderBuffer) InsertAt(data []byte, nonce uint64, pathID int, now time.Time) [][]byte {
 	rb.mu.Lock()
 	defer rb.mu.Unlock()
-
-	now := time.Now()
 
 	// Update path stats
 	ps := rb.getPathStats(pathID)
@@ -119,9 +123,9 @@ func (rb *ReorderBuffer) Insert(data []byte, nonce uint64, pathID int) [][]byte 
 		return result
 	}
 
-	// Expected packet — deliver immediately
+	// Expected packet — deliver immediately (take ownership, no copy)
 	if nonce == rb.nextExpect {
-		result = append(result, copyBytes(data))
+		result = append(result, data)
 		rb.nextExpect++
 		rb.inOrderCount++
 
@@ -140,7 +144,7 @@ func (rb *ReorderBuffer) Insert(data []byte, nonce uint64, pathID int) [][]byte 
 	}
 
 	rb.slots[idx] = &bufferedPacket{
-		data:    copyBytes(data),
+		data:    data, // take ownership — caller (FEC decode) already allocated
 		nonce:   nonce,
 		pathID:  pathID,
 		arrival: now,

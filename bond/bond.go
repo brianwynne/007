@@ -141,6 +141,13 @@ func (m *Manager) getPeerState(peerID uint32) *peerState {
 	return ps
 }
 
+// RemovePeer cleans up all state for a peer. Called when a peer is removed.
+func (m *Manager) RemovePeer(peerID uint32) {
+	m.peersMu.Lock()
+	defer m.peersMu.Unlock()
+	delete(m.peers, peerID)
+}
+
 // SetPeerSendFunc provides a callback for injecting packets into the
 // WireGuard send path for a specific peer. Used by ARQ for NACKs and
 // retransmissions. Must be called after the peer is created.
@@ -224,6 +231,9 @@ func (m *Manager) ProcessInbound(peerID uint32, packet []byte, nonce uint64, pat
 
 	ps := m.getPeerState(peerID)
 
+	// Single timestamp for all operations on this packet
+	now := time.Now()
+
 	// Track per-path receive stats
 	ps.pathTrack.RecordReceive(pathID)
 
@@ -242,7 +252,7 @@ func (m *Manager) ProcessInbound(peerID uint32, packet []byte, nonce uint64, pat
 		// Data packet → reorder using its embedded nonce
 		if data != nil {
 			if m.config.ReorderEnabled && ps.reorderBuf != nil {
-				result = append(result, ps.reorderBuf.Insert(data.Data, data.Nonce, pathID)...)
+				result = append(result, ps.reorderBuf.InsertAt(data.Data, data.Nonce, pathID, now)...)
 			} else {
 				result = append(result, data.Data)
 			}
@@ -251,7 +261,7 @@ func (m *Manager) ProcessInbound(peerID uint32, packet []byte, nonce uint64, pat
 		// Recovered packets → also reorder (nonce recovered from FEC payload)
 		for _, rec := range recovered {
 			if m.config.ReorderEnabled && ps.reorderBuf != nil {
-				result = append(result, ps.reorderBuf.Insert(rec.Data, rec.Nonce, pathID)...)
+				result = append(result, ps.reorderBuf.InsertAt(rec.Data, rec.Nonce, pathID, now)...)
 			} else {
 				result = append(result, rec.Data)
 			}
@@ -273,7 +283,7 @@ func (m *Manager) ProcessInbound(peerID uint32, packet []byte, nonce uint64, pat
 
 	// No FEC — just reorder the raw packet
 	if m.config.ReorderEnabled && ps.reorderBuf != nil {
-		return ps.reorderBuf.Insert(packet, nonce, pathID)
+		return ps.reorderBuf.InsertAt(packet, nonce, pathID, now)
 	}
 
 	return [][]byte{packet}

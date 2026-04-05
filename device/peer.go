@@ -125,6 +125,7 @@ type BondPath struct {
 	Endpoint conn.Endpoint  // destination address
 	LocalIP  netip.Addr     // local IP this socket is bound to
 	conn     *net.UDPConn   // dedicated socket bound to LocalIP
+	dst      *net.UDPAddr   // cached parsed destination (avoids per-packet parsing)
 }
 
 // Send transmits buffers via this path's dedicated socket.
@@ -132,13 +133,8 @@ func (bp *BondPath) Send(buffers [][]byte) error {
 	if bp.conn == nil {
 		return errors.New("bond path socket not open")
 	}
-	dstAddrPort, err := netip.ParseAddrPort(bp.Endpoint.DstToString())
-	if err != nil {
-		return err
-	}
-	dst := net.UDPAddrFromAddrPort(dstAddrPort)
 	for _, buf := range buffers {
-		_, err := bp.conn.WriteToUDP(buf, dst)
+		_, err := bp.conn.WriteToUDP(buf, bp.dst)
 		if err != nil {
 			return err
 		}
@@ -172,9 +168,8 @@ func (peer *Peer) SendBuffers(buffers [][]byte) error {
 		endpoint.ClearSrc()
 		peer.endpoint.clearSrcOnTx = false
 	}
-	// Snapshot bond paths under lock
-	bondPaths := make([]BondPath, len(peer.endpoint.bondPaths))
-	copy(bondPaths, peer.endpoint.bondPaths)
+	// Snapshot bond paths under lock (slice header only — BondPath structs are small)
+	bondPaths := peer.endpoint.bondPaths
 	peer.endpoint.Unlock()
 
 	// Send to primary endpoint via standard bind
@@ -216,12 +211,20 @@ func (peer *Peer) AddBondPath(dest conn.Endpoint, localIP netip.Addr) error {
 		return err
 	}
 
+	// Cache parsed destination address to avoid per-packet string parsing
+	dstAddrPort, err := netip.ParseAddrPort(dest.DstToString())
+	if err != nil {
+		udpConn.Close()
+		return err
+	}
+
 	peer.endpoint.Lock()
 	defer peer.endpoint.Unlock()
 	peer.endpoint.bondPaths = append(peer.endpoint.bondPaths, BondPath{
 		Endpoint: dest,
 		LocalIP:  localIP,
 		conn:     udpConn,
+		dst:      net.UDPAddrFromAddrPort(dstAddrPort),
 	})
 	return nil
 }
