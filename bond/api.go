@@ -49,9 +49,7 @@ func NewAPI(mgr *Manager, listenAddr string) *API {
 func (a *API) Start() {
 	go func() {
 		if err := a.server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			if a.mgr.logger != nil {
-				a.mgr.logger.Printf("007 Bond: API server error: %v", err)
-			}
+			a.mgr.logger.Error("API server error", "err", err)
 		}
 	}()
 }

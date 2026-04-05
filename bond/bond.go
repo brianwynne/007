@@ -37,11 +37,50 @@
 package bond
 
 import (
+	"context"
+	"fmt"
 	"log"
 	"sync"
 	"sync/atomic"
 	"time"
 )
+
+// Logger provides structured logging for the bond system.
+// All log calls include key-value context fields for diagnostics.
+type Logger interface {
+	Info(msg string, keysAndValues ...interface{})
+	Warn(msg string, keysAndValues ...interface{})
+	Error(msg string, keysAndValues ...interface{})
+}
+
+// stdLogger wraps a standard log.Logger to implement Logger.
+type stdLogger struct {
+	l *log.Logger
+}
+
+func (s *stdLogger) Info(msg string, kv ...interface{})  { s.log("INFO", msg, kv) }
+func (s *stdLogger) Warn(msg string, kv ...interface{})  { s.log("WARN", msg, kv) }
+func (s *stdLogger) Error(msg string, kv ...interface{}) { s.log("ERROR", msg, kv) }
+
+func (s *stdLogger) log(level, msg string, kv []interface{}) {
+	if s.l == nil {
+		return
+	}
+	if len(kv) == 0 {
+		s.l.Printf("[%s] 007 Bond: %s", level, msg)
+		return
+	}
+	fields := ""
+	for i := 0; i+1 < len(kv); i += 2 {
+		fields += fmt.Sprintf(" %v=%v", kv[i], kv[i+1])
+	}
+	s.l.Printf("[%s] 007 Bond: %s%s", level, msg, fields)
+}
+
+// NewStdLogger wraps a standard log.Logger for use with the bond Manager.
+func NewStdLogger(l *log.Logger) Logger {
+	return &stdLogger{l: l}
+}
 
 // SystemState represents the overall health of the bonding system.
 type SystemState int32
@@ -177,18 +216,22 @@ type Manager struct {
 
 	// Lifecycle
 	running atomic.Bool
-	stopCh  chan struct{}
+	cancel  context.CancelFunc
+	ctx     context.Context
 
-	// Logger
-	logger *log.Logger
+	// Logger — structured with key-value context
+	logger Logger
 }
 
 // NewManager creates a new bond manager with the given configuration.
-func NewManager(cfg Config, logger *log.Logger) (*Manager, error) {
+// If logger is nil, a no-op logger is used.
+func NewManager(cfg Config, logger Logger) (*Manager, error) {
+	if logger == nil {
+		logger = &stdLogger{}
+	}
 	m := &Manager{
 		config: cfg,
 		peers:  make(map[uint32]*peerState),
-		stopCh: make(chan struct{}),
 		logger: logger,
 	}
 
@@ -206,9 +249,7 @@ func (m *Manager) getPeerState(peerID uint32) *peerState {
 		if m.config.FECEnabled {
 			enc, err := NewFECEncoder(m.config)
 			if err != nil {
-				if m.logger != nil {
-					m.logger.Printf("007 Bond: failed to create FEC encoder for peer %d: %v", peerID, err)
-				}
+				m.logger.Error("failed to create FEC encoder", "peer", peerID, "err", err)
 			} else {
 				ps.encoder = enc
 				ps.decoder = NewFECDecoder()
@@ -251,6 +292,8 @@ func (m *Manager) Start() {
 		return // already running
 	}
 
+	m.ctx, m.cancel = context.WithCancel(context.Background())
+
 	// Adaptive FEC ratio goroutine
 	if m.config.FECEnabled && m.config.FECAdaptive {
 		go m.fecAdaptLoop()
@@ -264,9 +307,11 @@ func (m *Manager) Start() {
 	// Path health probing goroutine
 	go m.probeLoop()
 
-	if m.logger != nil {
-		m.logger.Println("007 Bond: manager started")
-	}
+	m.logger.Info("manager started",
+		"fec", m.config.FECEnabled,
+		"reorder", m.config.ReorderEnabled,
+		"arq", m.config.ARQEnabled,
+		"latency_budget_ms", m.config.LatencyBudgetMs)
 }
 
 // Stop shuts down background goroutines.
@@ -274,10 +319,8 @@ func (m *Manager) Stop() {
 	if !m.running.Swap(false) {
 		return
 	}
-	close(m.stopCh)
-	if m.logger != nil {
-		m.logger.Println("007 Bond: manager stopped")
-	}
+	m.cancel()
+	m.logger.Info("manager stopped")
 }
 
 // ProcessOutbound handles a packet on the send path.
@@ -411,8 +454,8 @@ func (m *Manager) handleControl(ps *peerState, packet []byte) {
 				ps.sendFunc(data)
 			}
 		}
-		if m.logger != nil && len(nonces) > 0 {
-			m.logger.Printf("007 Bond: retransmitted %d packets on NACK", len(nonces))
+		if len(nonces) > 0 {
+			m.logger.Info("retransmitted on NACK", "count", len(nonces))
 		}
 
 	case controlTypeProbe:
@@ -455,7 +498,7 @@ func (m *Manager) reorderLoop() {
 
 	for {
 		select {
-		case <-m.stopCh:
+		case <-m.ctx.Done():
 			return
 		case <-flushTicker.C:
 			// Flush timed-out gaps for all peers.
@@ -525,7 +568,7 @@ func (m *Manager) probeLoop() {
 
 	for {
 		select {
-		case <-m.stopCh:
+		case <-m.ctx.Done():
 			return
 		case <-ticker.C:
 			m.peersMu.Lock()
@@ -550,7 +593,7 @@ func (m *Manager) fecAdaptLoop() {
 
 	for {
 		select {
-		case <-m.stopCh:
+		case <-m.ctx.Done():
 			return
 		case <-ticker.C:
 			tx := m.txPackets.Load()
@@ -573,8 +616,8 @@ func (m *Manager) fecAdaptLoop() {
 			m.peersMu.Lock()
 			for _, ps := range m.peers {
 				if ps.encoder != nil {
-					if err := ps.encoder.AdaptRate(lossRate); err != nil && m.logger != nil {
-						m.logger.Printf("007 Bond: FEC adapt error: %v", err)
+					if err := ps.encoder.AdaptRate(lossRate); err != nil {
+						m.logger.Error("FEC adapt error", "err", err, "loss_rate", lossRate)
 					}
 				}
 			}
