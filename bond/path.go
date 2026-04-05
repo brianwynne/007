@@ -37,27 +37,64 @@ const (
 	pathStatsWindow  = 100             // packets in loss measurement window
 )
 
+// PathState represents the explicit health state of a network path.
+type PathState int
+
+const (
+	PathHealthy     PathState = iota // operating normally
+	PathDegraded                      // elevated loss or jitter, still usable
+	PathUnstable                      // flapping or very high loss
+	PathFailed                        // no packets received recently
+	PathRecovering                    // was failed, seeing packets again
+)
+
+func (s PathState) String() string {
+	switch s {
+	case PathHealthy:
+		return "healthy"
+	case PathDegraded:
+		return "degraded"
+	case PathUnstable:
+		return "unstable"
+	case PathFailed:
+		return "failed"
+	case PathRecovering:
+		return "recovering"
+	default:
+		return "unknown"
+	}
+}
+
 // PathHealth holds per-path health metrics.
 type PathHealth struct {
 	mu sync.Mutex
 
 	PathID    int
+	State     PathState     // explicit path state
 	RTT       time.Duration // exponential moving average
 	RTTVar    time.Duration // RTT variance (for jitter)
 	Loss      float64       // estimated loss rate (0.0 - 1.0)
+	BurstLoss int           // current consecutive loss streak
+	MaxBurst  int           // max burst loss observed
 	LastProbe time.Time     // when last probe was sent
 	LastSeen  time.Time     // when last packet was received on this path
 	RxCount   uint64        // total packets received on this path
+	DropCount uint64        // packets dropped (late/duplicate/invalid)
 	TxProbes  uint64        // probes sent on this path
 	RxProbes  uint64        // probe echoes received
 
 	// Inter-arrival jitter (RFC 3550 style)
-	lastArrival time.Time
-	jitter      time.Duration
+	lastArrival    time.Time
+	jitter         time.Duration
+	packetInterval time.Duration // configurable expected interval
 
 	// Loss tracking — sliding window of received/missed
 	lossWindow []bool // true = received, false = gap
 	lossIdx    int
+
+	// State transition tracking
+	stableCount int       // consecutive stable checks for recovery
+	failedSince time.Time // when path entered failed state
 }
 
 // pathTracker manages health metrics for all paths of a peer.
@@ -85,10 +122,16 @@ func (pt *pathTracker) RecordReceive(pathID int) {
 	ph.RxCount++
 	ph.LastSeen = now
 
+	// Reset burst counter on receive
+	ph.BurstLoss = 0
+
 	// Inter-arrival jitter (RFC 3550)
 	if !ph.lastArrival.IsZero() {
 		diff := now.Sub(ph.lastArrival)
-		expected := 20 * time.Millisecond // typical packet interval
+		expected := ph.packetInterval
+		if expected == 0 {
+			expected = 20 * time.Millisecond
+		}
 		deviation := diff - expected
 		if deviation < 0 {
 			deviation = -deviation
@@ -104,6 +147,9 @@ func (pt *pathTracker) RecordReceive(pathID int) {
 		ph.lossWindow[ph.lossIdx] = true
 		ph.lossIdx = (ph.lossIdx + 1) % pathStatsWindow
 	}
+
+	// Update path state
+	ph.updateState()
 }
 
 // RecordLoss records a missed packet on a path.
@@ -114,6 +160,12 @@ func (pt *pathTracker) RecordLoss(pathID int) {
 	ph := pt.getOrCreate(pathID)
 	ph.mu.Lock()
 	defer ph.mu.Unlock()
+
+	// Track burst loss
+	ph.BurstLoss++
+	if ph.BurstLoss > ph.MaxBurst {
+		ph.MaxBurst = ph.BurstLoss
+	}
 
 	if len(ph.lossWindow) < pathStatsWindow {
 		ph.lossWindow = append(ph.lossWindow, false)
@@ -130,6 +182,8 @@ func (pt *pathTracker) RecordLoss(pathID int) {
 		}
 	}
 	ph.Loss = float64(lost) / float64(len(ph.lossWindow))
+
+	ph.updateState()
 }
 
 // UpdateRTT records a new RTT measurement for a path.
@@ -166,16 +220,65 @@ func (pt *pathTracker) GetAll() []PathHealthSnapshot {
 	for _, ph := range pt.paths {
 		ph.mu.Lock()
 		result = append(result, PathHealthSnapshot{
-			PathID:  ph.PathID,
-			RTT:     ph.RTT,
-			RTTVar:  ph.RTTVar,
-			Jitter:  ph.jitter,
-			Loss:    ph.Loss,
-			RxCount: ph.RxCount,
+			PathID:    ph.PathID,
+			State:     ph.State,
+			RTT:       ph.RTT,
+			RTTVar:    ph.RTTVar,
+			Jitter:    ph.jitter,
+			Loss:      ph.Loss,
+			BurstLoss: ph.BurstLoss,
+			MaxBurst:  ph.MaxBurst,
+			RxCount:   ph.RxCount,
+			DropCount: ph.DropCount,
 		})
 		ph.mu.Unlock()
 	}
 	return result
+}
+
+// updateState computes the path state from current metrics.
+// Caller must hold ph.mu.
+func (ph *PathHealth) updateState() {
+	switch {
+	case ph.Loss > 0.50 || ph.BurstLoss > 20:
+		if ph.State != PathFailed {
+			ph.failedSince = time.Now()
+		}
+		ph.State = PathFailed
+		ph.stableCount = 0
+	case ph.Loss > 0.10 || ph.BurstLoss > 10:
+		ph.State = PathUnstable
+		ph.stableCount = 0
+	case ph.Loss > 0.02 || ph.jitter > 50*time.Millisecond:
+		ph.State = PathDegraded
+		ph.stableCount = 0
+	default:
+		if ph.State == PathFailed || ph.State == PathUnstable {
+			ph.stableCount++
+			if ph.stableCount < 10 {
+				ph.State = PathRecovering
+			} else {
+				ph.State = PathHealthy
+			}
+		} else if ph.State == PathRecovering {
+			ph.stableCount++
+			if ph.stableCount >= 10 {
+				ph.State = PathHealthy
+			}
+		} else {
+			ph.State = PathHealthy
+		}
+	}
+}
+
+// RecordDrop increments the drop counter for a path.
+func (pt *pathTracker) RecordDrop(pathID int) {
+	pt.mu.Lock()
+	defer pt.mu.Unlock()
+	ph := pt.getOrCreate(pathID)
+	ph.mu.Lock()
+	ph.DropCount++
+	ph.mu.Unlock()
 }
 
 func (pt *pathTracker) getOrCreate(pathID int) *PathHealth {
@@ -192,12 +295,16 @@ func (pt *pathTracker) getOrCreate(pathID int) *PathHealth {
 
 // PathHealthSnapshot is a point-in-time view of path health.
 type PathHealthSnapshot struct {
-	PathID  int
-	RTT     time.Duration
-	RTTVar  time.Duration
-	Jitter  time.Duration
-	Loss    float64
-	RxCount uint64
+	PathID    int
+	State     PathState
+	RTT       time.Duration
+	RTTVar    time.Duration
+	Jitter    time.Duration
+	Loss      float64
+	BurstLoss int
+	MaxBurst  int
+	RxCount   uint64
+	DropCount uint64
 }
 
 // buildProbePacket creates a probe control packet with a timestamp.

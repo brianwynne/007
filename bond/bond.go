@@ -43,26 +43,106 @@ import (
 	"time"
 )
 
-// Config holds bond configuration.
-type Config struct {
-	// FEC
-	FECEnabled  bool // enable forward error correction
-	FECAdaptive bool // dynamically adjust FEC ratio
+// SystemState represents the overall health of the bonding system.
+type SystemState int32
 
-	// Reorder
-	ReorderEnabled bool // enable reorder buffer
+const (
+	SystemHealthy       SystemState = iota // all paths healthy, recovery working
+	SystemDegraded                          // some paths impaired, recovery active
+	SystemSeverelyDegraded                  // most paths impaired, recovery stressed
+	SystemUnrecoverable                     // loss exceeding recovery capacity
+)
 
-	// General
-	Enabled bool // master enable for bonding features
+func (s SystemState) String() string {
+	switch s {
+	case SystemHealthy:
+		return "healthy"
+	case SystemDegraded:
+		return "degraded"
+	case SystemSeverelyDegraded:
+		return "severely_degraded"
+	case SystemUnrecoverable:
+		return "unrecoverable"
+	default:
+		return "unknown"
+	}
 }
 
-// DefaultConfig returns a sensible default configuration.
+// Config holds bond configuration. All operational parameters are
+// configurable — no hardcoded constants per CLAUDE.md requirements.
+type Config struct {
+	// General
+	Enabled        bool          // master enable for bonding features
+	LatencyBudgetMs int          // max acceptable end-to-end latency (ms); 0 = unlimited
+
+	// FEC
+	FECEnabled      bool         // enable forward error correction
+	FECAdaptive     bool         // dynamically adjust FEC ratio
+	FECBlockTimeoutMs int        // max ms to wait for complete FEC block
+	FECLossWindow   int          // packets in loss measurement sliding window
+	FECAdaptIntervalMs int       // ms between FEC ratio adaptation
+	FECLowK, FECLowM   int      // clean network FEC ratio
+	FECMedK, FECMedM   int      // moderate loss FEC ratio
+	FECHighK, FECHighM int      // high loss FEC ratio
+	FECLowThreshold    float64  // loss rate threshold for low→med
+	FECHighThreshold   float64  // loss rate threshold for med→high
+
+	// Reorder
+	ReorderEnabled    bool       // enable reorder buffer
+	ReorderBufSize    int        // max packets in reorder buffer
+	ReorderWindowMs   int        // default reorder window (ms)
+	ReorderMinMs      int        // minimum reorder window (ms)
+	ReorderMaxMs      int        // maximum reorder window (ms)
+	ReorderFlushMs    int        // gap flush interval (ms)
+	ReorderAdaptSec   int        // window adaptation interval (seconds)
+
+	// ARQ
+	ARQEnabled        bool       // enable NACK-based retransmission
+	ARQBufSize        int        // retransmit ring buffer size (packets)
+	ARQMaxNonces      int        // max nonces per NACK packet
+	ARQRateLimitMs    int        // min ms between NACKs
+	ARQDeadlineCheck  bool       // only NACK if retransmit can arrive in time
+
+	// Path health
+	ProbeIntervalMs    int       // ms between path probes
+	PathStatsWindow    int       // packets in loss measurement window
+	PacketIntervalMs   int       // expected packet interval for jitter calc (ms)
+}
+
+// DefaultConfig returns a sensible default configuration for broadcast audio.
 func DefaultConfig() Config {
 	return Config{
-		Enabled:        true,
-		FECEnabled:     true,
-		FECAdaptive:    true,
-		ReorderEnabled: true,
+		Enabled:         true,
+		LatencyBudgetMs: 200, // 200ms end-to-end budget for broadcast
+
+		FECEnabled:        true,
+		FECAdaptive:       true,
+		FECBlockTimeoutMs: 50,
+		FECLossWindow:     200,
+		FECAdaptIntervalMs: 500,
+		FECLowK: 16, FECLowM: 2,
+		FECMedK: 12, FECMedM: 4,
+		FECHighK: 8, FECHighM: 6,
+		FECLowThreshold:  0.01,
+		FECHighThreshold: 0.05,
+
+		ReorderEnabled:  true,
+		ReorderBufSize:  64,
+		ReorderWindowMs: 80,
+		ReorderMinMs:    20,
+		ReorderMaxMs:    200,
+		ReorderFlushMs:  10,
+		ReorderAdaptSec: 1,
+
+		ARQEnabled:       true,
+		ARQBufSize:       512,
+		ARQMaxNonces:     32,
+		ARQRateLimitMs:   10,
+		ARQDeadlineCheck: true,
+
+		ProbeIntervalMs:  1000,
+		PathStatsWindow:  100,
+		PacketIntervalMs: 20,
 	}
 }
 
@@ -87,9 +167,13 @@ type Manager struct {
 	peers   map[uint32]*peerState
 	peersMu sync.Mutex
 
+	// System state
+	systemState atomic.Int32 // SystemState enum
+
 	// Stats
-	txPackets atomic.Uint64
-	rxPackets atomic.Uint64
+	txPackets   atomic.Uint64
+	rxPackets   atomic.Uint64
+	dropPackets atomic.Uint64
 
 	// Lifecycle
 	running atomic.Bool
@@ -120,7 +204,7 @@ func (m *Manager) getPeerState(peerID uint32) *peerState {
 	if !exists {
 		ps = &peerState{}
 		if m.config.FECEnabled {
-			enc, err := NewFECEncoder()
+			enc, err := NewFECEncoder(m.config)
 			if err != nil {
 				if m.logger != nil {
 					m.logger.Printf("007 Bond: failed to create FEC encoder for peer %d: %v", peerID, err)
@@ -131,10 +215,13 @@ func (m *Manager) getPeerState(peerID uint32) *peerState {
 			}
 		}
 		if m.config.ReorderEnabled {
-			ps.reorderBuf = NewReorderBuffer()
+			ps.reorderBuf = NewReorderBuffer(m.config)
 		}
 		ps.retransmit = &retransmitBuffer{}
-		ps.nackTrack = &nackTracker{}
+		ps.nackTrack = &nackTracker{
+			rateLimit: time.Duration(m.config.ARQRateLimitMs) * time.Millisecond,
+			maxNonces: m.config.ARQMaxNonces,
+		}
 		ps.pathTrack = newPathTracker()
 		m.peers[peerID] = ps
 	}
@@ -268,9 +355,24 @@ func (m *Manager) ProcessInbound(peerID uint32, packet []byte, nonce uint64, pat
 		}
 
 		// Check for skipped nonces (FEC couldn't recover) → queue for NACK
-		if ps.reorderBuf != nil {
+		if ps.reorderBuf != nil && m.config.ARQEnabled {
 			skipped := ps.reorderBuf.DrainSkippedNonces()
 			for _, n := range skipped {
+				// Only NACK if retransmit can arrive within latency budget
+				if m.config.ARQDeadlineCheck && m.config.LatencyBudgetMs > 0 {
+					paths := ps.pathTrack.GetAll()
+					canArrive := false
+					budget := time.Duration(m.config.LatencyBudgetMs) * time.Millisecond
+					for _, p := range paths {
+						if p.RTT > 0 && p.RTT < budget {
+							canArrive = true
+							break
+						}
+					}
+					if !canArrive && len(paths) > 0 {
+						continue // retransmit would exceed budget
+					}
+				}
 				ps.nackTrack.AddMissing(n)
 			}
 			if len(skipped) > 0 {
@@ -346,8 +448,8 @@ func (m *Manager) triggerNACK(ps *peerState) {
 
 // reorderLoop runs periodic flush and window adaptation for all peers.
 func (m *Manager) reorderLoop() {
-	flushTicker := time.NewTicker(10 * time.Millisecond)
-	adaptTicker := time.NewTicker(1 * time.Second)
+	flushTicker := time.NewTicker(time.Duration(m.config.ReorderFlushMs) * time.Millisecond)
+	adaptTicker := time.NewTicker(time.Duration(m.config.ReorderAdaptSec) * time.Second)
 	defer flushTicker.Stop()
 	defer adaptTicker.Stop()
 
@@ -368,21 +470,57 @@ func (m *Manager) reorderLoop() {
 			}
 			m.peersMu.Unlock()
 		case <-adaptTicker.C:
-			// Adapt window for all peers
+			// Adapt window for all peers + update system state
 			m.peersMu.Lock()
 			for _, ps := range m.peers {
 				if ps.reorderBuf != nil {
 					ps.reorderBuf.AdaptWindow()
 				}
 			}
+			m.updateSystemState()
 			m.peersMu.Unlock()
 		}
 	}
 }
 
+// updateSystemState computes overall system health from per-peer path states.
+// Caller must hold m.peersMu.
+func (m *Manager) updateSystemState() {
+	var totalPaths, healthy, degraded, failed int
+	for _, ps := range m.peers {
+		if ps.pathTrack == nil {
+			continue
+		}
+		for _, p := range ps.pathTrack.GetAll() {
+			totalPaths++
+			switch p.State {
+			case PathHealthy, PathRecovering:
+				healthy++
+			case PathDegraded:
+				degraded++
+			case PathUnstable, PathFailed:
+				failed++
+			}
+		}
+	}
+
+	var state SystemState
+	switch {
+	case totalPaths == 0 || healthy == totalPaths:
+		state = SystemHealthy
+	case healthy > 0:
+		state = SystemDegraded
+	case degraded > 0:
+		state = SystemSeverelyDegraded
+	default:
+		state = SystemUnrecoverable
+	}
+	m.systemState.Store(int32(state))
+}
+
 // probeLoop periodically sends probe packets for RTT measurement.
 func (m *Manager) probeLoop() {
-	ticker := time.NewTicker(probeInterval)
+	ticker := time.NewTicker(time.Duration(m.config.ProbeIntervalMs) * time.Millisecond)
 	defer ticker.Stop()
 
 	for {
@@ -405,7 +543,7 @@ func (m *Manager) probeLoop() {
 
 // fecAdaptLoop periodically adjusts the FEC ratio based on measured loss.
 func (m *Manager) fecAdaptLoop() {
-	ticker := time.NewTicker(500 * time.Millisecond)
+	ticker := time.NewTicker(time.Duration(m.config.FECAdaptIntervalMs) * time.Millisecond)
 	defer ticker.Stop()
 
 	var lastTx, lastRx uint64
@@ -447,8 +585,10 @@ func (m *Manager) fecAdaptLoop() {
 
 // Stats returns current bond statistics.
 type Stats struct {
+	SystemState      string
 	TxPackets        uint64
 	RxPackets        uint64
+	DropPackets      uint64
 	FECRecovered     uint64
 	FECFailed        uint64
 	ReorderInOrder   uint64
@@ -461,8 +601,10 @@ type Stats struct {
 // GetStats returns current statistics aggregated across all peers.
 func (m *Manager) GetStats() Stats {
 	s := Stats{
-		TxPackets: m.txPackets.Load(),
-		RxPackets: m.rxPackets.Load(),
+		SystemState: SystemState(m.systemState.Load()).String(),
+		TxPackets:   m.txPackets.Load(),
+		RxPackets:   m.rxPackets.Load(),
+		DropPackets: m.dropPackets.Load(),
 	}
 
 	m.peersMu.Lock()

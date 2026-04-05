@@ -63,9 +63,10 @@ func (a *API) Stop() {
 
 // statsResponse is the JSON response for /api/stats.
 type statsResponse struct {
-	Uptime           string             `json:"uptime"`
+	SystemState      string             `json:"system_state"`
 	TxPackets        uint64             `json:"tx_packets"`
 	RxPackets        uint64             `json:"rx_packets"`
+	DropPackets      uint64             `json:"drop_packets"`
 	FECRecovered     uint64             `json:"fec_recovered"`
 	FECFailed        uint64             `json:"fec_failed"`
 	ReorderInOrder   uint64             `json:"reorder_in_order"`
@@ -76,11 +77,15 @@ type statsResponse struct {
 }
 
 type pathResponse struct {
-	PathID  int     `json:"path_id"`
-	RTTMs   float64 `json:"rtt_ms"`
-	JitterMs float64 `json:"jitter_ms"`
-	Loss    float64 `json:"loss"`
-	RxCount uint64  `json:"rx_count"`
+	PathID    int     `json:"path_id"`
+	State     string  `json:"state"`
+	RTTMs     float64 `json:"rtt_ms"`
+	JitterMs  float64 `json:"jitter_ms"`
+	Loss      float64 `json:"loss"`
+	BurstLoss int     `json:"burst_loss"`
+	MaxBurst  int     `json:"max_burst"`
+	RxCount   uint64  `json:"rx_count"`
+	DropCount uint64  `json:"drop_count"`
 }
 
 func (a *API) handleStats(w http.ResponseWriter, r *http.Request) {
@@ -92,8 +97,10 @@ func (a *API) handleStats(w http.ResponseWriter, r *http.Request) {
 	s := a.mgr.GetStats()
 
 	resp := statsResponse{
+		SystemState:      s.SystemState,
 		TxPackets:        s.TxPackets,
 		RxPackets:        s.RxPackets,
+		DropPackets:      s.DropPackets,
 		FECRecovered:     s.FECRecovered,
 		FECFailed:        s.FECFailed,
 		ReorderInOrder:   s.ReorderInOrder,
@@ -104,11 +111,15 @@ func (a *API) handleStats(w http.ResponseWriter, r *http.Request) {
 
 	for _, p := range s.Paths {
 		resp.Paths = append(resp.Paths, pathResponse{
-			PathID:   p.PathID,
-			RTTMs:    float64(p.RTT) / float64(time.Millisecond),
-			JitterMs: float64(p.Jitter) / float64(time.Millisecond),
-			Loss:     p.Loss,
-			RxCount:  p.RxCount,
+			PathID:    p.PathID,
+			State:     p.State.String(),
+			RTTMs:     float64(p.RTT) / float64(time.Millisecond),
+			JitterMs:  float64(p.Jitter) / float64(time.Millisecond),
+			Loss:      p.Loss,
+			BurstLoss: p.BurstLoss,
+			MaxBurst:  p.MaxBurst,
+			RxCount:   p.RxCount,
+			DropCount: p.DropCount,
 		})
 	}
 
@@ -126,11 +137,15 @@ func (a *API) handlePaths(w http.ResponseWriter, r *http.Request) {
 	var paths []pathResponse
 	for _, p := range s.Paths {
 		paths = append(paths, pathResponse{
-			PathID:   p.PathID,
-			RTTMs:    float64(p.RTT) / float64(time.Millisecond),
-			JitterMs: float64(p.Jitter) / float64(time.Millisecond),
-			Loss:     p.Loss,
-			RxCount:  p.RxCount,
+			PathID:    p.PathID,
+			State:     p.State.String(),
+			RTTMs:     float64(p.RTT) / float64(time.Millisecond),
+			JitterMs:  float64(p.Jitter) / float64(time.Millisecond),
+			Loss:      p.Loss,
+			BurstLoss: p.BurstLoss,
+			MaxBurst:  p.MaxBurst,
+			RxCount:   p.RxCount,
+			DropCount: p.DropCount,
 		})
 	}
 

@@ -77,10 +77,18 @@ const (
 )
 
 // NewReorderBuffer creates a new adaptive reorder buffer.
-func NewReorderBuffer() *ReorderBuffer {
+func NewReorderBuffer(cfg Config) *ReorderBuffer {
+	windowMs := cfg.ReorderWindowMs
+	if windowMs == 0 {
+		windowMs = defaultWindowMs
+	}
+	minMs := cfg.ReorderMinMs
+	if minMs == 0 {
+		minMs = minWindowMs
+	}
 	return &ReorderBuffer{
-		maxWindow:   time.Duration(defaultWindowMs) * time.Millisecond,
-		minWindow:   time.Duration(minWindowMs) * time.Millisecond,
+		maxWindow:   time.Duration(windowMs) * time.Millisecond,
+		minWindow:   time.Duration(minMs) * time.Millisecond,
 		pathRTT:     make(map[int]*PathStats),
 		lastGapTime: time.Now(),
 	}

@@ -101,9 +101,11 @@ func (rb *retransmitBuffer) Lookup(nonce uint64) []byte {
 
 // nackTracker generates NACKs for unrecoverable gaps on the receive side.
 type nackTracker struct {
-	mu       sync.Mutex
-	pending  []uint64  // nonces that need NACKing
-	lastNACK time.Time // rate limiting
+	mu        sync.Mutex
+	pending   []uint64      // nonces that need NACKing
+	lastNACK  time.Time     // rate limiting
+	rateLimit time.Duration // min time between NACKs
+	maxNonces int           // max nonces per NACK packet
 }
 
 // AddMissing records a nonce that FEC couldn't recover.
@@ -136,14 +138,22 @@ func (nt *nackTracker) GenerateNACK() []byte {
 	}
 
 	now := time.Now()
-	if now.Sub(nt.lastNACK) < nackRateLimit {
+	rl := nt.rateLimit
+	if rl == 0 {
+		rl = nackRateLimit
+	}
+	if now.Sub(nt.lastNACK) < rl {
 		return nil
 	}
 
-	// Take up to maxNACKNonces
+	// Take up to maxNonces
+	maxN := nt.maxNonces
+	if maxN == 0 {
+		maxN = maxNACKNonces
+	}
 	count := len(nt.pending)
-	if count > maxNACKNonces {
-		count = maxNACKNonces
+	if count > maxN {
+		count = maxN
 	}
 	nonces := nt.pending[:count]
 	nt.pending = nt.pending[count:]

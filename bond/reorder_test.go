@@ -6,7 +6,7 @@ import (
 )
 
 func TestReorderBuffer_InOrder(t *testing.T) {
-	rb := NewReorderBuffer()
+	rb := NewReorderBuffer(DefaultConfig())
 
 	for i := uint64(0); i < 10; i++ {
 		data := []byte{byte(i)}
@@ -32,7 +32,7 @@ func TestReorderBuffer_InOrder(t *testing.T) {
 }
 
 func TestReorderBuffer_OutOfOrder(t *testing.T) {
-	rb := NewReorderBuffer()
+	rb := NewReorderBuffer(DefaultConfig())
 
 	// Send packet 0
 	result := rb.Insert([]byte{0}, 0, 0)
@@ -57,7 +57,7 @@ func TestReorderBuffer_OutOfOrder(t *testing.T) {
 }
 
 func TestReorderBuffer_GapTimeout(t *testing.T) {
-	rb := NewReorderBuffer()
+	rb := NewReorderBuffer(DefaultConfig())
 	// Set very short window for testing
 	rb.mu.Lock()
 	rb.maxWindow = 10 * time.Millisecond
@@ -86,7 +86,7 @@ func TestReorderBuffer_GapTimeout(t *testing.T) {
 }
 
 func TestReorderBuffer_Duplicate(t *testing.T) {
-	rb := NewReorderBuffer()
+	rb := NewReorderBuffer(DefaultConfig())
 
 	result := rb.Insert([]byte{0}, 0, 0)
 	if len(result) != 1 {
@@ -101,7 +101,7 @@ func TestReorderBuffer_Duplicate(t *testing.T) {
 }
 
 func TestReorderBuffer_LatePacket(t *testing.T) {
-	rb := NewReorderBuffer()
+	rb := NewReorderBuffer(DefaultConfig())
 
 	// Deliver 0, 1, 2
 	for i := uint64(0); i < 3; i++ {
@@ -116,7 +116,7 @@ func TestReorderBuffer_LatePacket(t *testing.T) {
 }
 
 func TestReorderBuffer_Flush(t *testing.T) {
-	rb := NewReorderBuffer()
+	rb := NewReorderBuffer(DefaultConfig())
 	rb.mu.Lock()
 	rb.maxWindow = 5 * time.Millisecond
 	rb.minWindow = 5 * time.Millisecond
@@ -138,7 +138,7 @@ func TestReorderBuffer_Flush(t *testing.T) {
 }
 
 func TestReorderBuffer_SkippedNonces(t *testing.T) {
-	rb := NewReorderBuffer()
+	rb := NewReorderBuffer(DefaultConfig())
 	rb.mu.Lock()
 	rb.maxWindow = 5 * time.Millisecond
 	rb.minWindow = 5 * time.Millisecond
@@ -167,7 +167,7 @@ func TestReorderBuffer_SkippedNonces(t *testing.T) {
 }
 
 func TestReorderBuffer_LargeGap(t *testing.T) {
-	rb := NewReorderBuffer()
+	rb := NewReorderBuffer(DefaultConfig())
 
 	// Send packets 0-4
 	for i := uint64(0); i < 5; i++ {

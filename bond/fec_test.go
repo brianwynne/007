@@ -7,7 +7,7 @@ import (
 )
 
 func TestFECEncoderDecoder_Roundtrip(t *testing.T) {
-	enc, err := NewFECEncoder()
+	enc, err := NewFECEncoder(DefaultConfig())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -50,7 +50,7 @@ func TestFECEncoderDecoder_Roundtrip(t *testing.T) {
 }
 
 func TestFECRecovery_SingleLoss(t *testing.T) {
-	enc, err := NewFECEncoder()
+	enc, err := NewFECEncoder(DefaultConfig())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -96,7 +96,7 @@ func TestFECRecovery_SingleLoss(t *testing.T) {
 }
 
 func TestFECRecovery_TwoLoss(t *testing.T) {
-	enc, err := NewFECEncoder()
+	enc, err := NewFECEncoder(DefaultConfig())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -140,7 +140,7 @@ func TestFECRecovery_TwoLoss(t *testing.T) {
 }
 
 func TestFECRecovery_TooManyLost(t *testing.T) {
-	enc, err := NewFECEncoder()
+	enc, err := NewFECEncoder(DefaultConfig())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -176,7 +176,7 @@ func TestFECRecovery_TooManyLost(t *testing.T) {
 func TestFECKeepaliveBypass(t *testing.T) {
 	// Empty packets (keepalives) should NOT be FEC-encoded
 	// This is handled at the device level, but verify encoder handles empty data
-	enc, err := NewFECEncoder()
+	enc, err := NewFECEncoder(DefaultConfig())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -192,7 +192,7 @@ func TestFECKeepaliveBypass(t *testing.T) {
 }
 
 func TestFECHeaderFormat(t *testing.T) {
-	enc, err := NewFECEncoder()
+	enc, err := NewFECEncoder(DefaultConfig())
 	if err != nil {
 		t.Fatal(err)
 	}

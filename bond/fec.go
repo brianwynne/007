@@ -71,6 +71,7 @@ type FECEncoder struct {
 	k, m    int // current data/parity ratio
 	blockID uint16
 	encoder reedsolomon.Encoder
+	config  Config // configurable thresholds and ratios
 
 	// Current block being filled
 	currentBlock [][]byte // K data packets
@@ -107,18 +108,30 @@ type fecBlock struct {
 	timer    *time.Timer
 }
 
-// NewFECEncoder creates a new adaptive FEC encoder.
-func NewFECEncoder() (*FECEncoder, error) {
-	enc, err := reedsolomon.New(fecLowLossK, fecLowLossM)
+// NewFECEncoder creates a new adaptive FEC encoder with the given config.
+func NewFECEncoder(cfg Config) (*FECEncoder, error) {
+	k, m := cfg.FECLowK, cfg.FECLowM
+	if k == 0 {
+		k = fecLowLossK
+	}
+	if m == 0 {
+		m = fecLowLossM
+	}
+	enc, err := reedsolomon.New(k, m)
 	if err != nil {
 		return nil, err
 	}
+	lossWindow := cfg.FECLossWindow
+	if lossWindow == 0 {
+		lossWindow = fecLossWindowSize
+	}
 	fe := &FECEncoder{
-		k:            fecLowLossK,
-		m:            fecLowLossM,
+		k:            k,
+		m:            m,
 		encoder:      enc,
-		currentBlock: make([][]byte, fecLowLossK),
-		lossWindow:   make([]bool, fecLossWindowSize),
+		currentBlock: make([][]byte, k),
+		lossWindow:   make([]bool, lossWindow),
+		config:       cfg,
 	}
 	return fe, nil
 }
@@ -207,13 +220,28 @@ func (fe *FECEncoder) AdaptRate(lossRate float64) error {
 	fe.mu.Lock()
 	defer fe.mu.Unlock()
 
+	lowThresh := fe.config.FECLowThreshold
+	highThresh := fe.config.FECHighThreshold
+	if lowThresh == 0 {
+		lowThresh = lowLossThreshold
+	}
+	if highThresh == 0 {
+		highThresh = highLossThreshold
+	}
+
 	var newK, newM int
-	if lossRate < lowLossThreshold {
-		newK, newM = fecLowLossK, fecLowLossM
-	} else if lossRate < highLossThreshold {
-		newK, newM = fecMedLossK, fecMedLossM
+	if lossRate < lowThresh {
+		newK, newM = fe.config.FECLowK, fe.config.FECLowM
+	} else if lossRate < highThresh {
+		newK, newM = fe.config.FECMedK, fe.config.FECMedM
 	} else {
-		newK, newM = fecHighLossK, fecHighLossM
+		newK, newM = fe.config.FECHighK, fe.config.FECHighM
+	}
+	if newK == 0 {
+		newK = fecLowLossK
+	}
+	if newM == 0 {
+		newM = fecLowLossM
 	}
 
 	if newK == fe.k && newM == fe.m {
