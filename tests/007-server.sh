@@ -14,7 +14,7 @@ fuser -k 8007/tcp 2>/dev/null || true
 fuser -k 51820/udp 2>/dev/null || true
 
 echo "[+] Installing dependencies..."
-apt-get update -qq && apt-get install -y -qq wireguard-tools golang-go git > /dev/null 2>&1
+apt-get update -qq && apt-get install -y -qq wireguard-tools golang-go git iperf3 > /dev/null 2>&1
 
 echo "[+] Building 007 from source..."
 cd /tmp
@@ -46,6 +46,11 @@ wg set bond0 listen-port 51820 private-key ./server.key \
 ip addr add 10.7.0.1/24 dev bond0 2>/dev/null || true
 ip link set bond0 up
 iptables -I INPUT -p udp --dport 51820 -j ACCEPT 2>/dev/null || true
+
+# Start iperf3 server on tunnel IP for client tests
+pkill -f 'iperf3.*10.7.0.1' 2>/dev/null || true
+iperf3 -s -B 10.7.0.1 -D 2>/dev/null || true
+echo "[+] iperf3 server listening on 10.7.0.1:5201"
 
 SERVER_IP=$(hostname -I | awk '{print $1}')
 
