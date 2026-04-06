@@ -33,9 +33,8 @@ if ! command -v go &>/dev/null; then
     echo "[+] Installing Go..."
     apt-get install -y -qq golang-go > /dev/null 2>&1
 fi
-if [ ! -d /opt/007/src ]; then
-    git clone https://github.com/brianwynne/007.git /opt/007/src 2>/dev/null || (cd /opt/007/src && git pull)
-fi
+rm -rf /opt/007/src
+git clone --depth 1 https://github.com/brianwynne/007.git /opt/007/src
 cd /opt/007/src
 go build -o /opt/007/007-proxy ./cmd/007-proxy/
 cd /opt/007
