@@ -57,6 +57,10 @@ type NativeTun struct {
 }
 
 func (tun *NativeTun) File() *os.File {
+	if tun.tunFile == nil {
+		// Blocking mode: create a temporary os.File for callers that need it
+		return os.NewFile(uintptr(tun.blockingReadFd), cloneDevicePath)
+	}
 	return tun.tunFile
 }
 
@@ -510,10 +514,14 @@ func (tun *NativeTun) Close() error {
 		} else if tun.events != nil {
 			close(tun.events)
 		}
-		if tun.blockingReadFd > 0 {
+		if tun.blockingReadFd > 0 && tun.tunFile == nil {
 			unix.Close(tun.blockingReadFd)
+		} else if tun.blockingReadFd > 0 {
+			unix.Close(tun.blockingReadFd)
+			err2 = tun.tunFile.Close()
+		} else {
+			err2 = tun.tunFile.Close()
 		}
-		err2 = tun.tunFile.Close()
 	})
 	if err1 != nil {
 		return err1
@@ -602,9 +610,10 @@ func CreateTUN(name string, mtu int) (Device, error) {
 	// and use the raw fd with blocking unix.Read/unix.Write. No Go
 	// netpoller involvement at all.
 	if os.Getenv("WG_TUN_BLOCKING") == "1" {
-		// fd stays BLOCKING (no SetNonblock)
+		// Keep fd BLOCKING. Do NOT use os.NewFile — Go's runtime would
+		// set it to non-blocking and register with epoll, which is
+		// exactly what's broken on kernel 6.17+.
 		tun := &NativeTun{
-			tunFile:                 os.NewFile(uintptr(nfd), cloneDevicePath),
 			blockingReadFd:          nfd,
 			events:                  make(chan Event, 5),
 			errors:                  make(chan error, 5),
@@ -612,21 +621,15 @@ func CreateTUN(name string, mtu int) (Device, error) {
 			batchSize:               1,
 			vnetHdr:                 false,
 		}
-		// DON'T register with Go's netpoller — just use the fd directly
-		// DON'T start routineHackListener (requires vnetHdr)
-		// Start netlink listener for MTU/interface events
 		tun.nameOnce.Do(func() {
 			tun.nameCache = name
 		})
-		var mtuVal int
-		mtuVal, err = tun.MTU()
-		if err != nil {
-			unix.Close(nfd)
-			return nil, err
-		}
-		if mtu > 0 && mtu < mtuVal {
-			tun.setMTU(mtu)
-		}
+		// Signal interface up after a brief delay (normally done by
+		// routineHackListener which requires os.File/SyscallConn)
+		go func() {
+			time.Sleep(200 * time.Millisecond)
+			tun.events <- EventUp
+		}()
 		return tun, nil
 	}
 
