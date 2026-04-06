@@ -119,60 +119,79 @@ else
     result FAIL "WireGuard handshake lost"
 fi
 
-# ─── TEST 6: FEC recovery under simulated loss ──────────────────
+# ─── TEST 6: FEC recovery — loss on ALL paths ───────────────────
 echo ""
-echo "=== TEST 6: FEC recovery under 20% loss ==="
-# Get FEC stats before
-FEC_BEFORE=$(curl -s --max-time 3 http://127.0.0.1:8007/api/stats 2>/dev/null | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('fec_recovered',0))" 2>/dev/null || echo 0)
+echo "=== TEST 6: FEC recovery — 30% loss on ALL interfaces ==="
+echo "  (must impair ALL paths to force FEC, otherwise multi-path redundancy masks loss)"
+STATS_BEFORE=$(curl -s --max-time 3 http://127.0.0.1:8007/api/stats 2>/dev/null)
+FEC_BEFORE=$(echo "$STATS_BEFORE" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('fec_recovered',0))" 2>/dev/null || echo 0)
 
-# Add loss to one interface
-LOSS_IFACE=$(echo $IFACES | awk '{print $1}')
-tc qdisc add dev "$LOSS_IFACE" root netem loss 20% 2>/dev/null || true
+for iface in $IFACES; do
+    tc qdisc add dev "$iface" root netem loss 30% 2>/dev/null || true
+done
 ping -c 50 -i 0.05 "$SERVER" > /tmp/007-loss.txt 2>&1 || true
-tc qdisc del dev "$LOSS_IFACE" root 2>/dev/null || true
+for iface in $IFACES; do
+    tc qdisc del dev "$iface" root 2>/dev/null || true
+done
 
 RX=$(grep -c "bytes from" /tmp/007-loss.txt || echo 0)
-FEC_AFTER=$(curl -s --max-time 3 http://127.0.0.1:8007/api/stats 2>/dev/null | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('fec_recovered',0))" 2>/dev/null || echo 0)
+STATS_AFTER=$(curl -s --max-time 3 http://127.0.0.1:8007/api/stats 2>/dev/null)
+FEC_AFTER=$(echo "$STATS_AFTER" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('fec_recovered',0))" 2>/dev/null || echo 0)
 FEC_RECOVERED=$((FEC_AFTER - FEC_BEFORE))
+GAPS=$(echo "$STATS_AFTER" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('reorder_gaps',0))" 2>/dev/null || echo 0)
 
-if [ "$RX" -ge 40 ]; then
-    result PASS "Under 20% loss: $RX/50 received (FEC recovered: $FEC_RECOVERED)"
+if [ "$RX" -ge 30 ]; then
+    result PASS "Under 30% ALL-path loss: $RX/50 received (FEC recovered: $FEC_RECOVERED, gaps: $GAPS)"
 else
-    result FAIL "Under 20% loss: $RX/50 received (FEC recovered: $FEC_RECOVERED)"
+    result FAIL "Under 30% ALL-path loss: $RX/50 received (FEC recovered: $FEC_RECOVERED, gaps: $GAPS)"
 fi
 
-# ─── TEST 7: Reorder under latency asymmetry ────────────────────
+# ─── TEST 7: Reorder — different delays per path ────────────────
 echo ""
-echo "=== TEST 7: Reorder under 30ms latency asymmetry ==="
-DELAY_IFACE=$(echo $IFACES | awk '{print $NF}')
-tc qdisc add dev "$DELAY_IFACE" root netem delay 30ms 2>/dev/null || true
-ping -c 20 -i 0.1 "$SERVER" > /tmp/007-delay.txt 2>&1 || true
-tc qdisc del dev "$DELAY_IFACE" root 2>/dev/null || true
-
-RX=$(grep -c "bytes from" /tmp/007-delay.txt || echo 0)
-REORDER_STATS=$(curl -s --max-time 3 http://127.0.0.1:8007/api/stats 2>/dev/null | python3 -c "import sys,json; d=json.load(sys.stdin); print(f'in_order={d.get(\"reorder_in_order\",0)} reordered={d.get(\"reorder_reordered\",0)}')" 2>/dev/null || echo "unavailable")
-if [ "$RX" -ge 18 ]; then
-    result PASS "Under 30ms asymmetry: $RX/20 received ($REORDER_STATS)"
-else
-    result FAIL "Under 30ms asymmetry: $RX/20 received ($REORDER_STATS)"
-fi
-
-# ─── TEST 8: Combined loss + delay ──────────────────────────────
-echo ""
-echo "=== TEST 8: Combined 15% loss + 20ms delay ==="
+echo "=== TEST 7: Reorder — 0ms on path 1, 50ms on path 2 ==="
+echo "  (asymmetric delay forces packets to arrive out of order)"
 IFACE1=$(echo $IFACES | awk '{print $1}')
 IFACE2=$(echo $IFACES | awk '{print $NF}')
-tc qdisc add dev "$IFACE1" root netem loss 15% 2>/dev/null || true
-tc qdisc add dev "$IFACE2" root netem delay 20ms 2>/dev/null || true
-ping -c 30 -i 0.1 "$SERVER" > /tmp/007-combined.txt 2>&1 || true
-tc qdisc del dev "$IFACE1" root 2>/dev/null || true
+REORDER_BEFORE=$(curl -s --max-time 3 http://127.0.0.1:8007/api/stats 2>/dev/null | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('reorder_reordered',0))" 2>/dev/null || echo 0)
+
+tc qdisc add dev "$IFACE2" root netem delay 50ms 10ms 2>/dev/null || true
+ping -c 30 -i 0.05 "$SERVER" > /tmp/007-delay.txt 2>&1 || true
 tc qdisc del dev "$IFACE2" root 2>/dev/null || true
 
-RX=$(grep -c "bytes from" /tmp/007-combined.txt || echo 0)
+RX=$(grep -c "bytes from" /tmp/007-delay.txt || echo 0)
+REORDER_AFTER=$(curl -s --max-time 3 http://127.0.0.1:8007/api/stats 2>/dev/null | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('reorder_reordered',0))" 2>/dev/null || echo 0)
+REORDERED=$((REORDER_AFTER - REORDER_BEFORE))
+
 if [ "$RX" -ge 25 ]; then
-    result PASS "Combined impairment: $RX/30 received"
+    result PASS "Under 50ms asymmetry: $RX/30 received (reordered: $REORDERED)"
 else
-    result FAIL "Combined impairment: $RX/30 received"
+    result FAIL "Under 50ms asymmetry: $RX/30 received (reordered: $REORDERED)"
+fi
+
+# ─── TEST 8: Combined — loss + delay on ALL paths ───────────────
+echo ""
+echo "=== TEST 8: Combined — 20% loss + 30ms delay on ALL paths ==="
+STATS_BEFORE=$(curl -s --max-time 3 http://127.0.0.1:8007/api/stats 2>/dev/null)
+FEC_BEFORE=$(echo "$STATS_BEFORE" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('fec_recovered',0))" 2>/dev/null || echo 0)
+
+for iface in $IFACES; do
+    tc qdisc add dev "$iface" root netem loss 20% delay 30ms 10ms 2>/dev/null || true
+done
+ping -c 50 -i 0.05 "$SERVER" > /tmp/007-combined.txt 2>&1 || true
+for iface in $IFACES; do
+    tc qdisc del dev "$iface" root 2>/dev/null || true
+done
+
+RX=$(grep -c "bytes from" /tmp/007-combined.txt || echo 0)
+STATS_AFTER=$(curl -s --max-time 3 http://127.0.0.1:8007/api/stats 2>/dev/null)
+FEC_AFTER=$(echo "$STATS_AFTER" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('fec_recovered',0))" 2>/dev/null || echo 0)
+FEC_RECOVERED=$((FEC_AFTER - FEC_BEFORE))
+NACKS=$(echo "$STATS_AFTER" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('nacks_sent',0))" 2>/dev/null || echo 0)
+
+if [ "$RX" -ge 30 ]; then
+    result PASS "Combined ALL-path impairment: $RX/50 received (FEC: $FEC_RECOVERED, NACKs: $NACKS)"
+else
+    result FAIL "Combined ALL-path impairment: $RX/50 received (FEC: $FEC_RECOVERED, NACKs: $NACKS)"
 fi
 
 # ─── TEST 9: Management API ─────────────────────────────────────
