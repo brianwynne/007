@@ -29,7 +29,6 @@ const (
 
 type NativeTun struct {
 	tunFile                 *os.File
-	blockingReadFd          int  // fd in blocking mode for unix.Read (kernel 6.17+ fix)
 	index                   int32      // if index
 	errors                  chan error // async error handling
 	events                  chan Event // device related events
@@ -57,10 +56,6 @@ type NativeTun struct {
 }
 
 func (tun *NativeTun) File() *os.File {
-	if tun.tunFile == nil {
-		// Blocking mode: create a temporary os.File for callers that need it
-		return os.NewFile(uintptr(tun.blockingReadFd), cloneDevicePath)
-	}
 	return tun.tunFile
 }
 
@@ -361,13 +356,7 @@ func (tun *NativeTun) Write(bufs [][]byte, offset int) (int, error) {
 		}
 	}
 	for _, bufsI := range tun.toWrite {
-		var n int
-		var err error
-		if tun.blockingReadFd > 0 {
-			n, err = unix.Write(tun.blockingReadFd, bufs[bufsI][offset:])
-		} else {
-			n, err = tun.tunFile.Write(bufs[bufsI][offset:])
-		}
+		n, err := tun.tunFile.Write(bufs[bufsI][offset:])
 		if errors.Is(err, syscall.EBADFD) {
 			return total, os.ErrClosed
 		}
@@ -470,20 +459,7 @@ func (tun *NativeTun) Read(bufs [][]byte, sizes []int, offset int) (int, error) 
 		if tun.vnetHdr {
 			readInto = tun.readBuff[:]
 		}
-
-		var n int
-		var err error
-		if tun.blockingReadFd > 0 {
-			// Direct blocking read — fd was forced into blocking mode by
-			// calling os.File.Fd() during init. Bypasses Go's epoll
-			// netpoller which fails on TUN fds with kernel 6.17+.
-			n, err = unix.Read(tun.blockingReadFd, readInto)
-			if n == 0 && err == nil {
-				err = os.ErrClosed
-			}
-		} else {
-			n, err = tun.tunFile.Read(readInto)
-		}
+		n, err := tun.tunFile.Read(readInto)
 		if errors.Is(err, syscall.EBADFD) {
 			err = os.ErrClosed
 		}
@@ -514,14 +490,7 @@ func (tun *NativeTun) Close() error {
 		} else if tun.events != nil {
 			close(tun.events)
 		}
-		if tun.blockingReadFd > 0 && tun.tunFile == nil {
-			unix.Close(tun.blockingReadFd)
-		} else if tun.blockingReadFd > 0 {
-			unix.Close(tun.blockingReadFd)
-			err2 = tun.tunFile.Close()
-		} else {
-			err2 = tun.tunFile.Close()
-		}
+		err2 = tun.tunFile.Close()
 	})
 	if err1 != nil {
 		return err1
@@ -594,43 +563,10 @@ func CreateTUN(name string, mtu int) (Device, error) {
 	}
 	// IFF_VNET_HDR enables the "tun status hack" via routineHackListener()
 	// where a null write will return EINVAL indicating the TUN is up.
-	// Set WG_NO_VNET_HDR=1 to disable if TUN data doesn't flow on your kernel.
-	tunFlags := uint16(unix.IFF_TUN | unix.IFF_NO_PI | unix.IFF_VNET_HDR)
-	if os.Getenv("WG_NO_VNET_HDR") == "1" {
-		tunFlags = uint16(unix.IFF_TUN | unix.IFF_NO_PI)
-	}
-	ifr.SetUint16(tunFlags)
+	ifr.SetUint16(unix.IFF_TUN | unix.IFF_NO_PI | unix.IFF_VNET_HDR)
 	err = unix.IoctlIfreq(nfd, unix.TUNSETIFF, ifr)
 	if err != nil {
 		return nil, err
-	}
-
-	// On kernel 6.17+, Go's epoll netpoller does not properly signal TUN
-	// fd readability. When WG_TUN_BLOCKING=1, skip os.NewFile entirely
-	// and use the raw fd with blocking unix.Read/unix.Write. No Go
-	// netpoller involvement at all.
-	if os.Getenv("WG_TUN_BLOCKING") == "1" {
-		// Keep fd BLOCKING. Do NOT use os.NewFile — Go's runtime would
-		// set it to non-blocking and register with epoll, which is
-		// exactly what's broken on kernel 6.17+.
-		tun := &NativeTun{
-			blockingReadFd:          nfd,
-			events:                  make(chan Event, 5),
-			errors:                  make(chan error, 5),
-			statusListenersShutdown: make(chan struct{}),
-			batchSize:               1,
-			vnetHdr:                 false,
-		}
-		tun.nameOnce.Do(func() {
-			tun.nameCache = name
-		})
-		// Signal interface up after a brief delay (normally done by
-		// routineHackListener which requires os.File/SyscallConn)
-		go func() {
-			time.Sleep(200 * time.Millisecond)
-			tun.events <- EventUp
-		}()
-		return tun, nil
 	}
 
 	err = unix.SetNonblock(nfd, true)
@@ -642,12 +578,7 @@ func CreateTUN(name string, mtu int) (Device, error) {
 	// Note that the above -- open,ioctl,nonblock -- must happen prior to handing it to netpoll as below this line.
 
 	fd := os.NewFile(uintptr(nfd), cloneDevicePath)
-	dev, err := CreateTUNFromFile(fd, mtu)
-	if err != nil {
-		return nil, err
-	}
-
-	return dev, nil
+	return CreateTUNFromFile(fd, mtu)
 }
 
 // CreateTUNFromFile creates a Device from an os.File with the provided MTU.
