@@ -159,6 +159,12 @@ func DefaultConfig() Config {
 	cfg := FieldPreset()
 	cfg.JitterEnabled = false
 	cfg.ReorderEnabled = true
+	cfg.ReorderBufSize = 64
+	cfg.ReorderWindowMs = 80
+	cfg.ReorderMinMs = 20
+	cfg.ReorderMaxMs = 200
+	cfg.ReorderFlushMs = 10
+	cfg.ReorderAdaptSec = 1
 	return cfg
 }
 
