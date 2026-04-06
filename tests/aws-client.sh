@@ -39,7 +39,7 @@ echo "$CLIENT_KEY" > client.key
 echo "$SERVER_PUB" > server.pub
 
 echo "[+] Starting 007..."
-WG_NO_VNET_HDR=1 "$BOND_DIR/007" -f bond0 > /tmp/007-client.log 2>&1 &
+WG_NO_VNET_HDR=1 WG_TUN_BLOCKING=1 "$BOND_DIR/007" -f bond0 > /tmp/007-client.log 2>&1 &
 sleep 2
 
 echo "[+] Configuring WireGuard..."
