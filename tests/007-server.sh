@@ -14,8 +14,8 @@ fuser -k 8007/tcp 2>/dev/null || true
 fuser -k 51820/udp 2>/dev/null || true
 
 echo "[+] Installing dependencies..."
-pkill -9 apt 2>/dev/null || true
-pkill -9 dpkg 2>/dev/null || true
+fuser -k /var/lib/dpkg/lock-frontend 2>/dev/null || true
+fuser -k /var/lib/apt/lists/lock 2>/dev/null || true
 sleep 1
 rm -f /var/lib/dpkg/lock-frontend /var/lib/apt/lists/lock /var/cache/apt/archives/lock
 dpkg --configure -a 2>/dev/null || true
