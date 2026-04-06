@@ -11,6 +11,11 @@ killall 007 007-bond 2>/dev/null || true
 sleep 1
 rm -f /var/run/wireguard/*.sock
 ip link del bond0 2>/dev/null || true
+ip link del wg-test 2>/dev/null || true
+# Remove any other wireguard interfaces holding port 51820
+for iface in $(wg show interfaces 2>/dev/null); do
+    ip link del "$iface" 2>/dev/null || true
+done
 rm -f "$BOND_DIR/007"
 
 echo "[+] Installing 007 Bond server..."
