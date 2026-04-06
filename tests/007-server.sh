@@ -14,7 +14,13 @@ fuser -k 8007/tcp 2>/dev/null || true
 fuser -k 51820/udp 2>/dev/null || true
 
 echo "[+] Installing dependencies..."
-apt-get update -qq && apt-get install -y -qq wireguard-tools golang-go git iperf3 > /dev/null 2>&1
+pkill -9 apt 2>/dev/null || true
+pkill -9 dpkg 2>/dev/null || true
+sleep 1
+rm -f /var/lib/dpkg/lock-frontend /var/lib/apt/lists/lock /var/cache/apt/archives/lock
+dpkg --configure -a 2>/dev/null || true
+apt-get update -qq 2>/dev/null
+apt-get install -y -qq wireguard-tools golang-go git iperf3 2>/dev/null || true
 
 echo "[+] Building 007 from source..."
 cd /tmp
