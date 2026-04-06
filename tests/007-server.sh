@@ -48,10 +48,10 @@ ip addr add 10.7.0.1/24 dev bond0 2>/dev/null || true
 ip link set bond0 up
 iptables -I INPUT -p udp --dport 51820 -j ACCEPT 2>/dev/null || true
 
-# Start iperf3 server on tunnel IP
+# Start iperf3 server on tunnel IP (loop restarts after each connection)
 pkill -x iperf3 2>/dev/null || true
-iperf3 -s -B 10.7.0.1 -D 2>/dev/null || true
-echo "[+] iperf3 server on 10.7.0.1:5201"
+nohup bash -c 'while true; do iperf3 -s -B 10.7.0.1 --one-off 2>/dev/null; sleep 1; done' > /tmp/iperf3.log 2>&1 &
+echo "[+] iperf3 server on 10.7.0.1:5201 (auto-restart)"
 
 SERVER_IP=$(hostname -I | awk '{print $1}')
 
