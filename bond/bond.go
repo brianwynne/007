@@ -405,13 +405,14 @@ func (m *Manager) ProcessInbound(peerID uint32, packet []byte, nonce uint64, pat
 			}
 		}
 
-		// Recovered packets → also reorder (dataSeq recovered from FEC payload)
+		// Recovered packets → deliver directly, bypass reorder buffer.
+		// FEC recovery takes ~K*PacketInterval (160ms at K=8/50pps) but the
+		// reorder gap timeout is much shorter (20-80ms). By the time FEC
+		// recovers a packet, the reorder buffer has already skipped past its
+		// dataSeq and would reject it as "late". Delivering directly is better
+		// than dropping a recovered packet.
 		for _, rec := range recovered {
-			if m.config.ReorderEnabled && ps.reorderBuf != nil {
-				result = append(result, ps.reorderBuf.InsertAt(rec.Data, rec.DataSeq, pathID, now)...)
-			} else {
-				result = append(result, rec.Data)
-			}
+			result = append(result, rec.Data)
 		}
 
 		// Check for skipped nonces (FEC couldn't recover) → queue for NACK
@@ -508,12 +509,12 @@ func (m *Manager) handleControl(ps *peerState, packet []byte, pathID int) [][]by
 		}
 
 	case controlTypeRetransmit:
-		// Receiver got a retransmit — extract dataSeq and payload,
-		// insert into reorder buffer at the correct position
-		seq, payload := parseRetransmitPacket(packet)
-		if payload != nil && ps.reorderBuf != nil {
-			return ps.reorderBuf.InsertAt(payload, seq, pathID, time.Now())
-		} else if payload != nil {
+		// Receiver got a retransmit — deliver directly, bypass reorder.
+		// By the time the NACK round-trip completes, the reorder buffer
+		// has already skipped past the gap. Delivering directly is better
+		// than dropping the retransmitted packet.
+		_, payload := parseRetransmitPacket(packet)
+		if payload != nil {
 			return [][]byte{payload}
 		}
 
