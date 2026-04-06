@@ -219,13 +219,19 @@ func (peer *Peer) AddBondPath(dest conn.Endpoint, localIP netip.Addr) error {
 	}
 
 	peer.endpoint.Lock()
-	defer peer.endpoint.Unlock()
 	peer.endpoint.bondPaths = append(peer.endpoint.bondPaths, BondPath{
 		Endpoint: dest,
 		LocalIP:  localIP,
 		conn:     udpConn,
 		dst:      net.UDPAddrFromAddrPort(dstAddrPort),
 	})
+	peer.endpoint.Unlock()
+
+	// Start receive goroutine — bond paths must be bidirectional.
+	// Without this, server endpoint roaming sends replies to bond path
+	// sockets that nobody reads, breaking the return path.
+	peer.device.StartBondPathReceiver(udpConn)
+
 	return nil
 }
 

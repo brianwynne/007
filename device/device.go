@@ -6,6 +6,7 @@
 package device
 
 import (
+	"net"
 	"runtime"
 	"sync"
 	"sync/atomic"
@@ -116,6 +117,31 @@ func (device *Device) SetBondManager(mgr bondManager) {
 		device.tun.mtu.Store(mtu - int32(bondFECOverhead))
 		device.log.Verbosef("Bond: effective MTU reduced from %d to %d (FEC overhead)", mtu, mtu-int32(bondFECOverhead))
 	}
+}
+
+// StartBondPathReceiver starts a receive goroutine for a bond path socket.
+// This makes bond paths bidirectional — when the remote endpoint roams to
+// a bond path's source address, replies are received and processed normally.
+func (device *Device) StartBondPathReceiver(udpConn *net.UDPConn) {
+	device.net.stopping.Add(1)
+	device.queue.decryption.wg.Add(1)
+	device.queue.handshake.wg.Add(1)
+
+	// Create a ReceiveFunc that reads from the bond path socket
+	recvFunc := conn.ReceiveFunc(func(bufs [][]byte, sizes []int, eps []conn.Endpoint) (int, error) {
+		n, addr, err := udpConn.ReadFromUDP(bufs[0])
+		if err != nil {
+			return 0, err
+		}
+		sizes[0] = n
+		if addr != nil {
+			ep, _ := device.net.bind.ParseEndpoint(addr.String())
+			eps[0] = ep
+		}
+		return 1, nil
+	})
+
+	go device.RoutineReceiveIncoming(1, recvFunc)
 }
 
 // deviceState represents the state of a Device.
