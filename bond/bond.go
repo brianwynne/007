@@ -646,23 +646,34 @@ func (m *Manager) probeLoop() {
 		case <-m.ctx.Done():
 			return
 		case <-ticker.C:
+			// Collect send functions and paths under lock, send outside lock
+			// to prevent deadlock if sendFunc blocks on a full queue
+			type probeWork struct {
+				fn    func([]byte)
+				paths []PathHealthSnapshot
+			}
+			var work []probeWork
 			m.peersMu.Lock()
 			for _, ps := range m.peers {
 				if ps.sendFunc == nil {
 					continue
 				}
-				// Send probe for each known path
-				paths := ps.pathTrack.GetAll()
-				if len(paths) == 0 {
-					// No paths seen yet — probe on default
-					ps.sendFunc(buildProbePacket(0))
+				work = append(work, probeWork{
+					fn:    ps.sendFunc,
+					paths: ps.pathTrack.GetAll(),
+				})
+			}
+			m.peersMu.Unlock()
+
+			for _, w := range work {
+				if len(w.paths) == 0 {
+					w.fn(buildProbePacket(0))
 				} else {
-					for _, p := range paths {
-						ps.sendFunc(buildProbePacket(p.PathID))
+					for _, p := range w.paths {
+						w.fn(buildProbePacket(p.PathID))
 					}
 				}
 			}
-			m.peersMu.Unlock()
 		}
 	}
 }
