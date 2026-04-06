@@ -574,10 +574,14 @@ func CreateTUN(name string, mtu int) (Device, error) {
 		return nil, err
 	}
 
-	err = unix.SetNonblock(nfd, true)
-	if err != nil {
-		unix.Close(nfd)
-		return nil, err
+	// On kernel 6.17+, Go's epoll-based netpoller may not properly signal
+	// TUN fd readability. WG_TUN_BLOCKING=1 uses blocking reads as a workaround.
+	if os.Getenv("WG_TUN_BLOCKING") != "1" {
+		err = unix.SetNonblock(nfd, true)
+		if err != nil {
+			unix.Close(nfd)
+			return nil, err
+		}
 	}
 
 	// Note that the above -- open,ioctl,nonblock -- must happen prior to handing it to netpoll as below this line.
