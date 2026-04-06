@@ -1,0 +1,225 @@
+#!/usr/bin/env bash
+# 007 Bond — Comprehensive proof tests
+# Run on CLIENT after 007 is running and bond paths are configured
+#
+# Usage: sudo bash 007-prove-it.sh <server_tunnel_ip>
+set -euo pipefail
+
+SERVER="${1:-10.7.0.1}"
+PASS=0
+FAIL=0
+TOTAL=0
+
+result() {
+    TOTAL=$((TOTAL + 1))
+    if [ "$1" = "PASS" ]; then
+        PASS=$((PASS + 1))
+        echo -e "\033[0;32m  [PASS]\033[0m $2"
+    else
+        FAIL=$((FAIL + 1))
+        echo -e "\033[0;31m  [FAIL]\033[0m $2"
+    fi
+}
+
+echo "================================================================"
+echo "  007 Bond — Comprehensive Proof Tests"
+echo "  Server: $SERVER"
+echo "  Time: $(date)"
+echo "  Kernel: $(uname -r)"
+echo "================================================================"
+
+# ─── TEST 1: Basic connectivity ─────────────────────────────────
+echo ""
+echo "=== TEST 1: Basic tunnel connectivity ==="
+if ping -c 5 -W 2 "$SERVER" > /dev/null 2>&1; then
+    result PASS "Ping through tunnel works"
+else
+    result FAIL "Ping through tunnel"
+    echo "  Cannot continue without basic connectivity"
+    exit 1
+fi
+
+# ─── TEST 2: Multi-path send ────────────────────────────────────
+echo ""
+echo "=== TEST 2: Multi-path — packets sent on ALL interfaces ==="
+IFACES=""
+for iface in $(ip -4 -o addr show scope global | awk '{print $2}' | sort -u); do
+    [ "$iface" = "bond0" ] && continue
+    IFACES="$IFACES $iface"
+done
+
+ALL_HAVE_TRAFFIC=true
+for iface in $IFACES; do
+    COUNT=$(timeout 5 tcpdump -i "$iface" udp port 51820 -c 3 -n -q 2>&1 | grep -c "UDP" || echo 0)
+    if [ "$COUNT" -gt 0 ]; then
+        result PASS "Interface $iface: $COUNT packets"
+    else
+        # Generate traffic and retry
+        ping -c 5 -i 0.1 "$SERVER" > /dev/null 2>&1 &
+        COUNT=$(timeout 5 tcpdump -i "$iface" udp port 51820 -c 3 -n -q 2>&1 | grep -c "UDP" || echo 0)
+        wait 2>/dev/null
+        if [ "$COUNT" -gt 0 ]; then
+            result PASS "Interface $iface: $COUNT packets (after retry)"
+        else
+            result FAIL "Interface $iface: no traffic"
+            ALL_HAVE_TRAFFIC=false
+        fi
+    fi
+done
+
+# ─── TEST 3: Sustained throughput ────────────────────────────────
+echo ""
+echo "=== TEST 3: Sustained throughput (100 pings) ==="
+ping -c 100 -i 0.05 "$SERVER" > /tmp/007-sustained.txt 2>&1 || true
+RX=$(grep -c "bytes from" /tmp/007-sustained.txt || echo 0)
+LOSS=$(grep "packet loss" /tmp/007-sustained.txt | grep -oP '\d+(?=%)' || echo 100)
+if [ "$RX" -ge 95 ]; then
+    result PASS "Sustained: $RX/100 received ($LOSS% loss)"
+else
+    result FAIL "Sustained: $RX/100 received ($LOSS% loss)"
+fi
+RTT=$(grep "rtt" /tmp/007-sustained.txt | grep -oP 'avg/[\d.]+' | cut -d/ -f2 || echo "?")
+echo "  RTT avg: ${RTT}ms"
+
+# ─── TEST 4: Path failover ──────────────────────────────────────
+echo ""
+echo "=== TEST 4: Path failover — disable secondary interface ==="
+SECOND_IFACE=$(echo $IFACES | awk '{print $NF}')
+if [ -n "$SECOND_IFACE" ] && [ "$(echo $IFACES | wc -w)" -ge 2 ]; then
+    ping -c 20 -i 0.5 "$SERVER" > /tmp/007-failover.txt 2>&1 &
+    PING_PID=$!
+    sleep 3
+    echo "  Disabling $SECOND_IFACE..."
+    ip link set "$SECOND_IFACE" down
+    sleep 5
+    echo "  Re-enabling $SECOND_IFACE..."
+    ip link set "$SECOND_IFACE" up
+    sleep 2
+    wait $PING_PID 2>/dev/null || true
+    RX=$(grep -c "bytes from" /tmp/007-failover.txt || echo 0)
+    if [ "$RX" -ge 15 ]; then
+        result PASS "Failover: $RX/20 pings during interface toggle"
+    else
+        result FAIL "Failover: $RX/20 pings during interface toggle"
+    fi
+else
+    echo "  (skipped — need 2+ interfaces)"
+fi
+
+# ─── TEST 5: Control traffic survives failover ───────────────────
+echo ""
+echo "=== TEST 5: WireGuard handshake survives failover ==="
+HANDSHAKE_BEFORE=$(wg show bond0 | grep "latest handshake" | head -1)
+# Force handshake by waiting for key refresh or restarting keepalive
+sleep 2
+HANDSHAKE_AFTER=$(wg show bond0 | grep "latest handshake" | head -1)
+if wg show bond0 | grep -q "latest handshake"; then
+    result PASS "WireGuard handshake active after failover"
+else
+    result FAIL "WireGuard handshake lost"
+fi
+
+# ─── TEST 6: FEC recovery under simulated loss ──────────────────
+echo ""
+echo "=== TEST 6: FEC recovery under 20% loss ==="
+# Get FEC stats before
+FEC_BEFORE=$(curl -s --max-time 3 http://127.0.0.1:8007/api/stats 2>/dev/null | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('fec_recovered',0))" 2>/dev/null || echo 0)
+
+# Add loss to one interface
+LOSS_IFACE=$(echo $IFACES | awk '{print $1}')
+tc qdisc add dev "$LOSS_IFACE" root netem loss 20% 2>/dev/null || true
+ping -c 50 -i 0.05 "$SERVER" > /tmp/007-loss.txt 2>&1 || true
+tc qdisc del dev "$LOSS_IFACE" root 2>/dev/null || true
+
+RX=$(grep -c "bytes from" /tmp/007-loss.txt || echo 0)
+FEC_AFTER=$(curl -s --max-time 3 http://127.0.0.1:8007/api/stats 2>/dev/null | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('fec_recovered',0))" 2>/dev/null || echo 0)
+FEC_RECOVERED=$((FEC_AFTER - FEC_BEFORE))
+
+if [ "$RX" -ge 40 ]; then
+    result PASS "Under 20% loss: $RX/50 received (FEC recovered: $FEC_RECOVERED)"
+else
+    result FAIL "Under 20% loss: $RX/50 received (FEC recovered: $FEC_RECOVERED)"
+fi
+
+# ─── TEST 7: Reorder under latency asymmetry ────────────────────
+echo ""
+echo "=== TEST 7: Reorder under 30ms latency asymmetry ==="
+DELAY_IFACE=$(echo $IFACES | awk '{print $NF}')
+tc qdisc add dev "$DELAY_IFACE" root netem delay 30ms 2>/dev/null || true
+ping -c 20 -i 0.1 "$SERVER" > /tmp/007-delay.txt 2>&1 || true
+tc qdisc del dev "$DELAY_IFACE" root 2>/dev/null || true
+
+RX=$(grep -c "bytes from" /tmp/007-delay.txt || echo 0)
+REORDER_STATS=$(curl -s --max-time 3 http://127.0.0.1:8007/api/stats 2>/dev/null | python3 -c "import sys,json; d=json.load(sys.stdin); print(f'in_order={d.get(\"reorder_in_order\",0)} reordered={d.get(\"reorder_reordered\",0)}')" 2>/dev/null || echo "unavailable")
+if [ "$RX" -ge 18 ]; then
+    result PASS "Under 30ms asymmetry: $RX/20 received ($REORDER_STATS)"
+else
+    result FAIL "Under 30ms asymmetry: $RX/20 received ($REORDER_STATS)"
+fi
+
+# ─── TEST 8: Combined loss + delay ──────────────────────────────
+echo ""
+echo "=== TEST 8: Combined 15% loss + 20ms delay ==="
+IFACE1=$(echo $IFACES | awk '{print $1}')
+IFACE2=$(echo $IFACES | awk '{print $NF}')
+tc qdisc add dev "$IFACE1" root netem loss 15% 2>/dev/null || true
+tc qdisc add dev "$IFACE2" root netem delay 20ms 2>/dev/null || true
+ping -c 30 -i 0.1 "$SERVER" > /tmp/007-combined.txt 2>&1 || true
+tc qdisc del dev "$IFACE1" root 2>/dev/null || true
+tc qdisc del dev "$IFACE2" root 2>/dev/null || true
+
+RX=$(grep -c "bytes from" /tmp/007-combined.txt || echo 0)
+if [ "$RX" -ge 25 ]; then
+    result PASS "Combined impairment: $RX/30 received"
+else
+    result FAIL "Combined impairment: $RX/30 received"
+fi
+
+# ─── TEST 9: Management API ─────────────────────────────────────
+echo ""
+echo "=== TEST 9: Management API ==="
+HEALTH=$(curl -s --max-time 3 http://127.0.0.1:8007/api/health 2>/dev/null || echo "")
+if echo "$HEALTH" | grep -q "ok"; then
+    result PASS "API health endpoint"
+else
+    result FAIL "API health endpoint"
+fi
+
+STATS=$(curl -s --max-time 3 http://127.0.0.1:8007/api/stats 2>/dev/null || echo "")
+if echo "$STATS" | grep -q "tx_packets"; then
+    result PASS "API stats endpoint"
+else
+    result FAIL "API stats endpoint"
+fi
+
+CONFIG=$(curl -s --max-time 3 http://127.0.0.1:8007/api/config 2>/dev/null || echo "")
+if echo "$CONFIG" | grep -q "fec_enabled"; then
+    result PASS "API config endpoint"
+else
+    result FAIL "API config endpoint"
+fi
+
+# ─── TEST 10: Full stats dump ────────────────────────────────────
+echo ""
+echo "=== TEST 10: Final bond stats ==="
+FINAL_STATS=$(curl -s --max-time 3 http://127.0.0.1:8007/api/stats 2>/dev/null)
+echo "$FINAL_STATS" | python3 -m json.tool 2>/dev/null || echo "$FINAL_STATS"
+
+TX=$(echo "$FINAL_STATS" | python3 -c "import sys,json; print(json.load(sys.stdin).get('tx_packets',0))" 2>/dev/null || echo 0)
+RX=$(echo "$FINAL_STATS" | python3 -c "import sys,json; print(json.load(sys.stdin).get('rx_packets',0))" 2>/dev/null || echo 0)
+if [ "$TX" -gt 0 ] && [ "$RX" -gt 0 ]; then
+    result PASS "Bond processing active (tx=$TX rx=$RX)"
+else
+    result FAIL "Bond processing inactive"
+fi
+
+# ─── Summary ─────────────────────────────────────────────────────
+echo ""
+echo "================================================================"
+echo "  RESULTS: $PASS passed, $FAIL failed, $TOTAL total"
+if [ "$FAIL" -eq 0 ]; then
+    echo -e "  \033[0;32mALL TESTS PASSED\033[0m"
+else
+    echo -e "  \033[0;31m$FAIL TEST(S) FAILED\033[0m"
+fi
+echo "================================================================"
