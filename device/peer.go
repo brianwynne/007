@@ -336,12 +336,18 @@ func (peer *Peer) Start() {
 			peerRef.SendStagedPackets()
 		})
 
-		// Jitter buffer TUN writer — delivers packets from playout goroutine
+		// Jitter buffer TUN writer — delivers packets from playout goroutine.
+		// Must zero the virtio header space (bytes before MessageTransportOffsetContent)
+		// because the TUN driver with IFF_VNET_HDR expects a valid virtio_net_hdr.
 		device.bondMgr.SetTUNWriter(peer.bondPeerID, func(data []byte) {
 			if device.isClosed() {
 				return
 			}
 			buf := device.GetMessageBuffer()
+			// Zero the header area (virtio_net_hdr + any padding)
+			for i := 0; i < MessageTransportOffsetContent; i++ {
+				buf[i] = 0
+			}
 			copy(buf[MessageTransportOffsetContent:], data)
 			bufs := [][]byte{buf[:MessageTransportOffsetContent+len(data)]}
 			_, err := device.tun.device.Write(bufs, MessageTransportOffsetContent)
