@@ -214,6 +214,16 @@ func main() {
 	if os.Getenv("BOND_REORDER") == "0" {
 		bondCfg.ReorderEnabled = false
 	}
+	if os.Getenv("BOND_JITTER") == "0" {
+		bondCfg.JitterEnabled = false
+		bondCfg.ReorderEnabled = true
+		bondCfg.ReorderBufSize = 64
+		bondCfg.ReorderWindowMs = 80
+		bondCfg.ReorderMinMs = 20
+		bondCfg.ReorderMaxMs = 200
+		bondCfg.ReorderFlushMs = 10
+		bondCfg.ReorderAdaptSec = 1
+	}
 	bondLogger := bond.NewStdLogger(log.New(os.Stderr, fmt.Sprintf("(%s) ", interfaceName), log.LstdFlags))
 	bondMgr, err := bond.NewManager(bondCfg, bondLogger)
 	if err != nil {

@@ -152,20 +152,9 @@ type Config struct {
 	PacketIntervalMs   int       // expected packet interval for jitter calc (ms)
 }
 
-// DefaultConfig returns the field preset with jitter buffer disabled
-// until the TUN writer callback is wired in the device integration.
-// Use BOND_JITTER=1 env var to enable when deliverFunc is set.
+// DefaultConfig returns the field preset.
 func DefaultConfig() Config {
-	cfg := FieldPreset()
-	cfg.JitterEnabled = false
-	cfg.ReorderEnabled = true
-	cfg.ReorderBufSize = 64
-	cfg.ReorderWindowMs = 80
-	cfg.ReorderMinMs = 20
-	cfg.ReorderMaxMs = 200
-	cfg.ReorderFlushMs = 10
-	cfg.ReorderAdaptSec = 1
-	return cfg
+	return FieldPreset()
 }
 
 // BroadcastPreset returns configuration for live broadcast contribution.
@@ -400,6 +389,7 @@ func (m *Manager) Start() {
 
 	m.logger.Info("manager started",
 		"fec", m.config.FECEnabled,
+		"jitter", m.config.JitterEnabled,
 		"reorder", m.config.ReorderEnabled,
 		"arq", m.config.ARQEnabled,
 		"latency_budget_ms", m.config.LatencyBudgetMs)

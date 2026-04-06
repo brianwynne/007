@@ -318,9 +318,11 @@ func (peer *Peer) Start() {
 
 	peer.isRunning.Store(true)
 
-	// Register ARQ send callback with bond manager
+	// Register callbacks with bond manager
 	if device.bondMgr != nil {
 		peerRef := peer
+
+		// ARQ send callback — injects packets into WireGuard send path
 		device.bondMgr.SetPeerSendFunc(peer.bondPeerID, func(data []byte) {
 			if !peerRef.isRunning.Load() {
 				return
@@ -332,6 +334,21 @@ func (peer *Peer) Start() {
 			container.elems = append(container.elems, elem)
 			peerRef.StagePackets(container)
 			peerRef.SendStagedPackets()
+		})
+
+		// Jitter buffer TUN writer — delivers packets from playout goroutine
+		device.bondMgr.SetTUNWriter(peer.bondPeerID, func(data []byte) {
+			if device.isClosed() {
+				return
+			}
+			buf := device.GetMessageBuffer()
+			copy(buf[MessageTransportOffsetContent:], data)
+			bufs := [][]byte{buf[:MessageTransportOffsetContent+len(data)]}
+			_, err := device.tun.device.Write(bufs, MessageTransportOffsetContent)
+			if err != nil {
+				device.log.Errorf("Jitter buffer TUN write failed: %v", err)
+			}
+			device.PutMessageBuffer(buf)
 		})
 	}
 }
