@@ -4,7 +4,8 @@
 set -euo pipefail
 
 echo "[+] Killing ALL old instances..."
-pkill -9 -f '007' 2>/dev/null || true
+pkill -9 -x '007' 2>/dev/null || true
+pkill -9 -x '007-proxy' 2>/dev/null || true
 sleep 2
 rm -f /var/run/wireguard/*.sock
 ip link del bond0 2>/dev/null || true
