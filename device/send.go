@@ -375,6 +375,13 @@ top:
 					if len(elem.packet) == 0 {
 						continue // keepalive — no FEC encoding
 					}
+					// Skip FEC for bond control packets (probes, NACKs, retransmits).
+					// Control packets start with blockID 0xFFFF. They must not consume
+					// dataSeq slots or FEC block capacity — otherwise the jitter buffer
+					// sees phantom gaps at control packet positions.
+					if len(elem.packet) >= 2 && elem.packet[0] == 0xFF && elem.packet[1] == 0xFF {
+						continue // control packet — send raw, no FEC
+					}
 					packets := peer.device.bondMgr.ProcessOutbound(peer.bondPeerID, elem.packet, elem.nonce)
 					if len(packets) > 0 {
 						// First packet is data with FEC header — update element in-place
