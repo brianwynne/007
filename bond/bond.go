@@ -126,14 +126,18 @@ type Config struct {
 	FECLowThreshold    float64  // loss rate threshold for low→med
 	FECHighThreshold   float64  // loss rate threshold for med→high
 
-	// Reorder
-	ReorderEnabled    bool       // enable reorder buffer
-	ReorderBufSize    int        // max packets in reorder buffer
-	ReorderWindowMs   int        // default reorder window (ms)
-	ReorderMinMs      int        // minimum reorder window (ms)
-	ReorderMaxMs      int        // maximum reorder window (ms)
-	ReorderFlushMs    int        // gap flush interval (ms)
-	ReorderAdaptSec   int        // window adaptation interval (seconds)
+	// Jitter buffer (replaces reorder buffer)
+	JitterEnabled     bool       // enable jitter buffer
+	JitterDepthMs     int        // 0 = auto-derive from budget - FEC fill time
+
+	// Reorder (deprecated — use JitterEnabled instead)
+	ReorderEnabled    bool       // enable reorder buffer (legacy)
+	ReorderBufSize    int
+	ReorderWindowMs   int
+	ReorderMinMs      int
+	ReorderMaxMs      int
+	ReorderFlushMs    int
+	ReorderAdaptSec   int
 
 	// ARQ
 	ARQEnabled        bool       // enable NACK-based retransmission
@@ -148,30 +152,33 @@ type Config struct {
 	PacketIntervalMs   int       // expected packet interval for jitter calc (ms)
 }
 
-// DefaultConfig returns a sensible default configuration for broadcast audio.
+// DefaultConfig returns the field preset — safest default.
 func DefaultConfig() Config {
+	return FieldPreset()
+}
+
+// BroadcastPreset returns configuration for live broadcast contribution.
+// 40ms total latency. K=2, M=2. Jitter buffer = 20ms (1 slot).
+// Use when latency is critical and links are reasonable.
+func BroadcastPreset() Config {
 	return Config{
 		Enabled:         true,
-		LatencyBudgetMs: 200, // 200ms end-to-end budget for broadcast
+		LatencyBudgetMs: 40,
+		PacketIntervalMs: 20,
 
-		FECEnabled:        true,
-		FECAdaptive:       true,
-		FECBlockTimeoutMs: 0, // 0 = auto-compute from K * PacketIntervalMs + 50ms
-		FECLossWindow:     200,
+		FECEnabled:  true,
+		FECAdaptive: false, // fixed K/M, no auto-tuning
+		FECLowK: 2, FECLowM: 2,
+		FECMedK: 2, FECMedM: 2,
+		FECHighK: 2, FECHighM: 2,
+		FECBlockTimeoutMs: 0,
+		FECLossWindow:     100,
 		FECAdaptIntervalMs: 500,
-		FECLowK: 8, FECLowM: 2,   // 160ms fill at 50pps, within 200ms budget
-		FECMedK: 6, FECMedM: 3,   // 120ms fill, 50% overhead
-		FECHighK: 4, FECHighM: 4, // 80ms fill, 100% overhead, recovers 4
 		FECLowThreshold:  0.01,
 		FECHighThreshold: 0.05,
 
-		ReorderEnabled:  true,
-		ReorderBufSize:  64,
-		ReorderWindowMs: 80,
-		ReorderMinMs:    20,
-		ReorderMaxMs:    200,
-		ReorderFlushMs:  10,
-		ReorderAdaptSec: 1,
+		JitterEnabled: true,
+		// JitterDepthMs: 0 = auto: 40 - (2-1)*20 = 20ms
 
 		ARQEnabled:       true,
 		ARQBufSize:       512,
@@ -181,20 +188,43 @@ func DefaultConfig() Config {
 
 		ProbeIntervalMs:  1000,
 		PathStatsWindow:  100,
-		PacketIntervalMs: 20,
 	}
 }
 
-// peerState holds per-peer FEC, reorder, ARQ, and path health state.
+// StudioPreset returns configuration for studio-quality links.
+// 80ms total latency. K=2, M=2. Jitter buffer = 60ms (3 slots).
+// Use for studio-to-studio or managed network links.
+func StudioPreset() Config {
+	cfg := BroadcastPreset()
+	cfg.LatencyBudgetMs = 80
+	// JitterDepthMs: auto: 80 - (2-1)*20 = 60ms
+	return cfg
+}
+
+// FieldPreset returns configuration for field contribution.
+// 200ms total latency. K=2, M=4. Jitter buffer = 180ms (9 slots).
+// Use for outdoor broadcast over WiFi + cellular.
+func FieldPreset() Config {
+	cfg := BroadcastPreset()
+	cfg.LatencyBudgetMs = 200
+	cfg.FECLowM = 4
+	cfg.FECMedM = 4
+	cfg.FECHighM = 4
+	// JitterDepthMs: auto: 200 - (2-1)*20 = 180ms
+	return cfg
+}
+
+// peerState holds per-peer FEC, jitter buffer, ARQ, and path health state.
 type peerState struct {
 	encoder    *FECEncoder
 	decoder    *FECDecoder
-	reorderBuf *ReorderBuffer
-	retransmit        *retransmitBuffer // sender side: recent packets for retransmission
-	nackTrack         *nackTracker      // receiver side: tracks unrecoverable gaps
-	pathTrack         *pathTracker      // per-path health metrics
-	sendFunc          func(data []byte) // callback to inject packets into send path
-	lastNACKProcessed time.Time         // sender-side NACK rate limit
+	reorderBuf *ReorderBuffer  // legacy — used when JitterEnabled=false
+	jitterBuf  *JitterBuffer   // playout-deadline-aware buffer
+	retransmit        *retransmitBuffer
+	nackTrack         *nackTracker
+	pathTrack         *pathTracker
+	sendFunc          func(data []byte)
+	lastNACKProcessed time.Time
 }
 
 // Manager coordinates FEC encoding/decoding and packet reordering.
@@ -271,7 +301,29 @@ func (m *Manager) getPeerState(peerID uint32) *peerState {
 				ps.decoder = NewFECDecoder(blockTimeout, 256)
 			}
 		}
-		if m.config.ReorderEnabled {
+		if m.config.JitterEnabled {
+			// Derive jitter buffer depth: budget - FEC worst-case recovery
+			depthMs := m.config.JitterDepthMs
+			if depthMs <= 0 && m.config.LatencyBudgetMs > 0 {
+				fecFill := (m.config.FECLowK - 1) * m.config.PacketIntervalMs
+				depthMs = m.config.LatencyBudgetMs - fecFill
+				if depthMs < m.config.PacketIntervalMs {
+					depthMs = m.config.PacketIntervalMs
+				}
+			}
+			if depthMs <= 0 {
+				depthMs = 60 // fallback
+			}
+			ps.jitterBuf = NewJitterBuffer(JitterConfig{
+				BufferDepth:    time.Duration(depthMs) * time.Millisecond,
+				PacketInterval: time.Duration(m.config.PacketIntervalMs) * time.Millisecond,
+				DeliverFunc:    nil, // set later via SetTUNWriter
+			})
+			m.logger.Info("jitter buffer created",
+				"depth_ms", depthMs,
+				"slots", depthMs/m.config.PacketIntervalMs,
+				"budget_ms", m.config.LatencyBudgetMs)
+		} else if m.config.ReorderEnabled {
 			ps.reorderBuf = NewReorderBuffer(m.config)
 		}
 		ps.retransmit = &retransmitBuffer{}
@@ -290,6 +342,18 @@ func (m *Manager) RemovePeer(peerID uint32) {
 	m.peersMu.Lock()
 	defer m.peersMu.Unlock()
 	delete(m.peers, peerID)
+}
+
+// SetTUNWriter provides the callback for delivering packets to the TUN device.
+// Called from the jitter buffer's playout goroutine at fixed intervals.
+// Must be set before traffic flows if JitterEnabled is true.
+func (m *Manager) SetTUNWriter(peerID uint32, fn func([]byte)) {
+	ps := m.getPeerState(peerID)
+	m.peersMu.Lock()
+	if ps.jitterBuf != nil {
+		ps.jitterBuf.deliverFunc = fn
+	}
+	m.peersMu.Unlock()
 }
 
 // SetPeerSendFunc provides a callback for injecting packets into the
@@ -396,7 +460,51 @@ func (m *Manager) ProcessInbound(peerID uint32, packet []byte, nonce uint64, pat
 
 		var result [][]byte
 
-		// Data packet → reorder using its dataSeq (contiguous, no phantom gaps)
+		// --- JITTER BUFFER PATH ---
+		if ps.jitterBuf != nil {
+			// Insert data packet into jitter buffer (delivered by playout ticker)
+			if data != nil {
+				ps.jitterBuf.Insert(data.Data, data.DataSeq, sourceData)
+			}
+			// Insert recovered packets (FEC fills gaps within the buffer window)
+			for _, rec := range recovered {
+				ps.jitterBuf.Insert(rec.Data, rec.DataSeq, sourceFEC)
+			}
+			// Early NACKs from jitter buffer gap detection
+			if m.config.ARQEnabled {
+				earlyNonces := ps.jitterBuf.DrainEarlyNACK()
+				for _, n := range earlyNonces {
+					// Check if retransmit can arrive before playout deadline
+					if m.config.ARQDeadlineCheck {
+						deadline := ps.jitterBuf.PlayoutDeadline(n)
+						if !deadline.IsZero() {
+							remaining := time.Until(deadline)
+							paths := ps.pathTrack.GetAll()
+							canArrive := false
+							for _, p := range paths {
+								if p.RTT > 0 && p.RTT < remaining {
+									canArrive = true
+									break
+								}
+							}
+							if !canArrive && len(paths) > 0 {
+								m.arqDeadlineSkip.Add(1)
+								continue
+							}
+						}
+					}
+					ps.nackTrack.AddMissing(n)
+				}
+				if len(earlyNonces) > 0 {
+					m.triggerNACK(ps)
+				}
+			}
+			// Jitter buffer delivers via callback — return nil
+			return result
+		}
+
+		// --- LEGACY REORDER BUFFER PATH ---
+		// Data packet → reorder using its dataSeq
 		if data != nil {
 			if m.config.ReorderEnabled && ps.reorderBuf != nil {
 				result = append(result, ps.reorderBuf.InsertAt(data.Data, data.DataSeq, pathID, now)...)
@@ -404,8 +512,7 @@ func (m *Manager) ProcessInbound(peerID uint32, packet []byte, nonce uint64, pat
 				result = append(result, data.Data)
 			}
 		}
-
-		// Recovered packets → also reorder (dataSeq recovered from FEC payload)
+		// Recovered packets
 		for _, rec := range recovered {
 			if m.config.ReorderEnabled && ps.reorderBuf != nil {
 				result = append(result, ps.reorderBuf.InsertAt(rec.Data, rec.DataSeq, pathID, now)...)
@@ -413,11 +520,8 @@ func (m *Manager) ProcessInbound(peerID uint32, packet []byte, nonce uint64, pat
 				result = append(result, rec.Data)
 			}
 		}
-
-		// Check for skipped nonces (FEC couldn't recover) → queue for NACK
+		// Legacy reorder buffer NACK logic
 		if ps.reorderBuf != nil {
-			// Early NACKs — request retransmit immediately when gap detected
-			// (before gap timeout fires), giving RTT time for retransmit to arrive
 			if m.config.ARQEnabled {
 				earlyNonces := ps.reorderBuf.DrainEarlyNACK()
 				for _, n := range earlyNonces {
@@ -427,8 +531,6 @@ func (m *Manager) ProcessInbound(peerID uint32, packet []byte, nonce uint64, pat
 					m.triggerNACK(ps)
 				}
 			}
-
-			// Skipped nonces from gap timeout — confirmed losses
 			skipped := ps.reorderBuf.DrainSkippedNonces()
 			for range skipped {
 				ps.pathTrack.RecordLoss(pathID)
@@ -508,12 +610,14 @@ func (m *Manager) handleControl(ps *peerState, packet []byte, pathID int) [][]by
 		}
 
 	case controlTypeRetransmit:
-		// Receiver got a retransmit — extract dataSeq and payload,
-		// insert into reorder buffer at the correct position
 		seq, payload := parseRetransmitPacket(packet)
-		if payload != nil && ps.reorderBuf != nil {
-			return ps.reorderBuf.InsertAt(payload, seq, pathID, time.Now())
-		} else if payload != nil {
+		if payload != nil {
+			if ps.jitterBuf != nil {
+				ps.jitterBuf.Insert(payload, seq, sourceARQ)
+				return nil
+			} else if ps.reorderBuf != nil {
+				return ps.reorderBuf.InsertAt(payload, seq, pathID, time.Now())
+			}
 			return [][]byte{payload}
 		}
 

@@ -8,7 +8,10 @@ import (
 
 func TestManager_ProcessOutboundInbound_Roundtrip(t *testing.T) {
 	cfg := DefaultConfig()
-	cfg.ReorderEnabled = false // test FEC only
+	cfg.JitterEnabled = false
+	cfg.ReorderEnabled = false
+	cfg.FECLowK = 8
+	cfg.FECLowM = 2
 	mgr, err := NewManager(cfg, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -17,7 +20,7 @@ func TestManager_ProcessOutboundInbound_Roundtrip(t *testing.T) {
 	defer mgr.Stop()
 
 	peerID := uint32(1)
-	K := cfg.FECLowK // 8
+	K := cfg.FECLowK
 
 	// Send K packets through outbound
 	var allEncoded [][]byte
@@ -48,7 +51,10 @@ func TestManager_ProcessOutboundInbound_Roundtrip(t *testing.T) {
 
 func TestManager_ProcessInbound_WithRecovery(t *testing.T) {
 	cfg := DefaultConfig()
+	cfg.JitterEnabled = false
 	cfg.ReorderEnabled = false
+	cfg.FECLowK = 8
+	cfg.FECLowM = 2
 	mgr, err := NewManager(cfg, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -82,7 +88,9 @@ func TestManager_ProcessInbound_WithRecovery(t *testing.T) {
 
 func TestManager_ProcessInbound_WithReorder(t *testing.T) {
 	cfg := DefaultConfig()
-	cfg.FECEnabled = false // test reorder only
+	cfg.JitterEnabled = false
+	cfg.FECEnabled = false
+	cfg.ReorderEnabled = true
 	mgr, err := NewManager(cfg, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -109,7 +117,10 @@ func TestManager_ProcessInbound_WithReorder(t *testing.T) {
 
 func TestManager_PerPeerIsolation(t *testing.T) {
 	cfg := DefaultConfig()
+	cfg.JitterEnabled = false
 	cfg.ReorderEnabled = false
+	cfg.FECLowK = 8
+	cfg.FECLowM = 2
 	mgr, err := NewManager(cfg, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -165,6 +176,7 @@ func TestManager_PerPeerIsolation(t *testing.T) {
 
 func TestManager_ControlPacketNotDelivered(t *testing.T) {
 	cfg := DefaultConfig()
+	cfg.JitterEnabled = false
 	mgr, err := NewManager(cfg, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -184,6 +196,7 @@ func TestManager_ControlPacketNotDelivered(t *testing.T) {
 
 func TestManager_ARQRetransmit(t *testing.T) {
 	cfg := DefaultConfig()
+	cfg.JitterEnabled = false
 	cfg.FECEnabled = false
 	cfg.ReorderEnabled = false
 	mgr, err := NewManager(cfg, nil)
@@ -237,6 +250,7 @@ func TestManager_ARQRetransmit(t *testing.T) {
 
 func TestManager_ProbeEcho(t *testing.T) {
 	cfg := DefaultConfig()
+	cfg.JitterEnabled = false
 	cfg.FECEnabled = false
 	cfg.ReorderEnabled = false
 	mgr, err := NewManager(cfg, nil)
@@ -288,6 +302,7 @@ func TestManager_ProbeEcho(t *testing.T) {
 
 func TestManager_Stats(t *testing.T) {
 	cfg := DefaultConfig()
+	cfg.JitterEnabled = false
 	cfg.FECEnabled = false
 	cfg.ReorderEnabled = false
 	mgr, err := NewManager(cfg, nil)
