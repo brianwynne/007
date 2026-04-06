@@ -6,6 +6,13 @@ set -euo pipefail
 BOND_DIR="/opt/007"
 VERSION="v0.1.0"
 
+echo "[+] Cleaning up any running instances..."
+killall 007 007-bond 2>/dev/null || true
+sleep 1
+rm -f /var/run/wireguard/*.sock
+ip link del bond0 2>/dev/null || true
+rm -f "$BOND_DIR/007"
+
 echo "[+] Installing 007 Bond server..."
 mkdir -p "$BOND_DIR"
 apt-get update -qq && apt-get install -y -qq wireguard-tools xxd netcat-openbsd > /dev/null 2>&1
