@@ -29,7 +29,7 @@ const (
 
 type NativeTun struct {
 	tunFile                 *os.File
-	rawReadFd               int  // raw blocking fd for TUN reads (kernel 6.17+ workaround)
+	blockingReadFd          int  // fd in blocking mode for unix.Read (kernel 6.17+ fix)
 	index                   int32      // if index
 	errors                  chan error // async error handling
 	events                  chan Event // device related events
@@ -463,21 +463,11 @@ func (tun *NativeTun) Read(bufs [][]byte, sizes []int, offset int) (int, error) 
 
 		var n int
 		var err error
-		if tun.rawReadFd > 0 {
-			// Use unix.Poll + unix.Read — bypasses Go's epoll netpoller
-			// which fails on TUN fds with kernel 6.17+
-			for {
-				fds := []unix.PollFd{{Fd: int32(tun.rawReadFd), Events: unix.POLLIN}}
-				_, err = unix.Poll(fds, -1)
-				if err == unix.EINTR {
-					continue
-				}
-				if err != nil {
-					return 0, err
-				}
-				break
-			}
-			n, err = unix.Read(tun.rawReadFd, readInto)
+		if tun.blockingReadFd > 0 {
+			// Direct blocking read — fd was forced into blocking mode by
+			// calling os.File.Fd() during init. Bypasses Go's epoll
+			// netpoller which fails on TUN fds with kernel 6.17+.
+			n, err = unix.Read(tun.blockingReadFd, readInto)
 			if n == 0 && err == nil {
 				err = os.ErrClosed
 			}
@@ -514,9 +504,8 @@ func (tun *NativeTun) Close() error {
 		} else if tun.events != nil {
 			close(tun.events)
 		}
-		if tun.rawReadFd > 0 {
-			unix.Close(tun.rawReadFd)
-		}
+		// blockingReadFd is the SAME fd as tunFile (just forced to blocking),
+		// so tunFile.Close() handles it
 		err2 = tun.tunFile.Close()
 	})
 	if err1 != nil {
@@ -615,29 +604,15 @@ func CreateTUN(name string, mtu int) (Device, error) {
 		return nil, err
 	}
 
-	// On kernel 6.17+, Go's epoll-based netpoller may not signal TUN fd
-	// readability. Dup the fd BEFORE os.NewFile takes ownership, and use
-	// unix.Poll + unix.Read for TUN reads (bypasses Go's epoll).
+	// On kernel 6.17+, Go's epoll-based netpoller does not properly signal
+	// TUN fd readability. Fix: call os.File.Fd() which forces the fd into
+	// blocking mode and deregisters it from Go's netpoller. Then use
+	// unix.Read directly for TUN reads. Writes still work via tunFile.Write.
 	if os.Getenv("WG_TUN_BLOCKING") == "1" {
-		// nfd was already given to os.NewFile above, but we can dup the
-		// original fd for raw reads. The dup'd fd shares the same TUN queue.
-		rawFd, err := unix.Open(cloneDevicePath, unix.O_RDWR, 0)
-		if err == nil {
-			rawIfr, err2 := unix.NewIfreq(name)
-			if err2 == nil {
-				// Use IFF_TUN | IFF_NO_PI only — no vnet_hdr for raw reads
-				rawIfr.SetUint16(unix.IFF_TUN | unix.IFF_NO_PI)
-				if err3 := unix.IoctlIfreq(rawFd, unix.TUNSETIFF, rawIfr); err3 == nil {
-					dev.(*NativeTun).rawReadFd = rawFd
-					dev.(*NativeTun).vnetHdr = false
-					dev.(*NativeTun).batchSize = 1
-				} else {
-					unix.Close(rawFd)
-				}
-			} else {
-				unix.Close(rawFd)
-			}
-		}
+		nativeTun := dev.(*NativeTun)
+		nativeTun.blockingReadFd = int(nativeTun.tunFile.Fd()) // forces blocking mode
+		nativeTun.vnetHdr = false
+		nativeTun.batchSize = 1
 	}
 
 	return dev, nil
