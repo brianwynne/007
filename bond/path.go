@@ -128,20 +128,22 @@ func (pt *pathTracker) RecordReceive(pathID int) {
 	// Reset burst counter on receive
 	ph.BurstLoss = 0
 
-	// Inter-arrival jitter — computed from deviation against actual average
-	// inter-arrival time, not a hardcoded constant. This avoids inflated
-	// jitter from mixed traffic (keepalives every 25s + data at 50pps).
+	// Inter-arrival jitter — only computed for packets arriving within
+	// 2 seconds of each other. Longer gaps are idle periods (between
+	// keepalives, probes, or traffic bursts) that would inflate jitter.
 	if !ph.lastArrival.IsZero() {
 		diff := now.Sub(ph.lastArrival)
-		if ph.avgInterval == 0 {
-			ph.avgInterval = diff
-		} else {
-			deviation := diff - ph.avgInterval
-			if deviation < 0 {
-				deviation = -deviation
+		if diff < 2*time.Second {
+			if ph.avgInterval == 0 {
+				ph.avgInterval = diff
+			} else {
+				deviation := diff - ph.avgInterval
+				if deviation < 0 {
+					deviation = -deviation
+				}
+				ph.jitter = ph.jitter + (deviation-ph.jitter)/16
+				ph.avgInterval = ph.avgInterval + (diff-ph.avgInterval)/16
 			}
-			ph.jitter = ph.jitter + (deviation-ph.jitter)/16
-			ph.avgInterval = ph.avgInterval + (diff-ph.avgInterval)/16
 		}
 	}
 	ph.lastArrival = now
