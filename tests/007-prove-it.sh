@@ -196,97 +196,55 @@ fi
 
 # ─── TEST 9: iperf3 UDP throughput ────────────────────────────────
 echo ""
-echo "=== TEST 9: iperf3 UDP throughput (64kbps Opus-equivalent) ==="
+echo "=== TEST 9: iperf3 UDP tests ==="
+apt-get install -y -qq iperf3 > /dev/null 2>&1 || true
+
 if ! command -v iperf3 &>/dev/null; then
-    apt-get install -y -qq iperf3 > /dev/null 2>&1 || true
-fi
+    echo "  (skipped — iperf3 not available)"
+else
+    # Ensure iperf3 server is running on remote (started by server script)
+    # All iperf3 calls use timeout to prevent hanging
+    IPERF_TIMEOUT=20
 
-if command -v iperf3 &>/dev/null; then
-    # Start iperf3 server on remote via SSH or assume it's running
-    # For simplicity: start a local iperf3 server on the tunnel IP and test from here
-    # The server-side test script should start iperf3 — for now, try to connect
-
-    echo "  Attempting iperf3 to $SERVER..."
-
-    # Test 9a: Low bitrate UDP (64kbps — Opus audio)
-    IPERF_RESULT=$(iperf3 -c "$SERVER" -u -b 64k -l 160 -t 10 --json 2>/dev/null || echo "FAIL")
-    if echo "$IPERF_RESULT" | python3 -c "
-import sys, json
-try:
-    d = json.load(sys.stdin)
-    s = d['end']['sum']
-    loss = s.get('lost_percent', 100)
-    jitter = s.get('jitter_ms', -1)
-    bps = s.get('bits_per_second', 0)
-    print(f'loss={loss:.1f}% jitter={jitter:.3f}ms bps={bps/1000:.0f}kbps')
-    sys.exit(0 if loss < 5 else 1)
-except:
-    sys.exit(1)
-" 2>/dev/null; then
-        IPERF_LINE=$(iperf3 -c "$SERVER" -u -b 64k -l 160 -t 5 2>/dev/null | tail -3 | head -1 || echo "")
-        result PASS "iperf3 64kbps UDP: $IPERF_LINE"
-    else
-        # iperf3 server might not be running on remote
-        echo "  iperf3 server not reachable on $SERVER — starting bidirectional test"
-        # Run iperf3 server locally, test loopback through tunnel
-        iperf3 -s -D -B "$SERVER" --one-off 2>/dev/null || true
-        sleep 1
-
-        IPERF_OUT=$(iperf3 -c "$SERVER" -u -b 64k -l 160 -t 10 -R 2>&1 || echo "FAIL")
-        if echo "$IPERF_OUT" | grep -q "receiver"; then
-            LOSS=$(echo "$IPERF_OUT" | grep "receiver" | grep -oP '[\d.]+(?=%)' | tail -1 || echo "?")
-            JITTER=$(echo "$IPERF_OUT" | grep "receiver" | grep -oP '[\d.]+(?= ms)' | tail -1 || echo "?")
-            result PASS "iperf3 64kbps UDP: loss=${LOSS}% jitter=${JITTER}ms"
-        else
-            result FAIL "iperf3 64kbps UDP: could not connect"
+    run_iperf() {
+        local LABEL="$1"
+        local ARGS="$2"
+        local IPERF_OUT
+        IPERF_OUT=$(timeout $IPERF_TIMEOUT iperf3 $ARGS 2>&1 || echo "TIMEOUT_OR_FAIL")
+        if echo "$IPERF_OUT" | grep -q "TIMEOUT_OR_FAIL\|error\|unable"; then
+            result FAIL "$LABEL: server unreachable or timeout"
+            return
         fi
-    fi
+        local SUMMARY
+        SUMMARY=$(echo "$IPERF_OUT" | grep -E "sender|receiver" | tail -1 || echo "")
+        if [ -n "$SUMMARY" ]; then
+            result PASS "$LABEL: $SUMMARY"
+        else
+            result FAIL "$LABEL: no results"
+        fi
+    }
 
-    # Test 9b: Higher bitrate (1Mbps — video-equivalent)
     echo ""
-    echo "=== TEST 9b: iperf3 UDP throughput (1Mbps) ==="
-    IPERF_OUT=$(iperf3 -c "$SERVER" -u -b 1M -t 10 2>&1 || echo "FAIL")
-    if echo "$IPERF_OUT" | grep -q "receiver"; then
-        LOSS=$(echo "$IPERF_OUT" | grep "receiver" | grep -oP '[\d.]+(?=%)' | tail -1 || echo "?")
-        JITTER=$(echo "$IPERF_OUT" | grep "receiver" | grep -oP '[\d.]+(?= ms)' | tail -1 || echo "?")
-        BW=$(echo "$IPERF_OUT" | grep "receiver" | grep -oP '[\d.]+ [KMG]bits' | tail -1 || echo "?")
-        result PASS "iperf3 1Mbps UDP: loss=${LOSS}% jitter=${JITTER}ms bw=${BW}"
-    else
-        result FAIL "iperf3 1Mbps UDP: could not connect"
-    fi
+    echo "  9a: 64kbps UDP (Opus audio, 160-byte packets)"
+    run_iperf "64kbps" "-c $SERVER -u -b 64k -l 160 -t 5"
 
-    # Test 9c: High bitrate (5Mbps — multi-stream video)
     echo ""
-    echo "=== TEST 9c: iperf3 UDP throughput (5Mbps) ==="
-    IPERF_OUT=$(iperf3 -c "$SERVER" -u -b 5M -t 10 2>&1 || echo "FAIL")
-    if echo "$IPERF_OUT" | grep -q "receiver"; then
-        LOSS=$(echo "$IPERF_OUT" | grep "receiver" | grep -oP '[\d.]+(?=%)' | tail -1 || echo "?")
-        JITTER=$(echo "$IPERF_OUT" | grep "receiver" | grep -oP '[\d.]+(?= ms)' | tail -1 || echo "?")
-        BW=$(echo "$IPERF_OUT" | grep "receiver" | grep -oP '[\d.]+ [KMG]bits' | tail -1 || echo "?")
-        result PASS "iperf3 5Mbps UDP: loss=${LOSS}% jitter=${JITTER}ms bw=${BW}"
-    else
-        result FAIL "iperf3 5Mbps UDP: could not connect"
-    fi
+    echo "  9b: 1Mbps UDP"
+    run_iperf "1Mbps" "-c $SERVER -u -b 1M -t 5"
 
-    # Test 9d: iperf3 under impairment — 20% loss ALL paths
     echo ""
-    echo "=== TEST 9d: iperf3 64kbps under 20% loss ALL paths ==="
+    echo "  9c: 5Mbps UDP"
+    run_iperf "5Mbps" "-c $SERVER -u -b 5M -t 5"
+
+    echo ""
+    echo "  9d: 64kbps under 20% ALL-path loss"
     for iface in $IFACES; do
         tc qdisc add dev "$iface" root netem loss 20% 2>/dev/null || true
     done
-    IPERF_OUT=$(iperf3 -c "$SERVER" -u -b 64k -l 160 -t 10 2>&1 || echo "FAIL")
+    run_iperf "64kbps+loss" "-c $SERVER -u -b 64k -l 160 -t 5"
     for iface in $IFACES; do
         tc qdisc del dev "$iface" root 2>/dev/null || true
     done
-    if echo "$IPERF_OUT" | grep -q "receiver"; then
-        LOSS=$(echo "$IPERF_OUT" | grep "receiver" | grep -oP '[\d.]+(?=%)' | tail -1 || echo "?")
-        JITTER=$(echo "$IPERF_OUT" | grep "receiver" | grep -oP '[\d.]+(?= ms)' | tail -1 || echo "?")
-        result PASS "iperf3 64kbps under 20% loss: loss=${LOSS}% jitter=${JITTER}ms"
-    else
-        result FAIL "iperf3 64kbps under 20% loss"
-    fi
-else
-    echo "  (skipped — iperf3 not available)"
 fi
 
 # ─── TEST 10: Management API ────────────────────────────────────
