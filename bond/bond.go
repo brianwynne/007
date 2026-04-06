@@ -464,12 +464,22 @@ func (m *Manager) ProcessInbound(peerID uint32, packet []byte, nonce uint64, pat
 		// --- JITTER BUFFER PATH ---
 		if ps.jitterBuf != nil {
 			// Insert data packet into jitter buffer (delivered by playout ticker)
+			// Skip control packets that were FEC-encoded (probes, echoes) —
+			// they're not valid IP and would cause TUN write errors.
 			if data != nil {
-				ps.jitterBuf.Insert(data.Data, data.DataSeq, sourceData)
+				if isControlPacket(data.Data) {
+					m.handleControl(ps, data.Data, pathID)
+				} else {
+					ps.jitterBuf.Insert(data.Data, data.DataSeq, sourceData)
+				}
 			}
 			// Insert recovered packets (FEC fills gaps within the buffer window)
 			for _, rec := range recovered {
-				ps.jitterBuf.Insert(rec.Data, rec.DataSeq, sourceFEC)
+				if isControlPacket(rec.Data) {
+					m.handleControl(ps, rec.Data, pathID)
+				} else {
+					ps.jitterBuf.Insert(rec.Data, rec.DataSeq, sourceFEC)
+				}
 			}
 			// Early NACKs from jitter buffer gap detection
 			if m.config.ARQEnabled {
