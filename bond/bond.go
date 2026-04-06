@@ -152,9 +152,14 @@ type Config struct {
 	PacketIntervalMs   int       // expected packet interval for jitter calc (ms)
 }
 
-// DefaultConfig returns the field preset — safest default.
+// DefaultConfig returns the field preset with jitter buffer disabled
+// until the TUN writer callback is wired in the device integration.
+// Use BOND_JITTER=1 env var to enable when deliverFunc is set.
 func DefaultConfig() Config {
-	return FieldPreset()
+	cfg := FieldPreset()
+	cfg.JitterEnabled = false
+	cfg.ReorderEnabled = true
+	return cfg
 }
 
 // BroadcastPreset returns configuration for live broadcast contribution.
