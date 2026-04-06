@@ -70,24 +70,35 @@ jobs:
           echo "" >> version.go
           echo "const Version = \"${VERSION}\"" >> version.go
 
-      - name: Build
+      - name: Build wireguard-go binary
         env:
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
           CGO_ENABLED: 0
         run: go build -ldflags="-s -w" -o 007-${{ matrix.suffix }} .
 
-      - name: Upload artifact
+      - name: Build proxy binary
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: 0
+        run: go build -ldflags="-s -w" -o 007-proxy-${{ matrix.suffix }} ./cmd/007-proxy/
+
+      - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
           name: 007-${{ matrix.suffix }}
-          path: 007-${{ matrix.suffix }}
+          path: |
+            007-${{ matrix.suffix }}
+            007-proxy-${{ matrix.suffix }}
 
       - name: Upload to release
         if: github.event_name == 'release'
         uses: softprops/action-gh-release@v2
         with:
-          files: 007-${{ matrix.suffix }}
+          files: |
+            007-${{ matrix.suffix }}
+            007-proxy-${{ matrix.suffix }}
 
   checksums:
     name: Generate checksums
