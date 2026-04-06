@@ -24,6 +24,7 @@ echo "[+] Installing dependencies..."
 apt-get update -qq && apt-get install -y -qq wireguard-tools golang-go git xxd netcat-openbsd > /dev/null 2>&1
 
 echo "[+] Building 007 from source..."
+cd /tmp
 rm -rf /opt/007
 mkdir -p /opt/007
 git clone --depth 1 https://github.com/brianwynne/007.git /opt/007/src
