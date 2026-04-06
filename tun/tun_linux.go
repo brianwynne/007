@@ -504,8 +504,9 @@ func (tun *NativeTun) Close() error {
 		} else if tun.events != nil {
 			close(tun.events)
 		}
-		// blockingReadFd is the SAME fd as tunFile (just forced to blocking),
-		// so tunFile.Close() handles it
+		if tun.blockingReadFd > 0 {
+			unix.Close(tun.blockingReadFd)
+		}
 		err2 = tun.tunFile.Close()
 	})
 	if err1 != nil {
@@ -584,6 +585,10 @@ func CreateTUN(name string, mtu int) (Device, error) {
 	if os.Getenv("WG_NO_VNET_HDR") == "1" {
 		tunFlags = uint16(unix.IFF_TUN | unix.IFF_NO_PI)
 	}
+	if os.Getenv("WG_TUN_BLOCKING") == "1" {
+		// Need IFF_MULTI_QUEUE so a second fd can attach for blocking reads
+		tunFlags = uint16(unix.IFF_TUN | unix.IFF_NO_PI | unix.IFF_MULTI_QUEUE)
+	}
 	ifr.SetUint16(tunFlags)
 	err = unix.IoctlIfreq(nfd, unix.TUNSETIFF, ifr)
 	if err != nil {
@@ -605,12 +610,30 @@ func CreateTUN(name string, mtu int) (Device, error) {
 	}
 
 	// On kernel 6.17+, Go's epoll-based netpoller does not properly signal
-	// TUN fd readability. Fix: call os.File.Fd() which forces the fd into
-	// blocking mode and deregisters it from Go's netpoller. Then use
-	// unix.Read directly for TUN reads. Writes still work via tunFile.Write.
+	// TUN fd readability. Fix: open a SECOND fd to the same TUN device
+	// using IFF_MULTI_QUEUE. Keep it in blocking mode for unix.Read.
+	// The first fd (via os.NewFile) handles writes; the second handles reads.
 	if os.Getenv("WG_TUN_BLOCKING") == "1" {
+		readFd, err := unix.Open(cloneDevicePath, unix.O_RDWR, 0)
+		if err != nil {
+			dev.Close()
+			return nil, fmt.Errorf("failed to open blocking TUN fd: %w", err)
+		}
+		readIfr, err := unix.NewIfreq(name)
+		if err != nil {
+			unix.Close(readFd)
+			dev.Close()
+			return nil, err
+		}
+		readIfr.SetUint16(unix.IFF_TUN | unix.IFF_NO_PI | unix.IFF_MULTI_QUEUE)
+		if err := unix.IoctlIfreq(readFd, unix.TUNSETIFF, readIfr); err != nil {
+			unix.Close(readFd)
+			dev.Close()
+			return nil, fmt.Errorf("failed to attach blocking TUN fd (IFF_MULTI_QUEUE): %w", err)
+		}
+		// readFd is BLOCKING (no SetNonblock call)
 		nativeTun := dev.(*NativeTun)
-		nativeTun.blockingReadFd = int(nativeTun.tunFile.Fd()) // forces blocking mode
+		nativeTun.blockingReadFd = readFd
 		nativeTun.vnetHdr = false
 		nativeTun.batchSize = 1
 	}
