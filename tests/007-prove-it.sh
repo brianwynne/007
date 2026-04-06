@@ -50,13 +50,13 @@ done
 
 ALL_HAVE_TRAFFIC=true
 for iface in $IFACES; do
-    COUNT=$(timeout 5 tcpdump -i "$iface" udp port 51820 -c 3 -n -q 2>&1 | grep -c "UDP" || echo 0)
+    COUNT=$(timeout 5 tcpdump -i "$iface" udp port 51820 -c 3 -n -q 2>&1 | grep -c "UDP" 2>/dev/null); COUNT=${COUNT:-0}
     if [ "$COUNT" -gt 0 ]; then
         result PASS "Interface $iface: $COUNT packets"
     else
         # Generate traffic and retry
         ping -c 5 -i 0.1 "$SERVER" > /dev/null 2>&1 &
-        COUNT=$(timeout 5 tcpdump -i "$iface" udp port 51820 -c 3 -n -q 2>&1 | grep -c "UDP" || echo 0)
+        COUNT=$(timeout 5 tcpdump -i "$iface" udp port 51820 -c 3 -n -q 2>&1 | grep -c "UDP" 2>/dev/null); COUNT=${COUNT:-0}
         wait 2>/dev/null
         if [ "$COUNT" -gt 0 ]; then
             result PASS "Interface $iface: $COUNT packets (after retry)"
@@ -71,7 +71,7 @@ done
 echo ""
 echo "=== TEST 3: Sustained throughput (100 pings) ==="
 ping -c 100 -i 0.05 "$SERVER" > /tmp/007-sustained.txt 2>&1 || true
-RX=$(grep -c "bytes from" /tmp/007-sustained.txt || echo 0)
+RX=$(grep -c "bytes from" /tmp/007-sustained.txt 2>/dev/null); RX=${RX:-0}
 LOSS=$(grep "packet loss" /tmp/007-sustained.txt | grep -oP '\d+(?=%)' || echo 100)
 if [ "$RX" -ge 95 ]; then
     result PASS "Sustained: $RX/100 received ($LOSS% loss)"
@@ -96,7 +96,7 @@ if [ -n "$SECOND_IFACE" ] && [ "$(echo $IFACES | wc -w)" -ge 2 ]; then
     ip link set "$SECOND_IFACE" up
     sleep 2
     wait $PING_PID 2>/dev/null || true
-    RX=$(grep -c "bytes from" /tmp/007-failover.txt || echo 0)
+    RX=$(grep -c "bytes from" /tmp/007-failover.txt 2>/dev/null); RX=${RX:-0}
     if [ "$RX" -ge 15 ]; then
         result PASS "Failover: $RX/20 pings during interface toggle"
     else
@@ -134,7 +134,7 @@ for iface in $IFACES; do
     tc qdisc del dev "$iface" root 2>/dev/null || true
 done
 
-RX=$(grep -c "bytes from" /tmp/007-loss.txt || echo 0)
+RX=$(grep -c "bytes from" /tmp/007-loss.txt 2>/dev/null); RX=${RX:-0}
 STATS_AFTER=$(curl -s --max-time 3 http://127.0.0.1:8007/api/stats 2>/dev/null)
 FEC_AFTER=$(echo "$STATS_AFTER" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('fec_recovered',0))" 2>/dev/null || echo 0)
 FEC_RECOVERED=$((FEC_AFTER - FEC_BEFORE))
@@ -158,7 +158,7 @@ tc qdisc add dev "$IFACE2" root netem delay 50ms 10ms 2>/dev/null || true
 ping -c 30 -i 0.05 "$SERVER" > /tmp/007-delay.txt 2>&1 || true
 tc qdisc del dev "$IFACE2" root 2>/dev/null || true
 
-RX=$(grep -c "bytes from" /tmp/007-delay.txt || echo 0)
+RX=$(grep -c "bytes from" /tmp/007-delay.txt 2>/dev/null); RX=${RX:-0}
 REORDER_AFTER=$(curl -s --max-time 3 http://127.0.0.1:8007/api/stats 2>/dev/null | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('reorder_reordered',0))" 2>/dev/null || echo 0)
 REORDERED=$((REORDER_AFTER - REORDER_BEFORE))
 
@@ -182,7 +182,7 @@ for iface in $IFACES; do
     tc qdisc del dev "$iface" root 2>/dev/null || true
 done
 
-RX=$(grep -c "bytes from" /tmp/007-combined.txt || echo 0)
+RX=$(grep -c "bytes from" /tmp/007-combined.txt 2>/dev/null); RX=${RX:-0}
 STATS_AFTER=$(curl -s --max-time 3 http://127.0.0.1:8007/api/stats 2>/dev/null)
 FEC_AFTER=$(echo "$STATS_AFTER" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('fec_recovered',0))" 2>/dev/null || echo 0)
 FEC_RECOVERED=$((FEC_AFTER - FEC_BEFORE))
