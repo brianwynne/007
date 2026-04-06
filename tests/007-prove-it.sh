@@ -255,9 +255,22 @@ except:
         result FAIL "iperf3 1Mbps UDP: could not connect"
     fi
 
-    # Test 9c: iperf3 under impairment — 20% loss ALL paths
+    # Test 9c: High bitrate (5Mbps — multi-stream video)
     echo ""
-    echo "=== TEST 9c: iperf3 64kbps under 20% loss ALL paths ==="
+    echo "=== TEST 9c: iperf3 UDP throughput (5Mbps) ==="
+    IPERF_OUT=$(iperf3 -c "$SERVER" -u -b 5M -t 10 2>&1 || echo "FAIL")
+    if echo "$IPERF_OUT" | grep -q "receiver"; then
+        LOSS=$(echo "$IPERF_OUT" | grep "receiver" | grep -oP '[\d.]+(?=%)' | tail -1 || echo "?")
+        JITTER=$(echo "$IPERF_OUT" | grep "receiver" | grep -oP '[\d.]+(?= ms)' | tail -1 || echo "?")
+        BW=$(echo "$IPERF_OUT" | grep "receiver" | grep -oP '[\d.]+ [KMG]bits' | tail -1 || echo "?")
+        result PASS "iperf3 5Mbps UDP: loss=${LOSS}% jitter=${JITTER}ms bw=${BW}"
+    else
+        result FAIL "iperf3 5Mbps UDP: could not connect"
+    fi
+
+    # Test 9d: iperf3 under impairment — 20% loss ALL paths
+    echo ""
+    echo "=== TEST 9d: iperf3 64kbps under 20% loss ALL paths ==="
     for iface in $IFACES; do
         tc qdisc add dev "$iface" root netem loss 20% 2>/dev/null || true
     done
