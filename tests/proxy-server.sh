@@ -41,13 +41,18 @@ ip link set wg0 up
 iptables -I INPUT -p udp --dport 51820 -j ACCEPT 2>/dev/null || true
 
 echo "[+] Starting 007 proxy..."
-# Proxy: listen on 51821 (from wg0), forward recovered to 51820 (wg0)
-# Listen on 51822 for remote proxy packets, learn remote address automatically
 iptables -I INPUT -p udp --dport 51822 -j ACCEPT 2>/dev/null || true
+
+# Detect server's primary interface for path binding
+SERVER_IFACE=$(ip -4 -o addr show scope global | awk '{print $2}' | head -1)
+SERVER_BIND_IP=$(ip -4 addr show "$SERVER_IFACE" | grep inet | awk '{print $2}' | cut -d/ -f1 | head -1)
+echo "[+] Binding proxy path to $SERVER_IFACE ($SERVER_BIND_IP)"
+
 ./007-proxy \
     --wg-listen 127.0.0.1:51821 \
     --wg-forward 127.0.0.1:51820 \
     --listen-port 51822 \
+    --path "$SERVER_IFACE=$SERVER_BIND_IP" \
     --api 127.0.0.1:8007 \
     > /tmp/007-proxy.log 2>&1 &
 sleep 1

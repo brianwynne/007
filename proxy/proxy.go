@@ -309,18 +309,31 @@ func (p *Proxy) inboundLoop(path *pathSocket) {
 			}
 		}
 
-		// Learn remote address from first inbound packet
+		// Learn remote address from first inbound packet (ignore loopback/self)
 		if srcAddr != nil {
-			p.remoteMu.RLock()
-			known := p.remote != nil
-			p.remoteMu.RUnlock()
-			if !known {
-				p.remoteMu.Lock()
-				if p.remote == nil {
-					p.remote = srcAddr
-					p.logger.Info("learned remote address", "addr", srcAddr.String(), "path", path.name)
+			srcIP := srcAddr.IP
+			isLocal := srcIP.IsLoopback()
+			if !isLocal {
+				// Check if source is one of our own path IPs
+				for _, pp := range p.paths {
+					if pp.localIP.IsValid() && srcIP.Equal(pp.localIP.AsSlice()) {
+						isLocal = true
+						break
+					}
 				}
-				p.remoteMu.Unlock()
+			}
+			if !isLocal {
+				p.remoteMu.RLock()
+				known := p.remote != nil
+				p.remoteMu.RUnlock()
+				if !known {
+					p.remoteMu.Lock()
+					if p.remote == nil {
+						p.remote = srcAddr
+						p.logger.Info("learned remote address", "addr", srcAddr.String(), "path", path.name)
+					}
+					p.remoteMu.Unlock()
+				}
 			}
 		}
 
