@@ -464,8 +464,19 @@ func (tun *NativeTun) Read(bufs [][]byte, sizes []int, offset int) (int, error) 
 		var n int
 		var err error
 		if tun.rawReadFd > 0 {
-			// Blocking raw syscall read — bypasses Go's epoll netpoller
+			// Use unix.Poll + unix.Read — bypasses Go's epoll netpoller
 			// which fails on TUN fds with kernel 6.17+
+			for {
+				fds := []unix.PollFd{{Fd: int32(tun.rawReadFd), Events: unix.POLLIN}}
+				_, err = unix.Poll(fds, -1)
+				if err == unix.EINTR {
+					continue
+				}
+				if err != nil {
+					return 0, err
+				}
+				break
+			}
 			n, err = unix.Read(tun.rawReadFd, readInto)
 			if n == 0 && err == nil {
 				err = os.ErrClosed
@@ -605,27 +616,28 @@ func CreateTUN(name string, mtu int) (Device, error) {
 	}
 
 	// On kernel 6.17+, Go's epoll-based netpoller may not signal TUN fd
-	// readability. Open a second BLOCKING fd for raw syscall reads.
+	// readability. Dup the fd BEFORE os.NewFile takes ownership, and use
+	// unix.Poll + unix.Read for TUN reads (bypasses Go's epoll).
 	if os.Getenv("WG_TUN_BLOCKING") == "1" {
+		// nfd was already given to os.NewFile above, but we can dup the
+		// original fd for raw reads. The dup'd fd shares the same TUN queue.
 		rawFd, err := unix.Open(cloneDevicePath, unix.O_RDWR, 0)
-		if err != nil {
-			dev.Close()
-			return nil, fmt.Errorf("failed to open raw TUN fd: %w", err)
+		if err == nil {
+			rawIfr, err2 := unix.NewIfreq(name)
+			if err2 == nil {
+				// Use IFF_TUN | IFF_NO_PI only — no vnet_hdr for raw reads
+				rawIfr.SetUint16(unix.IFF_TUN | unix.IFF_NO_PI)
+				if err3 := unix.IoctlIfreq(rawFd, unix.TUNSETIFF, rawIfr); err3 == nil {
+					dev.(*NativeTun).rawReadFd = rawFd
+					dev.(*NativeTun).vnetHdr = false
+					dev.(*NativeTun).batchSize = 1
+				} else {
+					unix.Close(rawFd)
+				}
+			} else {
+				unix.Close(rawFd)
+			}
 		}
-		rawIfr, err := unix.NewIfreq(name)
-		if err != nil {
-			unix.Close(rawFd)
-			dev.Close()
-			return nil, err
-		}
-		rawIfr.SetUint16(tunFlags)
-		if err := unix.IoctlIfreq(rawFd, unix.TUNSETIFF, rawIfr); err != nil {
-			unix.Close(rawFd)
-			dev.Close()
-			return nil, fmt.Errorf("failed to attach raw TUN fd: %w", err)
-		}
-		// Keep rawFd BLOCKING — no SetNonblock
-		dev.(*NativeTun).rawReadFd = rawFd
 	}
 
 	return dev, nil
