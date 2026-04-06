@@ -232,7 +232,7 @@ func (pt *pathTracker) GetAll() []PathHealthSnapshot {
 			State:     ph.State,
 			RTT:       ph.RTT,
 			RTTVar:    ph.RTTVar,
-			Jitter:    ph.jitter,
+			Jitter:    ph.RTTVar, // RTTVar is the standard jitter metric (RFC 3550 style)
 			Loss:      ph.Loss,
 			BurstLoss: ph.BurstLoss,
 			MaxBurst:  ph.MaxBurst,
