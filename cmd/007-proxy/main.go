@@ -20,28 +20,23 @@ import (
 
 func main() {
 	var (
-		wgListen  = flag.String("wg-listen", "127.0.0.1:51821", "Listen for packets from kernel wg0")
-		wgForward = flag.String("wg-forward", "127.0.0.1:51820", "Forward recovered packets to wg0")
-		remote    = flag.String("remote", "", "Remote 007 proxy address (required)")
-		pathFlags pathList
-		apiAddr   = flag.String("api", "127.0.0.1:8007", "Management API listen address")
-		apiKey    = flag.String("api-key", "", "API key (optional)")
-		version   = flag.Bool("version", false, "Print version and exit")
+		wgListen   = flag.String("wg-listen", "127.0.0.1:51821", "Listen for packets from kernel wg0")
+		wgForward  = flag.String("wg-forward", "127.0.0.1:51820", "Forward recovered packets to wg0")
+		listenPort = flag.Int("listen-port", 51822, "Network port to listen for remote proxy packets")
+		remote     = flag.String("remote", "", "Remote 007 proxy address (optional — learned from first inbound)")
+		pathFlags  pathList
+		apiAddr    = flag.String("api", "127.0.0.1:8007", "Management API listen address")
+		apiKey     = flag.String("api-key", "", "API key (optional)")
+		version    = flag.Bool("version", false, "Print version and exit")
 	)
 	flag.Var(&pathFlags, "path", "Network path as name=localip (repeatable, e.g., -path eth0=192.168.1.100)")
 	flag.Parse()
 
 	if *version {
-		fmt.Println("007 Bond Proxy v0.1.0")
+		fmt.Println("007 Bond Proxy v0.2.0")
 		fmt.Println("Multi-path bonding proxy for kernel WireGuard")
 		fmt.Println("https://github.com/brianwynne/007")
 		return
-	}
-
-	if *remote == "" {
-		fmt.Fprintln(os.Stderr, "Error: -remote is required")
-		flag.Usage()
-		os.Exit(1)
 	}
 
 	logger := bond.NewStdLogger(log.New(os.Stderr, "[007] ", log.LstdFlags))
@@ -72,6 +67,7 @@ func main() {
 	cfg := proxy.Config{
 		WGListenAddr:  *wgListen,
 		WGForwardAddr: *wgForward,
+		ListenPort:    *listenPort,
 		RemoteAddr:    *remote,
 		Paths:         paths,
 		BondConfig:    bondCfg,

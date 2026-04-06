@@ -42,12 +42,13 @@ ip link set wg0 up
 iptables -I INPUT -p udp --dport 51820 -j ACCEPT 2>/dev/null || true
 
 echo "[+] Starting 007 proxy..."
-# Proxy: listen on 51821 (from wg0), forward to 51820 (wg0's listen port)
-# Remote will be configured by the client connecting
+# Proxy: listen on 51821 (from wg0), forward recovered to 51820 (wg0)
+# Listen on 51822 for remote proxy packets, learn remote address automatically
+iptables -I INPUT -p udp --dport 51822 -j ACCEPT 2>/dev/null || true
 ./007-proxy \
     --wg-listen 127.0.0.1:51821 \
     --wg-forward 127.0.0.1:51820 \
-    --remote 0.0.0.0:51822 \
+    --listen-port 51822 \
     --api 127.0.0.1:8007 \
     > /tmp/007-proxy.log 2>&1 &
 sleep 1

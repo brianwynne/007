@@ -62,17 +62,11 @@ for iface in $(ip -4 -o addr show scope global | awk '{print $2}' | sort -u); do
 done
 
 echo "[+] Starting 007 proxy..."
-# Proxy: listen on 51821 (from wg0), forward to 51820 (local wg0 doesn't listen here — use wg0's actual port)
-# Actually: wg0 sends to 127.0.0.1:51821 (proxy). Proxy sends to remote server:51822.
-# Remote proxy forwards to remote wg0:51820.
-# Return: remote proxy sends from remote:51822. Our proxy receives, forwards to wg0 via 127.0.0.1 spoofing.
-
-# For the simple case: proxy listens for wg0 outbound on 51821, forwards inbound to wg0's UDP port
 WG_PORT=$(wg show wg0 listen-port)
-
 ./007-proxy \
     --wg-listen "127.0.0.1:51821" \
     --wg-forward "127.0.0.1:$WG_PORT" \
+    --listen-port 51822 \
     --remote "$SERVER_IP:51822" \
     $PATHS \
     --api 127.0.0.1:8007 \

@@ -32,21 +32,22 @@ import (
 // Config holds proxy configuration.
 type Config struct {
 	// WireGuard-facing (loopback)
-	WGListenAddr string // address to listen for packets from kernel wg0 (e.g., "127.0.0.1:51821")
+	WGListenAddr  string // address to listen for packets from kernel wg0 (e.g., "127.0.0.1:51821")
 	WGForwardAddr string // address to forward recovered packets to wg0 (e.g., "127.0.0.1:51820")
+
+	// Network-facing
+	ListenPort int    // port to listen on all paths for remote proxy packets (e.g., 51822)
+	RemoteAddr string // remote 007 proxy address (optional — learned from first inbound if empty)
 
 	// Network paths
 	Paths []PathConfig // one per physical interface
-
-	// Remote proxy
-	RemoteAddr string // remote 007 proxy address (e.g., "203.0.113.50:51821")
 
 	// Bond
 	BondConfig bond.Config
 
 	// API
-	APIAddr   string
-	APIKey    string
+	APIAddr string
+	APIKey  string
 
 	// Logger
 	Logger bond.Logger
@@ -70,8 +71,9 @@ type Proxy struct {
 	wgSrc  *net.UDPAddr   // our loopback address (so wg0 sees correct source)
 
 	// Network-facing (multi-path)
-	paths  []*pathSocket
-	remote *net.UDPAddr // remote 007 proxy endpoint
+	paths      []*pathSocket
+	remote     *net.UDPAddr  // remote 007 proxy endpoint (may be nil until learned)
+	remoteMu   sync.RWMutex // guards remote
 
 	// Lifecycle
 	mu       sync.Mutex
@@ -83,11 +85,10 @@ type Proxy struct {
 }
 
 type pathSocket struct {
-	id       int
-	name     string
-	conn     *net.UDPConn
-	localIP  netip.Addr
-	remote   *net.UDPAddr
+	id      int
+	name    string
+	conn    *net.UDPConn
+	localIP netip.Addr
 }
 
 // New creates a new proxy.
@@ -107,9 +108,12 @@ func New(cfg Config) (*Proxy, error) {
 		return nil, fmt.Errorf("invalid wg-forward address: %w", err)
 	}
 
-	remoteAddr, err := net.ResolveUDPAddr("udp", cfg.RemoteAddr)
-	if err != nil {
-		return nil, fmt.Errorf("invalid remote address: %w", err)
+	var remoteAddr *net.UDPAddr
+	if cfg.RemoteAddr != "" {
+		remoteAddr, err = net.ResolveUDPAddr("udp", cfg.RemoteAddr)
+		if err != nil {
+			return nil, fmt.Errorf("invalid remote address: %w", err)
+		}
 	}
 
 	// Create bond manager
@@ -150,7 +154,7 @@ func New(cfg Config) (*Proxy, error) {
 			network = "udp6"
 		}
 
-		localAddr := &net.UDPAddr{IP: localIP.AsSlice(), Port: 0}
+		localAddr := &net.UDPAddr{IP: localIP.AsSlice(), Port: cfg.ListenPort}
 		conn, err := net.ListenUDP(network, localAddr)
 		if err != nil {
 			p.Close()
@@ -162,22 +166,20 @@ func New(cfg Config) (*Proxy, error) {
 			name:    pc.Name,
 			conn:    conn,
 			localIP: localIP,
-			remote:  remoteAddr,
 		})
 	}
 
 	// If no paths configured, create a default unbound socket
 	if len(p.paths) == 0 {
-		conn, err := net.ListenUDP("udp", &net.UDPAddr{Port: 0})
+		conn, err := net.ListenUDP("udp", &net.UDPAddr{Port: cfg.ListenPort})
 		if err != nil {
 			p.Close()
 			return nil, fmt.Errorf("failed to create default path: %w", err)
 		}
 		p.paths = append(p.paths, &pathSocket{
-			id:     0,
-			name:   "default",
-			conn:   conn,
-			remote: remoteAddr,
+			id:   0,
+			name: "default",
+			conn: conn,
 		})
 	}
 
@@ -295,7 +297,7 @@ func (p *Proxy) inboundLoop(path *pathSocket) {
 
 	buf := make([]byte, 65536)
 	for {
-		n, _, err := path.conn.ReadFromUDP(buf)
+		n, srcAddr, err := path.conn.ReadFromUDP(buf)
 		if err != nil {
 			select {
 			case <-p.stopCh:
@@ -304,6 +306,21 @@ func (p *Proxy) inboundLoop(path *pathSocket) {
 				p.logger.Error("path read error", "path", path.name, "err", err)
 				time.Sleep(time.Millisecond)
 				continue
+			}
+		}
+
+		// Learn remote address from first inbound packet
+		if srcAddr != nil {
+			p.remoteMu.RLock()
+			known := p.remote != nil
+			p.remoteMu.RUnlock()
+			if !known {
+				p.remoteMu.Lock()
+				if p.remote == nil {
+					p.remote = srcAddr
+					p.logger.Info("learned remote address", "addr", srcAddr.String(), "path", path.name)
+				}
+				p.remoteMu.Unlock()
 			}
 		}
 
@@ -326,7 +343,13 @@ func (p *Proxy) inboundLoop(path *pathSocket) {
 
 // sendAllPaths sends a packet on all configured network paths.
 func (p *Proxy) sendAllPaths(pkt []byte) {
+	p.remoteMu.RLock()
+	dst := p.remote
+	p.remoteMu.RUnlock()
+	if dst == nil {
+		return // don't know where to send yet
+	}
 	for _, path := range p.paths {
-		path.conn.WriteToUDP(pkt, path.remote)
+		path.conn.WriteToUDP(pkt, dst)
 	}
 }
