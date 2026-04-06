@@ -357,7 +357,13 @@ func (tun *NativeTun) Write(bufs [][]byte, offset int) (int, error) {
 		}
 	}
 	for _, bufsI := range tun.toWrite {
-		n, err := tun.tunFile.Write(bufs[bufsI][offset:])
+		var n int
+		var err error
+		if tun.blockingReadFd > 0 {
+			n, err = unix.Write(tun.blockingReadFd, bufs[bufsI][offset:])
+		} else {
+			n, err = tun.tunFile.Write(bufs[bufsI][offset:])
+		}
 		if errors.Is(err, syscall.EBADFD) {
 			return total, os.ErrClosed
 		}
@@ -585,14 +591,43 @@ func CreateTUN(name string, mtu int) (Device, error) {
 	if os.Getenv("WG_NO_VNET_HDR") == "1" {
 		tunFlags = uint16(unix.IFF_TUN | unix.IFF_NO_PI)
 	}
-	if os.Getenv("WG_TUN_BLOCKING") == "1" {
-		// Need IFF_MULTI_QUEUE so a second fd can attach for blocking reads
-		tunFlags = uint16(unix.IFF_TUN | unix.IFF_NO_PI | unix.IFF_MULTI_QUEUE)
-	}
 	ifr.SetUint16(tunFlags)
 	err = unix.IoctlIfreq(nfd, unix.TUNSETIFF, ifr)
 	if err != nil {
 		return nil, err
+	}
+
+	// On kernel 6.17+, Go's epoll netpoller does not properly signal TUN
+	// fd readability. When WG_TUN_BLOCKING=1, skip os.NewFile entirely
+	// and use the raw fd with blocking unix.Read/unix.Write. No Go
+	// netpoller involvement at all.
+	if os.Getenv("WG_TUN_BLOCKING") == "1" {
+		// fd stays BLOCKING (no SetNonblock)
+		tun := &NativeTun{
+			tunFile:                 os.NewFile(uintptr(nfd), cloneDevicePath),
+			blockingReadFd:          nfd,
+			events:                  make(chan Event, 5),
+			errors:                  make(chan error, 5),
+			statusListenersShutdown: make(chan struct{}),
+			batchSize:               1,
+			vnetHdr:                 false,
+		}
+		// DON'T register with Go's netpoller — just use the fd directly
+		// DON'T start routineHackListener (requires vnetHdr)
+		// Start netlink listener for MTU/interface events
+		tun.nameOnce.Do(func() {
+			tun.nameCache = name
+		})
+		var mtuVal int
+		mtuVal, err = tun.MTU()
+		if err != nil {
+			unix.Close(nfd)
+			return nil, err
+		}
+		if mtu > 0 && mtu < mtuVal {
+			tun.setMTU(mtu)
+		}
+		return tun, nil
 	}
 
 	err = unix.SetNonblock(nfd, true)
@@ -607,35 +642,6 @@ func CreateTUN(name string, mtu int) (Device, error) {
 	dev, err := CreateTUNFromFile(fd, mtu)
 	if err != nil {
 		return nil, err
-	}
-
-	// On kernel 6.17+, Go's epoll-based netpoller does not properly signal
-	// TUN fd readability. Fix: open a SECOND fd to the same TUN device
-	// using IFF_MULTI_QUEUE. Keep it in blocking mode for unix.Read.
-	// The first fd (via os.NewFile) handles writes; the second handles reads.
-	if os.Getenv("WG_TUN_BLOCKING") == "1" {
-		readFd, err := unix.Open(cloneDevicePath, unix.O_RDWR, 0)
-		if err != nil {
-			dev.Close()
-			return nil, fmt.Errorf("failed to open blocking TUN fd: %w", err)
-		}
-		readIfr, err := unix.NewIfreq(name)
-		if err != nil {
-			unix.Close(readFd)
-			dev.Close()
-			return nil, err
-		}
-		readIfr.SetUint16(unix.IFF_TUN | unix.IFF_NO_PI | unix.IFF_MULTI_QUEUE)
-		if err := unix.IoctlIfreq(readFd, unix.TUNSETIFF, readIfr); err != nil {
-			unix.Close(readFd)
-			dev.Close()
-			return nil, fmt.Errorf("failed to attach blocking TUN fd (IFF_MULTI_QUEUE): %w", err)
-		}
-		// readFd is BLOCKING (no SetNonblock call)
-		nativeTun := dev.(*NativeTun)
-		nativeTun.blockingReadFd = readFd
-		nativeTun.vnetHdr = false
-		nativeTun.batchSize = 1
 	}
 
 	return dev, nil
