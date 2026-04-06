@@ -204,6 +204,24 @@ func (jb *JitterBuffer) playoutOne() {
 		return
 	}
 
+	// Only advance if there are packets in the buffer ahead of baseSeq.
+	// Don't advance through empty slots during idle periods — this would
+	// make the next real packet arrive "late" (dataSeq < baseSeq).
+	hasData := false
+	for offset := uint64(0); offset < uint64(jb.bufSize); offset++ {
+		checkSeq := jb.baseSeq + offset
+		idx := checkSeq % maxJitterSlots
+		if jb.slots[idx].filled && jb.slots[idx].dataSeq == checkSeq {
+			hasData = true
+			break
+		}
+	}
+	if !hasData {
+		// No data in buffer — don't advance, just update next playout time
+		jb.nextPlayout = now.Add(jb.packetInterval)
+		return
+	}
+
 	// Deliver all packets whose playout time has passed
 	for !now.Before(jb.nextPlayout) {
 		idx := jb.baseSeq % maxJitterSlots
@@ -219,12 +237,17 @@ func (jb *JitterBuffer) playoutOne() {
 			slot.filled = false
 			slot.source = sourceNone
 		} else {
-			// Genuine loss
+			// Genuine loss — only count if we have later packets waiting
 			jb.missCount++
 		}
 
 		jb.baseSeq++
 		jb.nextPlayout = jb.nextPlayout.Add(jb.packetInterval)
+
+		// Stop if we've caught up to writeHead (no more data)
+		if jb.baseSeq >= jb.writeHead {
+			break
+		}
 	}
 }
 
