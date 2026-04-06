@@ -563,7 +563,12 @@ func CreateTUN(name string, mtu int) (Device, error) {
 	}
 	// IFF_VNET_HDR enables the "tun status hack" via routineHackListener()
 	// where a null write will return EINVAL indicating the TUN is up.
-	ifr.SetUint16(unix.IFF_TUN | unix.IFF_NO_PI | unix.IFF_VNET_HDR)
+	// Set WG_NO_VNET_HDR=1 to disable if TUN data doesn't flow on your kernel.
+	tunFlags := uint16(unix.IFF_TUN | unix.IFF_NO_PI | unix.IFF_VNET_HDR)
+	if os.Getenv("WG_NO_VNET_HDR") == "1" {
+		tunFlags = uint16(unix.IFF_TUN | unix.IFF_NO_PI)
+	}
+	ifr.SetUint16(tunFlags)
 	err = unix.IoctlIfreq(nfd, unix.TUNSETIFF, ifr)
 	if err != nil {
 		return nil, err
