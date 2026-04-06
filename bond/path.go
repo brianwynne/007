@@ -83,10 +83,11 @@ type PathHealth struct {
 	TxProbes  uint64        // probes sent on this path
 	RxProbes  uint64        // probe echoes received
 
-	// Inter-arrival jitter (RFC 3550 style)
-	lastArrival    time.Time
-	jitter         time.Duration
-	packetInterval time.Duration // configurable expected interval
+	// Inter-arrival jitter — computed from actual inter-arrival variance,
+	// not a hardcoded expected interval
+	lastArrival time.Time
+	jitter      time.Duration
+	avgInterval time.Duration // exponential moving average of actual inter-arrival
 
 	// Loss tracking — sliding window of received/missed
 	lossWindow []bool // true = received, false = gap
@@ -127,18 +128,21 @@ func (pt *pathTracker) RecordReceive(pathID int) {
 	// Reset burst counter on receive
 	ph.BurstLoss = 0
 
-	// Inter-arrival jitter (RFC 3550)
+	// Inter-arrival jitter — computed from deviation against actual average
+	// inter-arrival time, not a hardcoded constant. This avoids inflated
+	// jitter from mixed traffic (keepalives every 25s + data at 50pps).
 	if !ph.lastArrival.IsZero() {
 		diff := now.Sub(ph.lastArrival)
-		expected := ph.packetInterval
-		if expected == 0 {
-			expected = 20 * time.Millisecond
+		if ph.avgInterval == 0 {
+			ph.avgInterval = diff
+		} else {
+			deviation := diff - ph.avgInterval
+			if deviation < 0 {
+				deviation = -deviation
+			}
+			ph.jitter = ph.jitter + (deviation-ph.jitter)/16
+			ph.avgInterval = ph.avgInterval + (diff-ph.avgInterval)/16
 		}
-		deviation := diff - expected
-		if deviation < 0 {
-			deviation = -deviation
-		}
-		ph.jitter = ph.jitter + (deviation-ph.jitter)/16
 	}
 	ph.lastArrival = now
 
@@ -258,7 +262,7 @@ func (ph *PathHealth) updateState() {
 	case ph.Loss > 0.10 || ph.BurstLoss > 10:
 		ph.State = PathUnstable
 		ph.stableCount = 0
-	case ph.Loss > 0.02 || ph.jitter > 50*time.Millisecond:
+	case ph.Loss > 0.02:
 		ph.State = PathDegraded
 		ph.stableCount = 0
 	default:
