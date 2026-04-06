@@ -29,6 +29,7 @@ const (
 
 type NativeTun struct {
 	tunFile                 *os.File
+	rawReadFd               int  // raw blocking fd for TUN reads (kernel 6.17+ workaround)
 	index                   int32      // if index
 	errors                  chan error // async error handling
 	events                  chan Event // device related events
@@ -459,7 +460,19 @@ func (tun *NativeTun) Read(bufs [][]byte, sizes []int, offset int) (int, error) 
 		if tun.vnetHdr {
 			readInto = tun.readBuff[:]
 		}
-		n, err := tun.tunFile.Read(readInto)
+
+		var n int
+		var err error
+		if tun.rawReadFd > 0 {
+			// Blocking raw syscall read — bypasses Go's epoll netpoller
+			// which fails on TUN fds with kernel 6.17+
+			n, err = unix.Read(tun.rawReadFd, readInto)
+			if n == 0 && err == nil {
+				err = os.ErrClosed
+			}
+		} else {
+			n, err = tun.tunFile.Read(readInto)
+		}
 		if errors.Is(err, syscall.EBADFD) {
 			err = os.ErrClosed
 		}
@@ -489,6 +502,9 @@ func (tun *NativeTun) Close() error {
 			}
 		} else if tun.events != nil {
 			close(tun.events)
+		}
+		if tun.rawReadFd > 0 {
+			unix.Close(tun.rawReadFd)
 		}
 		err2 = tun.tunFile.Close()
 	})
@@ -574,20 +590,45 @@ func CreateTUN(name string, mtu int) (Device, error) {
 		return nil, err
 	}
 
-	// On kernel 6.17+, Go's epoll-based netpoller may not properly signal
-	// TUN fd readability. WG_TUN_BLOCKING=1 uses blocking reads as a workaround.
-	if os.Getenv("WG_TUN_BLOCKING") != "1" {
-		err = unix.SetNonblock(nfd, true)
-		if err != nil {
-			unix.Close(nfd)
-			return nil, err
-		}
+	err = unix.SetNonblock(nfd, true)
+	if err != nil {
+		unix.Close(nfd)
+		return nil, err
 	}
 
 	// Note that the above -- open,ioctl,nonblock -- must happen prior to handing it to netpoll as below this line.
 
 	fd := os.NewFile(uintptr(nfd), cloneDevicePath)
-	return CreateTUNFromFile(fd, mtu)
+	dev, err := CreateTUNFromFile(fd, mtu)
+	if err != nil {
+		return nil, err
+	}
+
+	// On kernel 6.17+, Go's epoll-based netpoller may not signal TUN fd
+	// readability. Open a second BLOCKING fd for raw syscall reads.
+	if os.Getenv("WG_TUN_BLOCKING") == "1" {
+		rawFd, err := unix.Open(cloneDevicePath, unix.O_RDWR, 0)
+		if err != nil {
+			dev.Close()
+			return nil, fmt.Errorf("failed to open raw TUN fd: %w", err)
+		}
+		rawIfr, err := unix.NewIfreq(name)
+		if err != nil {
+			unix.Close(rawFd)
+			dev.Close()
+			return nil, err
+		}
+		rawIfr.SetUint16(tunFlags)
+		if err := unix.IoctlIfreq(rawFd, unix.TUNSETIFF, rawIfr); err != nil {
+			unix.Close(rawFd)
+			dev.Close()
+			return nil, fmt.Errorf("failed to attach raw TUN fd: %w", err)
+		}
+		// Keep rawFd BLOCKING — no SetNonblock
+		dev.(*NativeTun).rawReadFd = rawFd
+	}
+
+	return dev, nil
 }
 
 // CreateTUNFromFile creates a Device from an os.File with the provided MTU.
