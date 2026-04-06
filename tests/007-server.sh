@@ -1,27 +1,21 @@
 #!/usr/bin/env bash
-# 007 Bond — Server Setup (original wireguard-go, single binary)
-# Usage: curl -fsSL https://raw.githubusercontent.com/brianwynne/007/main/tests/007-server.sh | sudo bash
+# 007 Bond — Server Setup
+# Usage: sudo bash 007-server.sh
 set -euo pipefail
 
-echo "[+] Killing ALL old instances..."
-pkill -9 -x '007' 2>/dev/null || true
-pkill -9 -x '007-proxy' 2>/dev/null || true
-sleep 2
-rm -f /var/run/wireguard/*.sock
-ip link del bond0 2>/dev/null || true
-for iface in $(wg show interfaces 2>/dev/null); do ip link del "$iface" 2>/dev/null || true; done
-# Kill anything on our ports
-fuser -k 8007/tcp 2>/dev/null || true
-fuser -k 51820/udp 2>/dev/null || true
-
-echo "[+] Installing dependencies..."
-fuser -k /var/lib/dpkg/lock-frontend 2>/dev/null || true
-fuser -k /var/lib/apt/lists/lock 2>/dev/null || true
+echo "[+] Cleaning up..."
+for pid in $(pgrep -x 007 2>/dev/null) $(pgrep -x 007-proxy 2>/dev/null); do
+    kill -9 "$pid" 2>/dev/null || true
+done
 sleep 1
-rm -f /var/lib/dpkg/lock-frontend /var/lib/apt/lists/lock /var/cache/apt/archives/lock
-dpkg --configure -a 2>/dev/null || true
-apt-get update -qq 2>/dev/null
-apt-get install -y -qq wireguard-tools golang-go git iperf3 2>/dev/null || true
+rm -f /var/run/wireguard/*.sock
+for iface in $(wg show interfaces 2>/dev/null); do ip link del "$iface" 2>/dev/null || true; done
+ip link del bond0 2>/dev/null || true
+
+echo "[+] Checking dependencies..."
+for pkg in wireguard-tools golang-go git iperf3; do
+    dpkg -s "$pkg" > /dev/null 2>&1 || DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "$pkg" 2>/dev/null || true
+done
 
 echo "[+] Building 007 from source..."
 cd /tmp
@@ -37,7 +31,7 @@ wg genkey | tee server.key | wg pubkey > server.pub
 wg genkey | tee client.key | wg pubkey > client.pub
 
 echo "[+] Starting 007..."
-nohup env WG_TUN_BLOCKING=1 /opt/007/007 -f bond0 > /tmp/007.log 2>&1 &
+nohup /opt/007/007 -f bond0 > /tmp/007.log 2>&1 &
 echo $! > /tmp/007.pid
 sleep 3
 
@@ -54,21 +48,20 @@ ip addr add 10.7.0.1/24 dev bond0 2>/dev/null || true
 ip link set bond0 up
 iptables -I INPUT -p udp --dport 51820 -j ACCEPT 2>/dev/null || true
 
-# Start iperf3 server on tunnel IP for client tests
-pkill -f 'iperf3.*10.7.0.1' 2>/dev/null || true
+# Start iperf3 server on tunnel IP
+pkill -x iperf3 2>/dev/null || true
 iperf3 -s -B 10.7.0.1 -D 2>/dev/null || true
-echo "[+] iperf3 server listening on 10.7.0.1:5201"
+echo "[+] iperf3 server on 10.7.0.1:5201"
 
 SERVER_IP=$(hostname -I | awk '{print $1}')
 
 echo ""
 echo "========================================================"
 echo "  007 SERVER RUNNING on $SERVER_IP:51820"
-echo "  Kernel: $(uname -r)"
 echo ""
 echo "  Run on CLIENT:"
 echo ""
-echo "  curl -fsSL https://raw.githubusercontent.com/brianwynne/007/main/tests/007-client.sh | sudo bash -s -- $SERVER_IP $(cat server.pub) $(cat client.key)"
+echo "  curl -fsSL https://raw.githubusercontent.com/brianwynne/007/main/tests/007-client.sh -o /tmp/007-client.sh && sudo bash /tmp/007-client.sh $SERVER_IP $(cat server.pub) $(cat client.key)"
 echo "========================================================"
 echo ""
 wg show bond0

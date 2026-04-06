@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# 007 Bond — Client Setup + Test (original wireguard-go, single binary)
-# Usage: curl -fsSL https://raw.githubusercontent.com/brianwynne/007/main/tests/007-client.sh | sudo bash -s -- <server_ip> <server_pub> <client_key>
+# 007 Bond — Client Setup + Test
+# Usage: sudo bash 007-client.sh <server_ip> <server_pub> <client_key>
 set -euo pipefail
 
 if [ $# -lt 3 ]; then
@@ -12,24 +12,19 @@ SERVER_IP="$1"
 SERVER_PUB="$2"
 CLIENT_KEY="$3"
 
-echo "[+] Killing ALL old instances..."
-pkill -9 -x '007' 2>/dev/null || true
-pkill -9 -x '007-proxy' 2>/dev/null || true
-sleep 2
+echo "[+] Cleaning up..."
+for pid in $(pgrep -x 007 2>/dev/null) $(pgrep -x 007-proxy 2>/dev/null); do
+    kill -9 "$pid" 2>/dev/null || true
+done
+sleep 1
 rm -f /var/run/wireguard/*.sock
 ip link del bond0 2>/dev/null || true
 for iface in $(wg show interfaces 2>/dev/null); do ip link del "$iface" 2>/dev/null || true; done
-fuser -k 8007/tcp 2>/dev/null || true
 
-echo "[+] Installing dependencies..."
-# Kill any stuck apt/dpkg processes
-fuser -k /var/lib/dpkg/lock-frontend 2>/dev/null || true
-fuser -k /var/lib/apt/lists/lock 2>/dev/null || true
-sleep 1
-rm -f /var/lib/dpkg/lock-frontend /var/lib/apt/lists/lock /var/cache/apt/archives/lock
-dpkg --configure -a 2>/dev/null || true
-apt-get update -qq 2>/dev/null
-apt-get install -y -qq wireguard-tools golang-go git xxd netcat-openbsd iperf3 2>/dev/null || true
+echo "[+] Checking dependencies..."
+for pkg in wireguard-tools golang-go git iperf3; do
+    dpkg -s "$pkg" > /dev/null 2>&1 || DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "$pkg" 2>/dev/null || true
+done
 
 echo "[+] Building 007 from source..."
 cd /tmp
@@ -44,7 +39,7 @@ echo "$CLIENT_KEY" > client.key
 echo "$SERVER_PUB" > server.pub
 
 echo "[+] Starting 007..."
-nohup env WG_TUN_BLOCKING=1 /opt/007/007 -f bond0 > /tmp/007.log 2>&1 &
+nohup /opt/007/007 -f bond0 > /tmp/007.log 2>&1 &
 echo $! > /tmp/007.pid
 sleep 3
 
