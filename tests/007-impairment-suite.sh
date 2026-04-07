@@ -21,7 +21,8 @@ set -uo pipefail
 
 # ─── Configuration ─────────────────────────────────────────────────────────
 SERVER="${1:-10.7.0.1}"
-API="http://127.0.0.1:8007"
+API="http://127.0.0.1:8007"          # Client stats (local)
+SERVER_API="http://${SERVER}:8007"    # Server stats (via tunnel — server must use BOND_API=0.0.0.0:8007)
 IFACE1="ens5"
 IFACE2="ens6"
 ALL_IFACES="$IFACE1 $IFACE2"
@@ -74,6 +75,10 @@ trap cleanup_all EXIT INT TERM
 
 get_stats() {
     curl -s --max-time 3 "$API/api/stats" 2>/dev/null || echo "{}"
+}
+
+get_server_stats() {
+    curl -s --max-time 3 "$SERVER_API/api/stats" 2>/dev/null || echo "{}"
 }
 
 extract_stat() {
@@ -235,9 +240,19 @@ if ! ping -c 2 -W 3 "$SERVER" > /dev/null 2>&1; then
 fi
 echo -e "${GREEN}Preflight: tunnel reachable${RESET}"
 
-# Check API
+# Check client API
 if ! curl -s --max-time 3 "$API/api/health" | grep -q ok 2>/dev/null; then
-    echo -e "${YELLOW}WARNING: Management API not responding at $API — stats will be unavailable${RESET}"
+    echo -e "${YELLOW}WARNING: Client API not responding at $API — client stats unavailable${RESET}"
+fi
+
+# Check server API (needed for section I — server-side FEC recovery stats)
+SERVER_API_OK=false
+if curl -s --max-time 3 "$SERVER_API/api/health" | grep -q ok 2>/dev/null; then
+    echo -e "${GREEN}Server API reachable at $SERVER_API${RESET}"
+    SERVER_API_OK=true
+else
+    echo -e "${YELLOW}WARNING: Server API not responding at $SERVER_API${RESET}"
+    echo -e "${YELLOW}  Server must be started with BOND_API=0.0.0.0:8007 for FEC validation tests${RESET}"
 fi
 
 # Clean any leftover tc rules
@@ -459,18 +474,26 @@ run_test "H2: Burst W+1=6 (exceeds window, ARQ)" \
     10 1 1
 
 # ============================================================================
-# I. SINGLE-PATH TESTS (FEC/ARQ Isolation)
+# I. SINGLE-PATH FEC/ARQ VALIDATION (Server-Side Recovery)
 # ============================================================================
-# IMPORTANT: tc netem on root qdisc only affects EGRESS (outgoing packets).
-# FEC protects against INBOUND loss (server's packets arriving at client).
-# To simulate inbound loss we use iptables random drop on INPUT chain for
-# incoming WireGuard UDP (port 51820). This drops encrypted packets before
-# they reach userspace — 007's FEC decoder must recover the missing data.
+# The real-world scenario: CLIENT sends audio on impaired interfaces.
+# tc netem on the client's interfaces drops/delays OUTBOUND packets.
+# The SERVER receives the impaired stream and must recover missing packets
+# using FEC and ARQ. We check the SERVER's stats for fec_recovered.
 #
-# Bond endpoints are cleared so only the primary WireGuard path remains.
+# tc netem egress loss is correct here — it simulates client interface issues.
+# Server API must be reachable via tunnel (BOND_API=0.0.0.0:8007 on server).
+#
+# Bond endpoints are cleared so only the primary WireGuard path remains,
+# ensuring loss isn't absorbed by multi-path redundancy.
 # ============================================================================
 echo ""
-echo -e "${BOLD}=== I. Single-Path Tests (FEC/ARQ Isolation) ===${RESET}"
+echo -e "${BOLD}=== I. Single-Path FEC/ARQ Validation (Server Recovery) ===${RESET}"
+
+if [ "$SERVER_API_OK" != "true" ]; then
+    echo -e "  ${RED}[SKIP]${RESET} Server API not reachable at $SERVER_API"
+    echo -e "  ${RED}       Restart server with: BOND_API=0.0.0.0:8007 BOND_FEC_MODE=sliding sudo -E bash 007-sliding-server.sh${RESET}"
+else
 
 # Get WireGuard peer info for UAPI restore
 WG_SOCK="/var/run/wireguard/bond0.sock"
@@ -478,11 +501,9 @@ WG_ENDPOINT=$(wg show bond0 endpoints 2>/dev/null | awk '{print $2}' | head -1)
 WG_PEER_PUB=$(wg show bond0 peers 2>/dev/null | head -1)
 WG_PEER_PUB_HEX=$(echo "$WG_PEER_PUB" | base64 -d 2>/dev/null | xxd -p -c 32 2>/dev/null || echo "")
 WG_SERVER_IP=$(echo "$WG_ENDPOINT" | cut -d: -f1)
-WG_PORT=$(echo "$WG_ENDPOINT" | cut -d: -f2)
-WG_PORT="${WG_PORT:-51820}"
 
 if [ -z "$WG_PEER_PUB_HEX" ] || [ -z "$WG_SERVER_IP" ]; then
-    echo -e "  ${RED}[SKIP]${RESET} Cannot determine WireGuard peer info for UAPI — skipping single-path tests"
+    echo -e "  ${RED}[SKIP]${RESET} Cannot determine WireGuard peer info — skipping single-path tests"
 else
 
 # Detect all bond-eligible interfaces and their local IPs (for restore)
@@ -514,53 +535,10 @@ restore_bond_paths() {
     sleep 1
 }
 
-# iptables-based inbound loss: drops incoming WireGuard UDP packets randomly.
-# This affects the RECEIVE path — exactly what FEC is designed to recover.
-# Chain: 007_IMPAIR (flushed per test, removed on cleanup)
-IPTABLES_CHAIN="007_IMPAIR"
+echo -e "  ${CYAN}Checking SERVER stats at $SERVER_API${RESET}"
+echo -e "  ${CYAN}tc netem on client egress → server FEC must recover${RESET}"
 
-cleanup_iptables() {
-    iptables -D INPUT -j "$IPTABLES_CHAIN" 2>/dev/null || true
-    iptables -F "$IPTABLES_CHAIN" 2>/dev/null || true
-    iptables -X "$IPTABLES_CHAIN" 2>/dev/null || true
-}
-
-setup_iptables_chain() {
-    cleanup_iptables
-    iptables -N "$IPTABLES_CHAIN" 2>/dev/null || true
-    iptables -I INPUT -j "$IPTABLES_CHAIN"
-}
-
-# Apply random inbound loss via iptables
-# Usage: apply_inbound_loss <probability> (e.g. 0.10 for 10%)
-apply_inbound_loss() {
-    local prob="$1"
-    setup_iptables_chain
-    iptables -A "$IPTABLES_CHAIN" -p udp --sport "$WG_PORT" -s "$WG_SERVER_IP" \
-        -m statistic --mode random --probability "$prob" -j DROP
-}
-
-# Apply Nth-packet inbound loss (drops every Nth packet — simulates burst)
-# Usage: apply_inbound_nth_loss <every_n>
-apply_inbound_nth_loss() {
-    local every_n="$1"
-    setup_iptables_chain
-    iptables -A "$IPTABLES_CHAIN" -p udp --sport "$WG_PORT" -s "$WG_SERVER_IP" \
-        -m statistic --mode nth --every "$every_n" --packet 0 -j DROP
-}
-
-# Update cleanup_all to include iptables
-cleanup_all_with_ipt() {
-    cleanup_tc
-    cleanup_links
-    cleanup_iptables
-}
-trap cleanup_all_with_ipt EXIT INT TERM
-
-echo -e "  ${CYAN}Using iptables inbound drop (not tc/netem egress) for FEC testing${RESET}"
-echo -e "  ${CYAN}Server: $WG_SERVER_IP:$WG_PORT${RESET}"
-
-# Wrapper for single-path tests with iptables inbound loss
+# Wrapper for single-path tests — applies egress loss, checks SERVER stats
 run_single_path_test() {
     local name="$1"
     local setup_fn="$2"
@@ -572,8 +550,8 @@ run_single_path_test() {
     echo -e "${CYAN}--- $name ---${RESET}"
 
     # Clean state and enter single-path mode
-    cleanup_iptables
     cleanup_tc
+    cleanup_links
     enter_single_path
     sleep 0.5
 
@@ -584,16 +562,16 @@ run_single_path_test() {
         return
     fi
 
-    # Stats before
-    local before
-    before=$(get_stats)
+    # SERVER stats before (this is where FEC recovery happens)
+    local srv_before
+    srv_before=$(get_server_stats)
     local fec_before arq_before nack_before drop_before
-    fec_before=$(extract_stat "$before" "fec_recovered")
-    arq_before=$(extract_stat "$before" "arq_retransmit_ok")
-    nack_before=$(extract_stat "$before" "nacks_sent")
-    drop_before=$(extract_stat "$before" "drop_packets")
+    fec_before=$(extract_stat "$srv_before" "fec_recovered")
+    arq_before=$(extract_stat "$srv_before" "arq_retransmit_ok")
+    nack_before=$(extract_stat "$srv_before" "nacks_sent")
+    drop_before=$(extract_stat "$srv_before" "drop_packets")
 
-    # Apply inbound impairment
+    # Apply egress impairment on client interfaces
     eval "$setup_fn"
     sleep 0.3
 
@@ -604,20 +582,19 @@ run_single_path_test() {
     rx=$(count_received "$ping_out")
 
     # Remove impairment
-    cleanup_iptables
     cleanup_tc
 
-    # Stats after
+    # SERVER stats after
     sleep 0.5
-    local after
-    after=$(get_stats)
+    local srv_after
+    srv_after=$(get_server_stats)
     local fec_after arq_after nack_after drop_after
-    fec_after=$(extract_stat "$after" "fec_recovered")
-    arq_after=$(extract_stat "$after" "arq_retransmit_ok")
-    nack_after=$(extract_stat "$after" "nacks_sent")
-    drop_after=$(extract_stat "$after" "drop_packets")
+    fec_after=$(extract_stat "$srv_after" "fec_recovered")
+    arq_after=$(extract_stat "$srv_after" "arq_retransmit_ok")
+    nack_after=$(extract_stat "$srv_after" "nacks_sent")
+    drop_after=$(extract_stat "$srv_after" "drop_packets")
 
-    # Deltas
+    # Deltas (SERVER-side)
     local d_fec d_arq d_nack d_drop
     d_fec=$((fec_after - fec_before))
     d_arq=$((arq_after - arq_before))
@@ -626,7 +603,7 @@ run_single_path_test() {
 
     # Determine verdict
     local verdict="PASS"
-    local detail="[single-path]"
+    local detail="[server-side]"
 
     if [ "$rx" -lt "$min_rx" ]; then
         verdict="FAIL"
@@ -635,11 +612,11 @@ run_single_path_test() {
 
     if [ "$expect_fec" -eq 1 ] && [ "$d_fec" -eq 0 ]; then
         verdict="FAIL"
-        detail="$detail (EXPECTED FEC recovery, got 0)"
+        detail="$detail (EXPECTED server FEC recovery, got 0)"
     fi
 
     if [ "$expect_arq" -eq 1 ] && [ "$d_arq" -eq 0 ] && [ "$d_nack" -eq 0 ]; then
-        detail="$detail (expected ARQ activity, got 0)"
+        detail="$detail (expected server ARQ activity, got 0)"
     fi
 
     record_result "$name" "$verdict" "$rx/50" "$d_fec" "$d_arq" "$d_drop" "$detail"
@@ -648,51 +625,54 @@ run_single_path_test() {
     restore_bond_paths
 }
 
-# I1: 10% inbound loss — FEC MUST recover some packets
-# With W=5 sliding XOR, single isolated losses are recoverable
-run_single_path_test "I1: 10% inbound loss (FEC must recover)" \
-    "apply_inbound_loss 0.10" \
-    40 1 0
-
-# I2: 20% inbound loss — heavy FEC + ARQ stress
-run_single_path_test "I2: 20% inbound loss (FEC+ARQ stress)" \
-    "apply_inbound_loss 0.20" \
-    30 1 1
-
-# I3: Every 10th packet dropped — predictable loss pattern for FEC
-run_single_path_test "I3: 1-in-10 inbound drop (predictable FEC)" \
-    "apply_inbound_nth_loss 10" \
-    40 1 0
-
-# I4: Every 5th packet dropped — at W=5 boundary, stresses FEC
-run_single_path_test "I4: 1-in-5 inbound drop (W=5 stress)" \
-    "apply_inbound_nth_loss 5" \
+# I1: 10% egress loss — server FEC MUST recover some packets
+run_single_path_test "I1: 10% egress loss (server FEC)" \
+    "for i in $ALL_IFACES; do tc qdisc add dev \$i root netem loss 10%; done" \
     35 1 0
 
-# I5: Every 3rd packet dropped — 33% loss, exceeds FEC, ARQ must help
-run_single_path_test "I5: 1-in-3 inbound drop (ARQ must help)" \
-    "apply_inbound_nth_loss 3" \
-    20 1 1
+# I2: 20% egress loss — heavy server FEC + ARQ
+run_single_path_test "I2: 20% egress loss (server FEC+ARQ)" \
+    "for i in $ALL_IFACES; do tc qdisc add dev \$i root netem loss 20%; done" \
+    25 1 1
 
-# I6: 5% inbound loss + egress jitter — realistic single-link
-run_single_path_test "I6: 5% inbound loss + jitter (realistic)" \
-    "apply_inbound_loss 0.05; tc qdisc add dev $IFACE1 root netem delay 20ms 10ms distribution normal; tc qdisc add dev $IFACE2 root netem delay 20ms 10ms distribution normal" \
+# I3: 2-pkt burst egress loss — server sliding FEC window recovery
+# gemodel p=2%, r=50% => avg burst ~2 pkts
+run_single_path_test "I3: 2-pkt burst egress (server FEC window)" \
+    "for i in $ALL_IFACES; do tc qdisc add dev \$i root netem loss gemodel 2% 50%; done" \
+    38 1 0
+
+# I4: 5-pkt burst — at W=5 limit, server FEC partially recovers
+# gemodel p=5%, r=20% => avg burst ~5 pkts
+run_single_path_test "I4: 5-pkt burst egress (W=5 limit)" \
+    "for i in $ALL_IFACES; do tc qdisc add dev \$i root netem loss gemodel 5% 20%; done" \
+    25 1 1
+
+# I5: 10-pkt burst — exceeds server FEC, ARQ must recover
+# gemodel p=8%, r=10% => avg burst ~10 pkts
+run_single_path_test "I5: 10-pkt burst egress (server ARQ must help)" \
+    "for i in $ALL_IFACES; do tc qdisc add dev \$i root netem loss gemodel 8% 10%; done" \
+    15 1 1
+
+# I6: 5% loss + jitter — realistic single-link conditions
+run_single_path_test "I6: 5% loss + jitter (realistic)" \
+    "for i in $ALL_IFACES; do tc qdisc add dev \$i root netem loss 5% delay 20ms 10ms distribution normal; done" \
     40 1 0
 
-# I7: 30% inbound loss — extreme stress, many recoveries expected
-run_single_path_test "I7: 30% inbound loss (extreme stress)" \
-    "apply_inbound_loss 0.30" \
-    20 1 1
+# I7: 30% loss — extreme stress, many server recoveries expected
+run_single_path_test "I7: 30% egress loss (extreme stress)" \
+    "for i in $ALL_IFACES; do tc qdisc add dev \$i root netem loss 30%; done" \
+    15 1 1
 
-# I8: 3% inbound loss + egress reorder — ARQ must not false-trigger
-run_single_path_test "I8: 3% inbound + reorder (false NACK)" \
-    "apply_inbound_loss 0.03; tc qdisc add dev $IFACE1 root netem delay 10ms reorder 70%; tc qdisc add dev $IFACE2 root netem delay 10ms reorder 70%" \
-    45 1 0
+# I8: 3% loss + reorder — server ARQ must not false-trigger
+run_single_path_test "I8: 3% loss + reorder (false NACK check)" \
+    "for i in $ALL_IFACES; do tc qdisc add dev \$i root netem loss 3% delay 10ms reorder 70%; done" \
+    40 1 0
 
 echo ""
 echo -e "  ${CYAN}Bond paths restored — back to multi-path mode${RESET}"
 
 fi  # end WG_PEER_PUB_HEX check
+fi  # end SERVER_API_OK check
 
 # Allow bond paths to stabilise after restore
 sleep 2
@@ -823,20 +803,21 @@ echo "  7. A2 — 10% all-path loss (confirms multi-path absorbs loss)"
 #   -> Usually indicates a specific subsystem struggling under combined load
 #   -> Run the individual component tests (A/B/C/D/E) to isolate
 #
-# I1-I8 single-path tests — fec_recovered still 0:
-#   -> iptables rule not matching. Check: iptables -L 007_IMPAIR -v -n
-#   -> Verify server IP/port match: wg show bond0 endpoints
-#   -> If using tc netem instead of iptables: netem only affects EGRESS, not inbound!
-#   -> FEC only recovers INBOUND loss. Must use iptables INPUT chain random drop.
+# I1-I8 server-side FEC tests — fec_recovered still 0:
+#   -> Server API not reachable. Must start server with BOND_API=0.0.0.0:8007
+#   -> Server not running sliding FEC. Must start with BOND_FEC_MODE=sliding
+#   -> tc netem only affects client EGRESS. Server's FEC decoder recovers
+#      packets the client dropped. Check SERVER stats, not client stats.
+#   -> If server fec_recovered > 0 but test still FAIL: check rx threshold
 #
 # I1-I8 — tunnel unreachable after clearing bond endpoints:
 #   -> Primary WireGuard path uses a different interface than expected
 #   -> Check: wg show bond0 endpoints — verify server endpoint
 #
-# I5 — ARQ not recovering despite heavy loss:
-#   -> Retransmit arriving after playout deadline
-#   -> Check arq_deadline_skip — if high, playout buffer too shallow
-#   -> Or: NACKs themselves dropped by iptables rule (both directions affected)
+# I5 — server ARQ not recovering despite heavy loss:
+#   -> Server retransmit requests (NACKs) also lost on impaired path
+#   -> Check server arq_deadline_skip — retransmits too late for playout
+#   -> Increase playout buffer or reduce loss rate
 #
 # General: fec_recovered always 0:
 #   -> FEC not enabled. Check BOND_FEC_MODE env var.

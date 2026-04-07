@@ -28,7 +28,7 @@ wg genkey | tee server.key | wg pubkey > server.pub
 wg genkey | tee client.key | wg pubkey > client.pub
 
 echo "[+] Starting 007 with SLIDING FEC..."
-nohup env BOND_FEC_MODE=sliding /opt/007/007 -f bond0 > /tmp/007.log 2>&1 &
+nohup env BOND_FEC_MODE=sliding BOND_API=0.0.0.0:8007 /opt/007/007 -f bond0 > /tmp/007.log 2>&1 &
 echo $! > /tmp/007.pid
 sleep 3
 
@@ -39,6 +39,7 @@ wg set bond0 listen-port 51820 private-key ./server.key peer "$(cat client.pub)"
 ip addr add 10.7.0.1/24 dev bond0 2>/dev/null || true
 ip link set bond0 up
 iptables -I INPUT -p udp --dport 51820 -j ACCEPT 2>/dev/null || true
+iptables -I INPUT -p tcp --dport 8007 -s 10.7.0.0/24 -j ACCEPT 2>/dev/null || true
 
 pkill -x iperf3 2>/dev/null || true
 nohup bash -c 'while true; do iperf3 -s -B 10.7.0.1 --one-off 2>/dev/null; sleep 1; done' > /tmp/iperf3.log 2>&1 &
