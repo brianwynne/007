@@ -461,12 +461,13 @@ run_test "H2: Burst W+1=6 (exceeds window, ARQ)" \
 # ============================================================================
 # I. SINGLE-PATH TESTS (FEC/ARQ Isolation)
 # ============================================================================
-# Multi-path sends every packet on ALL interfaces. Independent per-interface
-# loss means compound loss probability is very low (e.g. 30% per path = 9%
-# both). FEC never activates because path diversity absorbs the loss.
+# IMPORTANT: tc netem on root qdisc only affects EGRESS (outgoing packets).
+# FEC protects against INBOUND loss (server's packets arriving at client).
+# To simulate inbound loss we use iptables random drop on INPUT chain for
+# incoming WireGuard UDP (port 51820). This drops encrypted packets before
+# they reach userspace — 007's FEC decoder must recover the missing data.
 #
-# These tests clear bond endpoints so only the primary WireGuard path remains.
-# With a single path, tc/netem loss hits every packet — FEC and ARQ MUST work.
+# Bond endpoints are cleared so only the primary WireGuard path remains.
 # ============================================================================
 echo ""
 echo -e "${BOLD}=== I. Single-Path Tests (FEC/ARQ Isolation) ===${RESET}"
@@ -477,6 +478,8 @@ WG_ENDPOINT=$(wg show bond0 endpoints 2>/dev/null | awk '{print $2}' | head -1)
 WG_PEER_PUB=$(wg show bond0 peers 2>/dev/null | head -1)
 WG_PEER_PUB_HEX=$(echo "$WG_PEER_PUB" | base64 -d 2>/dev/null | xxd -p -c 32 2>/dev/null || echo "")
 WG_SERVER_IP=$(echo "$WG_ENDPOINT" | cut -d: -f1)
+WG_PORT=$(echo "$WG_ENDPOINT" | cut -d: -f2)
+WG_PORT="${WG_PORT:-51820}"
 
 if [ -z "$WG_PEER_PUB_HEX" ] || [ -z "$WG_SERVER_IP" ]; then
     echo -e "  ${RED}[SKIP]${RESET} Cannot determine WireGuard peer info for UAPI — skipping single-path tests"
@@ -511,19 +514,53 @@ restore_bond_paths() {
     sleep 1
 }
 
-# Determine primary interface (the one WireGuard endpoint is bound to)
-PRIMARY_IFACE="$IFACE1"
-for i in "${!BOND_LOCAL_IPS[@]}"; do
-    if ip -4 addr show "${BOND_IFACES[$i]}" | grep -q "$WG_SERVER_IP" 2>/dev/null; then
-        PRIMARY_IFACE="${BOND_IFACES[$i]}"
-    fi
-done
-# The primary interface is whichever carries the WG endpoint traffic
-# For netem, we apply to IFACE1 (ens5) which is typically the primary path
-echo -e "  ${CYAN}Primary interface for single-path: $IFACE1${RESET}"
-echo -e "  ${CYAN}Bond paths will be cleared, traffic forced through primary WG path${RESET}"
+# iptables-based inbound loss: drops incoming WireGuard UDP packets randomly.
+# This affects the RECEIVE path — exactly what FEC is designed to recover.
+# Chain: 007_IMPAIR (flushed per test, removed on cleanup)
+IPTABLES_CHAIN="007_IMPAIR"
 
-# Wrapper for single-path tests
+cleanup_iptables() {
+    iptables -D INPUT -j "$IPTABLES_CHAIN" 2>/dev/null || true
+    iptables -F "$IPTABLES_CHAIN" 2>/dev/null || true
+    iptables -X "$IPTABLES_CHAIN" 2>/dev/null || true
+}
+
+setup_iptables_chain() {
+    cleanup_iptables
+    iptables -N "$IPTABLES_CHAIN" 2>/dev/null || true
+    iptables -I INPUT -j "$IPTABLES_CHAIN"
+}
+
+# Apply random inbound loss via iptables
+# Usage: apply_inbound_loss <probability> (e.g. 0.10 for 10%)
+apply_inbound_loss() {
+    local prob="$1"
+    setup_iptables_chain
+    iptables -A "$IPTABLES_CHAIN" -p udp --sport "$WG_PORT" -s "$WG_SERVER_IP" \
+        -m statistic --mode random --probability "$prob" -j DROP
+}
+
+# Apply Nth-packet inbound loss (drops every Nth packet — simulates burst)
+# Usage: apply_inbound_nth_loss <every_n>
+apply_inbound_nth_loss() {
+    local every_n="$1"
+    setup_iptables_chain
+    iptables -A "$IPTABLES_CHAIN" -p udp --sport "$WG_PORT" -s "$WG_SERVER_IP" \
+        -m statistic --mode nth --every "$every_n" --packet 0 -j DROP
+}
+
+# Update cleanup_all to include iptables
+cleanup_all_with_ipt() {
+    cleanup_tc
+    cleanup_links
+    cleanup_iptables
+}
+trap cleanup_all_with_ipt EXIT INT TERM
+
+echo -e "  ${CYAN}Using iptables inbound drop (not tc/netem egress) for FEC testing${RESET}"
+echo -e "  ${CYAN}Server: $WG_SERVER_IP:$WG_PORT${RESET}"
+
+# Wrapper for single-path tests with iptables inbound loss
 run_single_path_test() {
     local name="$1"
     local setup_fn="$2"
@@ -534,9 +571,9 @@ run_single_path_test() {
     echo ""
     echo -e "${CYAN}--- $name ---${RESET}"
 
-    # Clean tc and enter single-path mode
+    # Clean state and enter single-path mode
+    cleanup_iptables
     cleanup_tc
-    cleanup_links
     enter_single_path
     sleep 0.5
 
@@ -556,7 +593,7 @@ run_single_path_test() {
     nack_before=$(extract_stat "$before" "nacks_sent")
     drop_before=$(extract_stat "$before" "drop_packets")
 
-    # Apply impairment to ALL interfaces (only primary matters, but be safe)
+    # Apply inbound impairment
     eval "$setup_fn"
     sleep 0.3
 
@@ -567,6 +604,7 @@ run_single_path_test() {
     rx=$(count_received "$ping_out")
 
     # Remove impairment
+    cleanup_iptables
     cleanup_tc
 
     # Stats after
@@ -610,49 +648,46 @@ run_single_path_test() {
     restore_bond_paths
 }
 
-# I1: 10% random loss, single path — FEC MUST recover some packets
-# With W=5 sliding XOR, single isolated losses within any window are recoverable
-run_single_path_test "I1: 10% loss single-path (FEC must recover)" \
-    "tc qdisc add dev $IFACE1 root netem loss 10%; tc qdisc add dev $IFACE2 root netem loss 10%" \
+# I1: 10% inbound loss — FEC MUST recover some packets
+# With W=5 sliding XOR, single isolated losses are recoverable
+run_single_path_test "I1: 10% inbound loss (FEC must recover)" \
+    "apply_inbound_loss 0.10" \
     40 1 0
 
-# I2: 20% random loss, single path — heavy FEC + ARQ stress
-run_single_path_test "I2: 20% loss single-path (FEC+ARQ stress)" \
-    "tc qdisc add dev $IFACE1 root netem loss 20%; tc qdisc add dev $IFACE2 root netem loss 20%" \
+# I2: 20% inbound loss — heavy FEC + ARQ stress
+run_single_path_test "I2: 20% inbound loss (FEC+ARQ stress)" \
+    "apply_inbound_loss 0.20" \
     30 1 1
 
-# I3: 2-packet burst loss, single path — sliding FEC window recovery
-# gemodel p=2%, r=50% => avg burst ~2 pkts
-run_single_path_test "I3: 2-pkt burst single-path (FEC window)" \
-    "tc qdisc add dev $IFACE1 root netem loss gemodel 2% 50%; tc qdisc add dev $IFACE2 root netem loss gemodel 2% 50%" \
-    38 1 0
-
-# I4: 5-packet burst, single path — at W=5 limit, FEC should partially recover
-# gemodel p=5%, r=20% => avg burst ~5 pkts
-run_single_path_test "I4: 5-pkt burst single-path (W=5 limit)" \
-    "tc qdisc add dev $IFACE1 root netem loss gemodel 5% 20%; tc qdisc add dev $IFACE2 root netem loss gemodel 5% 20%" \
-    25 1 1
-
-# I5: 10-packet burst, single path — exceeds FEC, ARQ MUST recover
-# gemodel p=8%, r=10% => avg burst ~10 pkts
-run_single_path_test "I5: 10-pkt burst single-path (ARQ must help)" \
-    "tc qdisc add dev $IFACE1 root netem loss gemodel 8% 10%; tc qdisc add dev $IFACE2 root netem loss gemodel 8% 10%" \
-    15 1 1
-
-# I6: 5% loss + 20ms jitter, single path — realistic single-link conditions
-run_single_path_test "I6: 5% loss + jitter single-path (realistic)" \
-    "tc qdisc add dev $IFACE1 root netem loss 5% delay 20ms 10ms distribution normal; tc qdisc add dev $IFACE2 root netem loss 5% delay 20ms 10ms distribution normal" \
+# I3: Every 10th packet dropped — predictable loss pattern for FEC
+run_single_path_test "I3: 1-in-10 inbound drop (predictable FEC)" \
+    "apply_inbound_nth_loss 10" \
     40 1 0
 
-# I7: 30% loss, single path — extreme stress, many FEC + ARQ recoveries expected
-run_single_path_test "I7: 30% loss single-path (extreme stress)" \
-    "tc qdisc add dev $IFACE1 root netem loss 30%; tc qdisc add dev $IFACE2 root netem loss 30%" \
+# I4: Every 5th packet dropped — at W=5 boundary, stresses FEC
+run_single_path_test "I4: 1-in-5 inbound drop (W=5 stress)" \
+    "apply_inbound_nth_loss 5" \
+    35 1 0
+
+# I5: Every 3rd packet dropped — 33% loss, exceeds FEC, ARQ must help
+run_single_path_test "I5: 1-in-3 inbound drop (ARQ must help)" \
+    "apply_inbound_nth_loss 3" \
     20 1 1
 
-# I8: 3% loss + reorder, single path — ARQ must NOT false-trigger on reorder
-run_single_path_test "I8: 3% loss + reorder single-path (false NACK)" \
-    "tc qdisc add dev $IFACE1 root netem loss 3% delay 10ms reorder 70%; tc qdisc add dev $IFACE2 root netem loss 3% delay 10ms reorder 70%" \
+# I6: 5% inbound loss + egress jitter — realistic single-link
+run_single_path_test "I6: 5% inbound loss + jitter (realistic)" \
+    "apply_inbound_loss 0.05; tc qdisc add dev $IFACE1 root netem delay 20ms 10ms distribution normal; tc qdisc add dev $IFACE2 root netem delay 20ms 10ms distribution normal" \
     40 1 0
+
+# I7: 30% inbound loss — extreme stress, many recoveries expected
+run_single_path_test "I7: 30% inbound loss (extreme stress)" \
+    "apply_inbound_loss 0.30" \
+    20 1 1
+
+# I8: 3% inbound loss + egress reorder — ARQ must not false-trigger
+run_single_path_test "I8: 3% inbound + reorder (false NACK)" \
+    "apply_inbound_loss 0.03; tc qdisc add dev $IFACE1 root netem delay 10ms reorder 70%; tc qdisc add dev $IFACE2 root netem delay 10ms reorder 70%" \
+    45 1 0
 
 echo ""
 echo -e "  ${CYAN}Bond paths restored — back to multi-path mode${RESET}"
@@ -789,20 +824,19 @@ echo "  7. A2 — 10% all-path loss (confirms multi-path absorbs loss)"
 #   -> Run the individual component tests (A/B/C/D/E) to isolate
 #
 # I1-I8 single-path tests — fec_recovered still 0:
-#   -> Bond endpoints not actually cleared. Check UAPI socket path.
-#   -> Verify with: wg show bond0 — should show no bond endpoints
-#   -> If tunnel unreachable in single-path: WG endpoint may be on ens6, not ens5
-#   -> If FEC recovering but verdict FAIL: repair packets also lost (expected at high loss)
+#   -> iptables rule not matching. Check: iptables -L 007_IMPAIR -v -n
+#   -> Verify server IP/port match: wg show bond0 endpoints
+#   -> If using tc netem instead of iptables: netem only affects EGRESS, not inbound!
+#   -> FEC only recovers INBOUND loss. Must use iptables INPUT chain random drop.
 #
 # I1-I8 — tunnel unreachable after clearing bond endpoints:
 #   -> Primary WireGuard path uses a different interface than expected
-#   -> WG endpoint bound to ens6 but tc applied to ens5
-#   -> Fix: apply netem to ALL interfaces in single-path tests (already done)
+#   -> Check: wg show bond0 endpoints — verify server endpoint
 #
-# I5 — ARQ not recovering despite bursts exceeding FEC:
+# I5 — ARQ not recovering despite heavy loss:
 #   -> Retransmit arriving after playout deadline
 #   -> Check arq_deadline_skip — if high, playout buffer too shallow
-#   -> Or: NACKs themselves lost in the impaired path
+#   -> Or: NACKs themselves dropped by iptables rule (both directions affected)
 #
 # General: fec_recovered always 0:
 #   -> FEC not enabled. Check BOND_FEC_MODE env var.
