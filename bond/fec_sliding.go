@@ -179,16 +179,17 @@ func (d *SlidingFECDecoder) Decode(packet []byte) (data *DecodedPacket, recovere
 		copy(payload, packet[SlidingDataHeaderSize:])
 		data = &DecodedPacket{Data: payload, DataSeq: seq}
 
-		// Detect gaps BEFORE storing — these are missing sequences that
-		// ARQ should NACK immediately, racing FEC recovery.
+		// Detect gaps BEFORE storing — report every missing sequence so
+		// ARQ fires immediately, racing FEC. Do NOT check d.received:
+		// FEC-recovered packets added by repair processing would hide
+		// gaps from ARQ. We want NACKs for every gap unconditionally.
+		// Duplicate retransmits are harmlessly discarded by the jitter buffer.
 		if !d.seqInitialized {
 			d.nextExpected = seq + 1
 			d.seqInitialized = true
 		} else if seq > d.nextExpected {
 			for s := d.nextExpected; s < seq; s++ {
-				if _, ok := d.received[s]; !ok {
-					missing = append(missing, s)
-				}
+				missing = append(missing, s)
 			}
 			d.nextExpected = seq + 1
 		} else if seq >= d.nextExpected {
