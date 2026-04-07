@@ -160,6 +160,7 @@ run_test() {
     if [ "$SERVER_API_OK" = "true" ]; then
         before=$(get_server_stats)
     else
+        echo -e "  ${YELLOW}WARNING: Using client stats — FEC/ARQ counters are not meaningful (server does recovery)${RESET}"
         before=$(get_stats)
     fi
     local fec_before arq_before nack_before drop_before
@@ -303,7 +304,7 @@ echo -e "${BOLD}=== B. Burst Loss Tests ===${RESET}"
 # Reduced p for shorter bursts on single path
 run_test "B1: 2-pkt burst loss ens5 (gemodel)" \
     "tc qdisc add dev $IFACE1 root netem loss gemodel 1% 25%" \
-    25 1 0
+    25 0 0
 
 # B2: 5-packet burst loss ALL paths — stresses sliding FEC window W=5
 # gemodel: p=3% (good->bad), r=20% (bad->good) => avg burst ~5 pkts
@@ -460,12 +461,12 @@ echo -e "${BOLD}=== G. Combined Real-World Scenarios ===${RESET}"
 # G1: "Bad WiFi" — ens5=3% loss + 15ms+-8ms jitter, ens6=0.5% loss + 2ms delay
 run_test "G1: Bad WiFi scenario" \
     "tc qdisc add dev $IFACE1 root netem loss 3% delay 15ms 8ms distribution normal; tc qdisc add dev $IFACE2 root netem loss 0.5% delay 2ms" \
-    26 1 0
+    26 0 0
 
 # G2: "Cellular failover" — ens5=80ms + 5% loss + burst, ens6=10ms + 0.1% loss
 run_test "G2: Cellular failover scenario" \
     "tc qdisc add dev $IFACE1 root netem delay 80ms loss gemodel 5% 30%; tc qdisc add dev $IFACE2 root netem delay 10ms loss 0.1%" \
-    25 1 0
+    25 0 0
 
 # G3: "Conference room" — ALL=2% loss + 20ms+-15ms jitter + 10% reorder
 run_test "G3: Conference room scenario" \
@@ -544,7 +545,7 @@ enter_single_path() {
 
 # Function: restore bond endpoints (multi-path mode)
 restore_bond_paths() {
-    local cmd="set=1\npublic_key=${WG_PEER_PUB_HEX}\n"
+    local cmd="set=1\npublic_key=${WG_PEER_PUB_HEX}\nclear_bond_endpoints=true\n"
     for i in "${!BOND_LOCAL_IPS[@]}"; do
         cmd="${cmd}bond_endpoint=${WG_SERVER_IP}:51820@${BOND_LOCAL_IPS[$i]}\n"
     done

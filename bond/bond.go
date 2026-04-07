@@ -948,6 +948,12 @@ type Stats struct {
 	ARQRetransmitMiss uint64
 	ARQReceived       uint64
 	ARQDeadlineSkip   uint64
+	JitterDelivered   uint64
+	JitterLate        uint64
+	JitterMisses      uint64
+	JitterFECFills    uint64
+	JitterARQFills    uint64
+	JitterJumps       uint64
 	Paths             []PathHealthSnapshot
 }
 
@@ -991,6 +997,15 @@ func (m *Manager) GetStats() Stats {
 			if windowMs > s.ReorderWindowMs {
 				s.ReorderWindowMs = windowMs
 			}
+		}
+		if ps.jitterBuf != nil {
+			js := ps.jitterBuf.Stats()
+			s.JitterDelivered += js.Delivered
+			s.JitterLate += js.Late
+			s.JitterMisses += js.Misses
+			s.JitterFECFills += js.FECFills
+			s.JitterARQFills += js.ARQFills
+			s.JitterJumps += js.Jumps
 		}
 		if ps.pathTrack != nil {
 			s.Paths = append(s.Paths, ps.pathTrack.GetAll()...)

@@ -107,6 +107,12 @@ type statsResponse struct {
 	ARQRetransmitMiss uint64             `json:"arq_retransmit_miss"`
 	ARQReceived       uint64             `json:"arq_received"`
 	ARQDeadlineSkip   uint64             `json:"arq_deadline_skip"`
+	JitterDelivered   uint64             `json:"jitter_delivered"`
+	JitterLate        uint64             `json:"jitter_late"`
+	JitterMisses      uint64             `json:"jitter_misses"`
+	JitterFECFills    uint64             `json:"jitter_fec_fills"`
+	JitterARQFills    uint64             `json:"jitter_arq_fills"`
+	JitterJumps       uint64             `json:"jitter_jumps"`
 	Paths             []pathResponse     `json:"paths"`
 }
 
@@ -150,6 +156,12 @@ func (a *API) handleStats(w http.ResponseWriter, r *http.Request) {
 		ARQRetransmitMiss: s.ARQRetransmitMiss,
 		ARQReceived:       s.ARQReceived,
 		ARQDeadlineSkip:   s.ARQDeadlineSkip,
+		JitterDelivered:   s.JitterDelivered,
+		JitterLate:        s.JitterLate,
+		JitterMisses:      s.JitterMisses,
+		JitterFECFills:    s.JitterFECFills,
+		JitterARQFills:    s.JitterARQFills,
+		JitterJumps:       s.JitterJumps,
 	}
 
 	for _, p := range s.Paths {
