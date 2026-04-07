@@ -245,7 +245,13 @@ func parsePresetPacket(pkt []byte) string {
 	if len(pkt) <= FECHeaderSize {
 		return ""
 	}
-	return string(pkt[FECHeaderSize:])
+	// Trim null bytes and whitespace — packet may be padded
+	name := pkt[FECHeaderSize:]
+	end := len(name)
+	for end > 0 && (name[end-1] == 0 || name[end-1] == ' ') {
+		end--
+	}
+	return string(name[:end])
 }
 
 // isControlPacket checks if a packet is a bond control message (not data).

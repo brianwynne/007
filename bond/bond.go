@@ -856,9 +856,11 @@ func (m *Manager) handleControl(ps *peerState, packet []byte, pathID int) [][]by
 
 	case controlTypePreset:
 		preset := parsePresetPacket(packet)
-		m.logger.Info("received preset control packet", "preset", preset, "peer", ps.peerID, "len", len(packet))
+		m.logger.Info("received preset control packet", "preset", preset, "preset_len", len(preset), "peer", ps.peerID, "pkt_len", len(packet))
 		if preset != "" {
-			m.SetPeerPreset(ps.peerID, preset)
+			if err := m.SetPeerPreset(ps.peerID, preset); err != nil {
+				m.logger.Error("SetPeerPreset failed", "error", err)
+			}
 		}
 	}
 	return nil
