@@ -31,7 +31,12 @@ wg genkey | tee server.key | wg pubkey > server.pub
 wg genkey | tee client.key | wg pubkey > client.pub
 
 echo "[+] Starting 007..."
-nohup /opt/007/007 -f bond0 > /tmp/007.log 2>&1 &
+# Pass through BOND_* env vars for FEC mode selection etc.
+nohup env ${BOND_FEC_MODE:+BOND_FEC_MODE=$BOND_FEC_MODE} \
+         ${BOND_JITTER:+BOND_JITTER=$BOND_JITTER} \
+         ${BOND_FEC:+BOND_FEC=$BOND_FEC} \
+         ${BOND_REORDER:+BOND_REORDER=$BOND_REORDER} \
+         /opt/007/007 -f bond0 > /tmp/007.log 2>&1 &
 echo $! > /tmp/007.pid
 sleep 3
 
