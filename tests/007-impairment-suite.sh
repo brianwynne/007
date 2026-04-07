@@ -696,6 +696,154 @@ fi  # end SERVER_API_OK check
 sleep 2
 
 # ============================================================================
+# J. INBOUND IMPAIRMENT (Client Recovery from Server→Client Loss)
+# ============================================================================
+# Sections A-I test SERVER recovery from CLIENT egress loss.
+# Section J tests CLIENT recovery from SERVER→CLIENT loss.
+#
+# We can't apply tc netem on the server from here, so we use iptables
+# on the client INPUT chain to randomly drop incoming WireGuard UDP.
+# This simulates the server's packets being lost on the way to the client.
+# The CLIENT's FEC/ARQ must recover — we check CLIENT stats.
+# ============================================================================
+echo ""
+echo -e "${BOLD}=== J. Inbound Impairment (Client Recovery) ===${RESET}"
+
+# Get server endpoint info for iptables rules
+WG_ENDPOINT_J=$(wg show bond0 endpoints 2>/dev/null | awk '{print $2}' | head -1)
+WG_SERVER_IP_J=$(echo "$WG_ENDPOINT_J" | cut -d: -f1)
+WG_PORT_J=$(echo "$WG_ENDPOINT_J" | cut -d: -f2)
+WG_PORT_J="${WG_PORT_J:-51820}"
+
+if [ -z "$WG_SERVER_IP_J" ]; then
+    echo -e "  ${RED}[SKIP]${RESET} Cannot determine server endpoint — skipping inbound tests"
+else
+
+# iptables chain for inbound impairment
+IPT_CHAIN="007_INBOUND"
+
+cleanup_iptables() {
+    iptables -D INPUT -j "$IPT_CHAIN" 2>/dev/null || true
+    iptables -F "$IPT_CHAIN" 2>/dev/null || true
+    iptables -X "$IPT_CHAIN" 2>/dev/null || true
+}
+
+setup_iptables_chain() {
+    cleanup_iptables
+    iptables -N "$IPT_CHAIN" 2>/dev/null || true
+    iptables -I INPUT -j "$IPT_CHAIN"
+}
+
+# Update trap to include iptables cleanup
+trap "cleanup_tc; cleanup_links; cleanup_iptables" EXIT INT TERM
+
+echo -e "  ${CYAN}Using iptables INPUT drop on incoming WireGuard UDP${RESET}"
+echo -e "  ${CYAN}Server endpoint: $WG_SERVER_IP_J:$WG_PORT_J${RESET}"
+echo -e "  ${CYAN}Checking CLIENT stats (client does recovery)${RESET}"
+
+# Wrapper for inbound impairment tests — drops incoming packets, checks CLIENT stats
+run_inbound_test() {
+    local name="$1"
+    local loss_prob="$2"
+    local min_rx="$3"
+    local expect_fec="${4:-0}"
+    local expect_arq="${5:-0}"
+
+    echo ""
+    echo -e "${CYAN}--- $name ---${RESET}"
+
+    cleanup_iptables
+    sleep 0.3
+
+    # Verify connectivity
+    if ! ping -c 2 -W 3 "$SERVER" > /dev/null 2>&1; then
+        echo -e "  ${RED}[SKIP]${RESET} $name — tunnel not reachable"
+        return
+    fi
+
+    # CLIENT stats before (client does the recovery)
+    local before
+    before=$(get_stats)
+    local fec_before arq_before nack_before drop_before
+    fec_before=$(extract_stat "$before" "fec_recovered")
+    arq_before=$(extract_stat "$before" "arq_received")
+    nack_before=$(extract_stat "$before" "nacks_sent")
+    drop_before=$(extract_stat "$before" "drop_packets")
+
+    # Apply inbound loss via iptables
+    setup_iptables_chain
+    iptables -A "$IPT_CHAIN" -p udp --sport "$WG_PORT_J" -s "$WG_SERVER_IP_J" \
+        -m statistic --mode random --probability "$loss_prob" -j DROP
+
+    sleep 0.3
+
+    # Run traffic
+    local ping_out
+    ping_out=$(run_ping 50 "$PING_INTERVAL")
+    local rx
+    rx=$(count_received "$ping_out")
+
+    # Remove impairment
+    cleanup_iptables
+
+    # CLIENT stats after
+    sleep 0.5
+    local after
+    after=$(get_stats)
+    local fec_after arq_after nack_after drop_after
+    fec_after=$(extract_stat "$after" "fec_recovered")
+    arq_after=$(extract_stat "$after" "arq_received")
+    nack_after=$(extract_stat "$after" "nacks_sent")
+    drop_after=$(extract_stat "$after" "drop_packets")
+
+    # Deltas (CLIENT-side)
+    local d_fec d_arq d_nack d_drop
+    d_fec=$((fec_after - fec_before))
+    d_arq=$((arq_after - arq_before))
+    d_nack=$((nack_after - nack_before))
+    d_drop=$((drop_after - drop_before))
+
+    # Determine verdict
+    local verdict="PASS"
+    local detail="[client-side]"
+
+    if [ "$rx" -lt "$min_rx" ]; then
+        verdict="FAIL"
+        detail="$detail (rx below threshold $min_rx)"
+    fi
+
+    if [ "$expect_fec" -eq 1 ] && [ "$d_fec" -eq 0 ]; then
+        verdict="FAIL"
+        detail="$detail (EXPECTED client FEC recovery, got 0)"
+    fi
+
+    if [ "$expect_arq" -eq 1 ] && [ "$d_arq" -eq 0 ] && [ "$d_nack" -eq 0 ]; then
+        detail="$detail (expected client ARQ activity, got 0)"
+    fi
+
+    record_result "$name" "$verdict" "$rx/50" "$d_fec" "$d_nack" "$d_arq" "$d_drop" "$detail"
+}
+
+# J1: 10% inbound loss — client FEC must recover
+run_inbound_test "J1: 10% inbound loss (client FEC)" 0.10 40 1 0
+
+# J2: 20% inbound loss — client FEC + ARQ
+run_inbound_test "J2: 20% inbound loss (client FEC+ARQ)" 0.20 30 1 1
+
+# J3: 30% inbound loss — extreme stress on client recovery
+run_inbound_test "J3: 30% inbound loss (client extreme)" 0.30 20 1 1
+
+# J4: 5% inbound loss — realistic, client should handle easily
+run_inbound_test "J4: 5% inbound loss (realistic)" 0.05 45 1 0
+
+echo ""
+echo -e "  ${CYAN}Inbound impairment tests complete${RESET}"
+
+fi  # end WG_SERVER_IP_J check
+
+sleep 1
+
+# ============================================================================
 # Verify tunnel still works after all tests
 # ============================================================================
 echo ""
@@ -761,12 +909,13 @@ echo -e "${BOLD}================================================================
 echo -e "${BOLD}  MINIMUM VALIDATION SUITE (run these 5 first)${RESET}"
 echo -e "${BOLD}================================================================${RESET}"
 echo "  1. A1 — 5% single-path loss (confirms path diversity works)"
-echo "  2. I1 — 10% loss single-path (confirms FEC actually recovers packets)"
-echo "  3. I4 — 5-pkt burst single-path (stresses sliding FEC window W=5)"
-echo "  4. I5 — 10-pkt burst single-path (confirms ARQ recovers beyond FEC)"
-echo "  5. C2 — Extreme delay asymmetry (confirms reorder buffer handles it)"
-echo "  6. F1 — 200ms single-path blackout (confirms failover works)"
-echo "  7. A2 — 10% all-path loss (confirms multi-path absorbs loss)"
+echo "  2. I1 — 10% egress loss (confirms server FEC recovers packets)"
+echo "  3. I5 — 10-pkt burst egress (confirms server ARQ recovers beyond FEC)"
+echo "  4. J1 — 10% inbound loss (confirms client FEC recovers packets)"
+echo "  5. J2 — 20% inbound loss (confirms client ARQ works)"
+echo "  6. C2 — Extreme delay asymmetry (confirms reorder buffer handles it)"
+echo "  7. F2 — 500ms blackout ALL paths (confirms recovery after outage)"
+echo "  8. A3 — 30% all-path loss (confirms multi-path + FEC + ARQ combined)"
 
 # ============================================================================
 # FAILURE DIAGNOSIS GUIDE
