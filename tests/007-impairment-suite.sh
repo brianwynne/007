@@ -47,6 +47,7 @@ TOTAL=0
 declare -a RESULTS_NAME=()
 declare -a RESULTS_RX=()
 declare -a RESULTS_FEC=()
+declare -a RESULTS_NACK=()
 declare -a RESULTS_ARQ=()
 declare -a RESULTS_DROP=()
 declare -a RESULTS_VERDICT=()
@@ -111,30 +112,34 @@ record_result() {
     local verdict="$2"  # PASS or FAIL
     local rx="$3"
     local fec="$4"
-    local arq="$5"
-    local drop="$6"
-    local detail="${7:-}"
+    local nack="$5"
+    local arq="$6"
+    local drop="$7"
+    local detail="${8:-}"
 
     TOTAL=$((TOTAL + 1))
     RESULTS_NAME+=("$name")
     RESULTS_RX+=("$rx")
     RESULTS_FEC+=("$fec")
+    RESULTS_NACK+=("$nack")
     RESULTS_ARQ+=("$arq")
     RESULTS_DROP+=("$drop")
 
     if [ "$verdict" = "PASS" ]; then
         PASS=$((PASS + 1))
         RESULTS_VERDICT+=("PASS")
-        echo -e "  ${GREEN}[PASS]${RESET} $name  rx=$rx fec=$fec arq=$arq drop=$drop $detail"
+        echo -e "  ${GREEN}[PASS]${RESET} $name  rx=$rx fec=$fec nack=$nack arq=$arq drop=$drop $detail"
     else
         FAIL=$((FAIL + 1))
         RESULTS_VERDICT+=("FAIL")
-        echo -e "  ${RED}[FAIL]${RESET} $name  rx=$rx fec=$fec arq=$arq drop=$drop $detail"
+        echo -e "  ${RED}[FAIL]${RESET} $name  rx=$rx fec=$fec nack=$nack arq=$arq drop=$drop $detail"
     fi
 }
 
 # Run a complete test scenario
-# Usage: run_test "name" "setup_cmd" "cleanup_cmd" pass_condition_rx_threshold
+# tc netem on client interfaces = egress loss = server must recover.
+# Stats are read from SERVER (where FEC/ARQ recovery happens).
+# Falls back to client stats if server API unavailable.
 run_test() {
     local name="$1"
     local setup_fn="$2"
@@ -150,9 +155,13 @@ run_test() {
     cleanup_links
     sleep 0.5
 
-    # Stats before
+    # Stats before — from SERVER (where recovery happens)
     local before
-    before=$(get_stats)
+    if [ "$SERVER_API_OK" = "true" ]; then
+        before=$(get_server_stats)
+    else
+        before=$(get_stats)
+    fi
     local fec_before arq_before nack_before drop_before
     fec_before=$(extract_stat "$before" "fec_recovered")
     arq_before=$(extract_stat "$before" "arq_retransmit_ok")
@@ -174,9 +183,13 @@ run_test() {
     cleanup_links
     sleep 0.5
 
-    # Stats after
+    # Stats after — from SERVER
     local after
-    after=$(get_stats)
+    if [ "$SERVER_API_OK" = "true" ]; then
+        after=$(get_server_stats)
+    else
+        after=$(get_stats)
+    fi
     local fec_after arq_after nack_after drop_after
     fec_after=$(extract_stat "$after" "fec_recovered")
     arq_after=$(extract_stat "$after" "arq_retransmit_ok")
@@ -207,7 +220,7 @@ run_test() {
         detail="$detail (expected ARQ activity, got 0)"
     fi
 
-    record_result "$name" "$verdict" "$rx/$PING_COUNT" "$d_fec" "$d_arq" "$d_drop" "$detail"
+    record_result "$name" "$verdict" "$rx/$PING_COUNT" "$d_fec" "$d_nack" "$d_arq" "$d_drop" "$detail"
 }
 
 # ─── Preflight checks ─────────────────────────────────────────────────────
@@ -368,9 +381,10 @@ echo -e "${BOLD}=== F. Short Outage Tests ===${RESET}"
 echo ""
 echo -e "${CYAN}--- F1: 200ms blackout ens6 ---${RESET}"
 {
-    before=$(get_stats)
+    if [ "$SERVER_API_OK" = "true" ]; then before=$(get_server_stats); else before=$(get_stats); fi
     fec_before=$(extract_stat "$before" "fec_recovered")
     arq_before=$(extract_stat "$before" "arq_retransmit_ok")
+    nack_before=$(extract_stat "$before" "nacks_sent")
     drop_before=$(extract_stat "$before" "drop_packets")
 
     # Start ping in background
@@ -389,22 +403,24 @@ echo -e "${CYAN}--- F1: 200ms blackout ens6 ---${RESET}"
     rx=$(count_received "$(cat "$ping_out_file")")
     rm -f "$ping_out_file"
 
-    after=$(get_stats)
+    if [ "$SERVER_API_OK" = "true" ]; then after=$(get_server_stats); else after=$(get_stats); fi
     d_fec=$(( $(extract_stat "$after" "fec_recovered") - fec_before ))
+    d_nack=$(( $(extract_stat "$after" "nacks_sent") - nack_before ))
     d_arq=$(( $(extract_stat "$after" "arq_retransmit_ok") - arq_before ))
     d_drop=$(( $(extract_stat "$after" "drop_packets") - drop_before ))
 
     if [ "$rx" -ge 26 ]; then verdict="PASS"; else verdict="FAIL"; fi
-    record_result "F1: 200ms blackout ens6" "$verdict" "$rx/$PING_COUNT" "$d_fec" "$d_arq" "$d_drop"
+    record_result "F1: 200ms blackout ens6" "$verdict" "$rx/$PING_COUNT" "$d_fec" "$d_nack" "$d_arq" "$d_drop"
 }
 
 # F2: 500ms blackout ALL paths — complete outage
 echo ""
 echo -e "${CYAN}--- F2: 500ms blackout ALL paths ---${RESET}"
 {
-    before=$(get_stats)
+    if [ "$SERVER_API_OK" = "true" ]; then before=$(get_server_stats); else before=$(get_stats); fi
     fec_before=$(extract_stat "$before" "fec_recovered")
     arq_before=$(extract_stat "$before" "arq_retransmit_ok")
+    nack_before=$(extract_stat "$before" "nacks_sent")
     drop_before=$(extract_stat "$before" "drop_packets")
 
     ping_out_file=$(mktemp /tmp/007-ping-XXXXXX)
@@ -421,14 +437,15 @@ echo -e "${CYAN}--- F2: 500ms blackout ALL paths ---${RESET}"
     rx=$(count_received "$(cat "$ping_out_file")")
     rm -f "$ping_out_file"
 
-    after=$(get_stats)
+    if [ "$SERVER_API_OK" = "true" ]; then after=$(get_server_stats); else after=$(get_stats); fi
     d_fec=$(( $(extract_stat "$after" "fec_recovered") - fec_before ))
+    d_nack=$(( $(extract_stat "$after" "nacks_sent") - nack_before ))
     d_arq=$(( $(extract_stat "$after" "arq_retransmit_ok") - arq_before ))
     d_drop=$(( $(extract_stat "$after" "drop_packets") - drop_before ))
 
     # Expect some loss during 500ms blackout — pass if we recover most
     if [ "$rx" -ge 20 ]; then verdict="PASS"; else verdict="FAIL"; fi
-    record_result "F2: 500ms blackout ALL paths" "$verdict" "$rx/$PING_COUNT" "$d_fec" "$d_arq" "$d_drop"
+    record_result "F2: 500ms blackout ALL paths" "$verdict" "$rx/$PING_COUNT" "$d_fec" "$d_nack" "$d_arq" "$d_drop"
 }
 
 # Allow paths to recover after link flapping
@@ -521,7 +538,7 @@ done
 # Function: clear bond endpoints (single-path mode)
 enter_single_path() {
     printf "set=1\npublic_key=%s\nclear_bond_endpoints=true\n\n" "$WG_PEER_PUB_HEX" \
-        | nc -U "$WG_SOCK" -w 1 2>/dev/null || true
+        | nc -U "$WG_SOCK" -w 1 > /dev/null 2>&1 || true
     sleep 0.5
 }
 
@@ -531,7 +548,7 @@ restore_bond_paths() {
     for i in "${!BOND_LOCAL_IPS[@]}"; do
         cmd="${cmd}bond_endpoint=${WG_SERVER_IP}:51820@${BOND_LOCAL_IPS[$i]}\n"
     done
-    printf "${cmd}\n" | nc -U "$WG_SOCK" -w 1 2>/dev/null || true
+    printf "${cmd}\n" | nc -U "$WG_SOCK" -w 1 > /dev/null 2>&1 || true
     sleep 1
 }
 
@@ -619,7 +636,7 @@ run_single_path_test() {
         detail="$detail (expected server ARQ activity, got 0)"
     fi
 
-    record_result "$name" "$verdict" "$rx/50" "$d_fec" "$d_arq" "$d_drop" "$detail"
+    record_result "$name" "$verdict" "$rx/50" "$d_fec" "$d_nack" "$d_arq" "$d_drop" "$detail"
 
     # Restore bond paths for next test
     restore_bond_paths
@@ -696,18 +713,24 @@ fi
 # Final stats dump
 # ============================================================================
 echo ""
-echo -e "${BOLD}=== Final Bond Stats ===${RESET}"
+echo -e "${BOLD}=== Final Bond Stats (Client) ===${RESET}"
 get_stats | python3 -m json.tool 2>/dev/null || echo "(stats unavailable)"
+
+if [ "$SERVER_API_OK" = "true" ]; then
+    echo ""
+    echo -e "${BOLD}=== Final Bond Stats (Server) ===${RESET}"
+    get_server_stats | python3 -m json.tool 2>/dev/null || echo "(stats unavailable)"
+fi
 
 # ============================================================================
 # SUMMARY TABLE
 # ============================================================================
 echo ""
 echo -e "${BOLD}================================================================${RESET}"
-echo -e "${BOLD}  RESULTS SUMMARY${RESET}"
+echo -e "${BOLD}  RESULTS SUMMARY  (stats from server where recovery happens)${RESET}"
 echo -e "${BOLD}================================================================${RESET}"
-printf "  %-45s  %-8s  %-5s  %-5s  %-5s  %s\n" "TEST" "RX" "FEC" "ARQ" "DROP" "VERDICT"
-printf "  %-45s  %-8s  %-5s  %-5s  %-5s  %s\n" "----" "--" "---" "---" "----" "-------"
+printf "  %-45s  %-8s  %-5s  %-5s  %-5s  %-5s  %s\n" "TEST" "RX" "FEC" "NACK" "ARQ" "DROP" "VERDICT"
+printf "  %-45s  %-8s  %-5s  %-5s  %-5s  %-5s  %s\n" "----" "--" "---" "----" "---" "----" "-------"
 
 for i in "${!RESULTS_NAME[@]}"; do
     v="${RESULTS_VERDICT[$i]}"
@@ -716,9 +739,9 @@ for i in "${!RESULTS_NAME[@]}"; do
     else
         colour="$RED"
     fi
-    printf "  %-45s  %-8s  %-5s  %-5s  %-5s  ${colour}%s${RESET}\n" \
+    printf "  %-45s  %-8s  %-5s  %-5s  %-5s  %-5s  ${colour}%s${RESET}\n" \
         "${RESULTS_NAME[$i]}" "${RESULTS_RX[$i]}" "${RESULTS_FEC[$i]}" \
-        "${RESULTS_ARQ[$i]}" "${RESULTS_DROP[$i]}" "$v"
+        "${RESULTS_NACK[$i]}" "${RESULTS_ARQ[$i]}" "${RESULTS_DROP[$i]}" "$v"
 done
 
 echo ""
