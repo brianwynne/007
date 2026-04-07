@@ -472,12 +472,22 @@ func (m *Manager) ProcessInbound(peerID uint32, packet []byte, nonce uint64, pat
 
 	// Sliding-window FEC decode
 	if m.config.FECEnabled && ps.slidingDec != nil && IsSlidingFECPacket(packet) {
-		data, recovered := ps.slidingDec.Decode(packet)
+		data, recovered, missing := ps.slidingDec.Decode(packet)
 
 		var result [][]byte
 
 		if ps.jitterBuf != nil {
-			// Step 1: Insert data packet (detects gaps in sequence)
+			// Step 1: Fire ARQ for gaps detected by FEC sequence tracking.
+			// The decoder reports missing sequences when a data packet
+			// arrives with a gap — NACKed immediately to race FEC.
+			if m.config.ARQEnabled && len(missing) > 0 {
+				for _, seq := range missing {
+					ps.nackTrack.AddMissing(seq)
+				}
+				m.triggerNACK(ps)
+			}
+
+			// Step 2: Insert data packet
 			if data != nil {
 				if isControlPacket(data.Data) {
 					m.handleControl(ps, data.Data, pathID)
@@ -486,10 +496,7 @@ func (m *Manager) ProcessInbound(peerID uint32, packet []byte, nonce uint64, pat
 				}
 			}
 
-			// Step 2: Fire ARQ BEFORE inserting FEC-recovered packets.
-			// ARQ races FEC — NACK every gap immediately. If FEC recovers
-			// the packet, the retransmit arrives as a harmless duplicate.
-			// If FEC fails, ARQ is already in flight.
+			// Step 3: Drain additional jitter buffer gaps
 			if m.config.ARQEnabled {
 				earlyNonces := ps.jitterBuf.DrainEarlyNACK()
 				for _, n := range earlyNonces {

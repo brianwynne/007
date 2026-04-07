@@ -17,7 +17,7 @@ func TestSlidingFEC_Roundtrip(t *testing.T) {
 			t.Errorf("packet %d: dataSeq=%d, want %d", i, seq, i)
 		}
 
-		data, _ := dec.Decode(dataEnc)
+		data, _, _ := dec.Decode(dataEnc)
 		if data == nil {
 			t.Fatalf("packet %d: data is nil", i)
 		}
@@ -29,7 +29,7 @@ func TestSlidingFEC_Roundtrip(t *testing.T) {
 		}
 
 		// Process repair (no recovery expected — all data present)
-		_, repairRec := dec.Decode(repairEnc)
+		_, repairRec, _ := dec.Decode(repairEnc)
 		if len(repairRec) > 0 {
 			t.Errorf("packet %d: unexpected recovery", i)
 		}
@@ -58,13 +58,13 @@ func TestSlidingFEC_SingleLoss(t *testing.T) {
 		if i == 3 {
 			continue // lost
 		}
-		_, rec := dec.Decode(allData[i])
+		_, rec, _ := dec.Decode(allData[i])
 		recovered = append(recovered, rec...)
 	}
 
 	// Now feed repairs — one of them should recover packet 3
 	for i := 0; i < 6; i++ {
-		_, rec := dec.Decode(allRepairs[i])
+		_, rec, _ := dec.Decode(allRepairs[i])
 		recovered = append(recovered, rec...)
 	}
 
@@ -107,13 +107,13 @@ func TestSlidingFEC_BurstLoss2(t *testing.T) {
 		if drop[i] {
 			continue
 		}
-		_, rec := dec.Decode(d)
+		_, rec, _ := dec.Decode(d)
 		recovered = append(recovered, rec...)
 	}
 
 	// Feed repairs
 	for _, r := range allRepairs {
-		_, rec := dec.Decode(r)
+		_, rec, _ := dec.Decode(r)
 		recovered = append(recovered, rec...)
 	}
 
@@ -139,7 +139,7 @@ func TestSlidingFEC_NoLoss(t *testing.T) {
 		pkt := []byte{byte(i)}
 		d, r, _ := enc.Encode(pkt, uint64(i))
 
-		data, rec := dec.Decode(d)
+		data, rec, _ := dec.Decode(d)
 		if data == nil {
 			t.Fatalf("packet %d: nil data", i)
 		}
@@ -147,7 +147,7 @@ func TestSlidingFEC_NoLoss(t *testing.T) {
 			t.Errorf("packet %d: false recovery", i)
 		}
 
-		_, rec = dec.Decode(r)
+		_, rec, _ = dec.Decode(r)
 		if len(rec) > 0 {
 			t.Errorf("repair %d: false recovery", i)
 		}
@@ -167,7 +167,7 @@ func TestSlidingFEC_RepairOnly(t *testing.T) {
 
 	// Feed only the repair — should not crash
 	// With all 4 data packets missing, can't recover (need exactly 1 missing)
-	data, rec := dec.Decode(r)
+	data, rec, _ := dec.Decode(r)
 	if data != nil {
 		t.Error("repair-only should not return data")
 	}

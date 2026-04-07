@@ -125,6 +125,11 @@ type SlidingFECDecoder struct {
 	maxRepairs int
 	maxAge     time.Duration
 
+	// Sequence tracking for gap detection — reports missing seqs to caller
+	// so ARQ can fire immediately, racing FEC recovery.
+	nextExpected   uint64
+	seqInitialized bool
+
 	recoveredCount uint64
 	failedCount    uint64
 }
@@ -154,10 +159,11 @@ func NewSlidingFECDecoder(maxRepairs int, maxAge time.Duration) *SlidingFECDecod
 }
 
 // Decode processes an incoming sliding FEC packet (data or repair).
-// Returns the data packet (for data type) and any recovered packets.
-func (d *SlidingFECDecoder) Decode(packet []byte) (data *DecodedPacket, recovered []*DecodedPacket) {
+// Returns the data packet (for data type), any recovered packets, and
+// sequences detected as missing (for immediate ARQ, racing FEC).
+func (d *SlidingFECDecoder) Decode(packet []byte) (data *DecodedPacket, recovered []*DecodedPacket, missing []uint64) {
 	if len(packet) < 2 {
-		return nil, nil
+		return nil, nil, nil
 	}
 
 	d.mu.Lock()
@@ -166,12 +172,28 @@ func (d *SlidingFECDecoder) Decode(packet []byte) (data *DecodedPacket, recovere
 	switch packet[0] {
 	case SlidingFECDataType:
 		if len(packet) < SlidingDataHeaderSize {
-			return nil, nil
+			return nil, nil, nil
 		}
 		seq := binary.BigEndian.Uint64(packet[2:10])
 		payload := make([]byte, len(packet)-SlidingDataHeaderSize)
 		copy(payload, packet[SlidingDataHeaderSize:])
 		data = &DecodedPacket{Data: payload, DataSeq: seq}
+
+		// Detect gaps BEFORE storing — these are missing sequences that
+		// ARQ should NACK immediately, racing FEC recovery.
+		if !d.seqInitialized {
+			d.nextExpected = seq + 1
+			d.seqInitialized = true
+		} else if seq > d.nextExpected {
+			for s := d.nextExpected; s < seq; s++ {
+				if _, ok := d.received[s]; !ok {
+					missing = append(missing, s)
+				}
+			}
+			d.nextExpected = seq + 1
+		} else if seq >= d.nextExpected {
+			d.nextExpected = seq + 1
+		}
 
 		// Store for future XOR recovery
 		stored := make([]byte, len(packet))
@@ -183,13 +205,13 @@ func (d *SlidingFECDecoder) Decode(packet []byte) (data *DecodedPacket, recovere
 
 	case SlidingFECRepairType:
 		if len(packet) < SlidingRepairHeaderSize {
-			return nil, nil
+			return nil, nil, nil
 		}
 		repairSeq := binary.BigEndian.Uint64(packet[2:10])
 		windowStart := binary.BigEndian.Uint64(packet[10:18])
 		windowSize := int(packet[18])
 		if windowSize <= 0 || windowSize > 32 {
-			return nil, nil // sanity check
+			return nil, nil, nil // sanity check
 		}
 		xorData := make([]byte, len(packet)-SlidingRepairHeaderSize)
 		copy(xorData, packet[SlidingRepairHeaderSize:])
@@ -208,7 +230,7 @@ func (d *SlidingFECDecoder) Decode(packet []byte) (data *DecodedPacket, recovere
 	}
 
 	d.evictOld()
-	return data, recovered
+	return data, recovered, missing
 }
 
 // tryRecoverAll checks all stored repairs for single-loss windows.
