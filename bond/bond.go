@@ -459,12 +459,19 @@ func (m *Manager) SetPreset(name string) error {
 
 	// Signal peers so they change their jitter buffer for us
 	m.peersMu.Lock()
-	for _, ps := range m.peers {
+	peerCount := len(m.peers)
+	sentCount := 0
+	for id, ps := range m.peers {
 		if ps.sendFunc != nil {
 			ps.sendFunc(buildPresetPacket(name))
+			sentCount++
+			m.logger.Info("preset control packet sent", "peer", id)
+		} else {
+			m.logger.Warn("peer has no sendFunc", "peer", id)
 		}
 	}
 	m.peersMu.Unlock()
+	m.logger.Info("preset signalled", "peers", peerCount, "sent", sentCount)
 
 	return nil
 }
