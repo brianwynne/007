@@ -220,6 +220,7 @@ func FieldPreset() Config {
 
 // peerState holds per-peer FEC, jitter buffer, ARQ, and path health state.
 type peerState struct {
+	peerID     uint32              // peer identifier (for SetPeerPreset)
 	encoder    *FECEncoder         // block FEC encoder
 	decoder    *FECDecoder         // block FEC decoder
 	slidingEnc *SlidingFECEncoder  // sliding-window FEC encoder
@@ -289,7 +290,7 @@ func (m *Manager) getPeerState(peerID uint32) *peerState {
 
 	ps, exists := m.peers[peerID]
 	if !exists {
-		ps = &peerState{}
+		ps = &peerState{peerID: peerID}
 		if m.config.FECEnabled {
 			switch m.config.FECMode {
 			case "sliding":
@@ -455,6 +456,56 @@ func (m *Manager) SetPreset(name string) error {
 		"preset", name,
 		"latency_budget_ms", cfg.LatencyBudgetMs,
 		"jitter_depth_ms", depthMs)
+
+	// Signal peers so they change their jitter buffer for us
+	m.peersMu.Lock()
+	for _, ps := range m.peers {
+		if ps.sendFunc != nil {
+			ps.sendFunc(buildPresetPacket(name))
+		}
+	}
+	m.peersMu.Unlock()
+
+	return nil
+}
+
+// SetPeerPreset changes the jitter buffer depth for a single peer.
+// Called when a peer signals its preset via a control packet.
+func (m *Manager) SetPeerPreset(peerID uint32, name string) error {
+	var budget int
+	switch name {
+	case "broadcast":
+		budget = 40
+	case "studio":
+		budget = 80
+	case "field":
+		budget = 200
+	default:
+		return fmt.Errorf("unknown preset: %s", name)
+	}
+
+	fecFill := (m.config.FECLowK - 1) * m.config.PacketIntervalMs
+	depthMs := budget - fecFill
+	if depthMs < m.config.PacketIntervalMs {
+		depthMs = m.config.PacketIntervalMs
+	}
+	depth := time.Duration(depthMs) * time.Millisecond
+
+	m.peersMu.Lock()
+	ps, ok := m.peers[peerID]
+	m.peersMu.Unlock()
+
+	if !ok {
+		return fmt.Errorf("peer %d not found", peerID)
+	}
+
+	if ps.jitterBuf != nil {
+		ps.jitterBuf.SetDepth(depth)
+		m.logger.Info("peer preset changed",
+			"peer", peerID,
+			"preset", name,
+			"jitter_depth_ms", depthMs)
+	}
 
 	return nil
 }
@@ -793,6 +844,12 @@ func (m *Manager) handleControl(ps *peerState, packet []byte, pathID int) [][]by
 			if ps.reorderBuf != nil {
 				ps.reorderBuf.UpdatePathRTT(pID, rtt)
 			}
+		}
+
+	case controlTypePreset:
+		preset := parsePresetPacket(packet)
+		if preset != "" {
+			m.SetPeerPreset(ps.peerID, preset)
 		}
 	}
 	return nil

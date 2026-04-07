@@ -311,6 +311,8 @@ cmd_revoke_token() {
 cmd_preset() {
     require_root
     local preset="${1:-}"
+    local target_ip="${2:-}"
+
     if [[ -z "$preset" ]]; then
         load_env
         local current="${BOND_PRESET:-field}"
@@ -320,7 +322,9 @@ cmd_preset() {
         echo "  studio      80ms latency, 60ms jitter buffer  — studio links"
         echo "  field      200ms latency, 180ms jitter buffer — WiFi + cellular"
         echo ""
-        echo "Usage: sudo 007-bond preset <broadcast|studio|field>"
+        echo "Usage:"
+        echo "  sudo 007-bond preset <name>       Set locally + signal all peers"
+        echo "  sudo 007-bond preset <name> <ip>  Set on a specific peer (remote help)"
         return
     fi
 
@@ -329,7 +333,20 @@ cmd_preset() {
         *) err "Unknown preset: $preset (use broadcast, studio, or field)"; exit 1 ;;
     esac
 
-    # Update .env for persistence across restarts
+    # Remote-only mode: push to a specific peer without changing local
+    if [[ -n "$target_ip" ]]; then
+        info "Setting preset on $target_ip to $preset..."
+        if curl -s --max-time 3 -X POST "http://${target_ip}:8007/api/preset" \
+            -H "Content-Type: application/json" \
+            -d "{\"preset\":\"$preset\"}" | grep -q '"ok"' 2>/dev/null; then
+            ok "$target_ip → $preset"
+        else
+            err "Could not reach $target_ip:8007"
+        fi
+        return
+    fi
+
+    # Update local .env for persistence across restarts
     if ! grep -q "^BOND_PRESET=" "$CONFIG_DIR/.env" 2>/dev/null; then
         echo "BOND_PRESET=$preset" >> "$CONFIG_DIR/.env"
     else
@@ -337,6 +354,8 @@ cmd_preset() {
     fi
 
     # Apply at runtime via API (no restart needed)
+    # SetPreset also sends a preset control packet to all peers,
+    # so the peer's jitter buffer for us changes automatically.
     load_env
     local api_addr="${BOND_API:-127.0.0.1:8007}"
     local api_key="${BOND_API_KEY:-}"
@@ -346,29 +365,17 @@ cmd_preset() {
     if curl -s --max-time 3 $auth_header -X POST "http://${api_addr}/api/preset" \
         -H "Content-Type: application/json" \
         -d "{\"preset\":\"$preset\"}" | grep -q '"ok"' 2>/dev/null; then
-        ok "Local preset changed to $preset (runtime, no restart)"
+        ok "Preset → $preset (applied locally + signalled to peers)"
     else
         info "Restarting service to apply preset..."
         systemctl restart "$SERVICE_NAME"
         sleep 2
-    fi
-
-    # Push to all connected peers via tunnel
-    for peer_ip in $(wg show bond0 allowed-ips 2>/dev/null | awk '{print $2}' | cut -d/ -f1); do
-        # Skip our own tunnel IP
-        load_env
-        local my_ip="${TUNNEL_IP%%/*}"
-        [[ "$peer_ip" == "$my_ip" ]] && continue
-
-        info "Pushing preset to peer $peer_ip..."
-        if curl -s --max-time 3 -X POST "http://${peer_ip}:8007/api/preset" \
-            -H "Content-Type: application/json" \
-            -d "{\"preset\":\"$preset\"}" | grep -q '"ok"' 2>/dev/null; then
-            ok "Peer $peer_ip → $preset"
+        if systemctl is-active --quiet "$SERVICE_NAME"; then
+            ok "Service restarted with $preset preset"
         else
-            warn "Peer $peer_ip — could not reach API (may need BOND_API=0.0.0.0:8007)"
+            err "Service failed to restart"
         fi
-    done
+    fi
 }
 
 cmd_help() {
@@ -382,7 +389,8 @@ cmd_help() {
     echo "  start               Start the service"
     echo "  stop                Stop the service"
     echo "  restart             Restart the service"
-    echo "  preset [name]       Show or set latency preset (broadcast/studio/field)"
+    echo "  preset [name]       Set latency preset locally + push to all peers"
+    echo "  preset [name] <ip>  Set preset on a specific peer (remote help)"
     echo "  add-client <key>    Add a WireGuard client peer"
     echo "  enroll-token [ip]   Generate one-time enrollment token for a client"
     echo "  list-tokens         Show pending enrollment tokens"

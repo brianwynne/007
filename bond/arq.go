@@ -29,9 +29,10 @@ import (
 // Rate limiting: max 1 NACK per 10ms to avoid flooding.
 
 const (
-	controlBlockID      = 0xFFFF // reserved FEC blockID for control packets
-	controlTypeNACK     = 1
+	controlBlockID        = 0xFFFF // reserved FEC blockID for control packets
+	controlTypeNACK       = 1
 	controlTypeRetransmit = 4
+	controlTypePreset     = 5
 
 	retransmitBufSize = 512   // packets in retransmit ring buffer
 	maxNACKNonces     = 32    // max nonces per NACK packet
@@ -225,6 +226,26 @@ func parseRetransmitPacket(pkt []byte) (dataSeq uint64, payload []byte) {
 		copy(payload, pkt[FECHeaderSize+8:])
 	}
 	return dataSeq, payload
+}
+
+// buildPresetPacket creates a control packet carrying a preset name.
+// Format: [blockID=0xFFFF][type=5][K=0][M=0][preset name bytes]
+func buildPresetPacket(preset string) []byte {
+	pkt := make([]byte, FECHeaderSize+len(preset))
+	binary.BigEndian.PutUint16(pkt[0:2], controlBlockID)
+	pkt[2] = controlTypePreset
+	pkt[3] = 0
+	pkt[4] = 0
+	copy(pkt[FECHeaderSize:], []byte(preset))
+	return pkt
+}
+
+// parsePresetPacket extracts the preset name from a preset control packet.
+func parsePresetPacket(pkt []byte) string {
+	if len(pkt) <= FECHeaderSize {
+		return ""
+	}
+	return string(pkt[FECHeaderSize:])
 }
 
 // isControlPacket checks if a packet is a bond control message (not data).
