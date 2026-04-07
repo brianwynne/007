@@ -105,6 +105,7 @@ type statsResponse struct {
 	NACKsReceived     uint64             `json:"nacks_received"`
 	ARQRetransmitOK   uint64             `json:"arq_retransmit_ok"`
 	ARQRetransmitMiss uint64             `json:"arq_retransmit_miss"`
+	ARQReceived       uint64             `json:"arq_received"`
 	ARQDeadlineSkip   uint64             `json:"arq_deadline_skip"`
 	Paths             []pathResponse     `json:"paths"`
 }
@@ -147,6 +148,7 @@ func (a *API) handleStats(w http.ResponseWriter, r *http.Request) {
 		NACKsReceived:     s.NACKsReceived,
 		ARQRetransmitOK:   s.ARQRetransmitOK,
 		ARQRetransmitMiss: s.ARQRetransmitMiss,
+		ARQReceived:       s.ARQReceived,
 		ARQDeadlineSkip:   s.ARQDeadlineSkip,
 	}
 

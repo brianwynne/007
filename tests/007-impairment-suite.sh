@@ -164,7 +164,7 @@ run_test() {
     fi
     local fec_before arq_before nack_before drop_before
     fec_before=$(extract_stat "$before" "fec_recovered")
-    arq_before=$(extract_stat "$before" "arq_retransmit_ok")
+    arq_before=$(extract_stat "$before" "arq_received")
     nack_before=$(extract_stat "$before" "nacks_sent")
     drop_before=$(extract_stat "$before" "drop_packets")
 
@@ -192,7 +192,7 @@ run_test() {
     fi
     local fec_after arq_after nack_after drop_after
     fec_after=$(extract_stat "$after" "fec_recovered")
-    arq_after=$(extract_stat "$after" "arq_retransmit_ok")
+    arq_after=$(extract_stat "$after" "arq_received")
     nack_after=$(extract_stat "$after" "nacks_sent")
     drop_after=$(extract_stat "$after" "drop_packets")
 
@@ -383,7 +383,7 @@ echo -e "${CYAN}--- F1: 200ms blackout ens6 ---${RESET}"
 {
     if [ "$SERVER_API_OK" = "true" ]; then before=$(get_server_stats); else before=$(get_stats); fi
     fec_before=$(extract_stat "$before" "fec_recovered")
-    arq_before=$(extract_stat "$before" "arq_retransmit_ok")
+    arq_before=$(extract_stat "$before" "arq_received")
     nack_before=$(extract_stat "$before" "nacks_sent")
     drop_before=$(extract_stat "$before" "drop_packets")
 
@@ -406,7 +406,7 @@ echo -e "${CYAN}--- F1: 200ms blackout ens6 ---${RESET}"
     if [ "$SERVER_API_OK" = "true" ]; then after=$(get_server_stats); else after=$(get_stats); fi
     d_fec=$(( $(extract_stat "$after" "fec_recovered") - fec_before ))
     d_nack=$(( $(extract_stat "$after" "nacks_sent") - nack_before ))
-    d_arq=$(( $(extract_stat "$after" "arq_retransmit_ok") - arq_before ))
+    d_arq=$(( $(extract_stat "$after" "arq_received") - arq_before ))
     d_drop=$(( $(extract_stat "$after" "drop_packets") - drop_before ))
 
     if [ "$rx" -ge 26 ]; then verdict="PASS"; else verdict="FAIL"; fi
@@ -419,7 +419,7 @@ echo -e "${CYAN}--- F2: 500ms blackout ALL paths ---${RESET}"
 {
     if [ "$SERVER_API_OK" = "true" ]; then before=$(get_server_stats); else before=$(get_stats); fi
     fec_before=$(extract_stat "$before" "fec_recovered")
-    arq_before=$(extract_stat "$before" "arq_retransmit_ok")
+    arq_before=$(extract_stat "$before" "arq_received")
     nack_before=$(extract_stat "$before" "nacks_sent")
     drop_before=$(extract_stat "$before" "drop_packets")
 
@@ -440,7 +440,7 @@ echo -e "${CYAN}--- F2: 500ms blackout ALL paths ---${RESET}"
     if [ "$SERVER_API_OK" = "true" ]; then after=$(get_server_stats); else after=$(get_stats); fi
     d_fec=$(( $(extract_stat "$after" "fec_recovered") - fec_before ))
     d_nack=$(( $(extract_stat "$after" "nacks_sent") - nack_before ))
-    d_arq=$(( $(extract_stat "$after" "arq_retransmit_ok") - arq_before ))
+    d_arq=$(( $(extract_stat "$after" "arq_received") - arq_before ))
     d_drop=$(( $(extract_stat "$after" "drop_packets") - drop_before ))
 
     # Expect some loss during 500ms blackout — pass if we recover most
@@ -584,7 +584,7 @@ run_single_path_test() {
     srv_before=$(get_server_stats)
     local fec_before arq_before nack_before drop_before
     fec_before=$(extract_stat "$srv_before" "fec_recovered")
-    arq_before=$(extract_stat "$srv_before" "arq_retransmit_ok")
+    arq_before=$(extract_stat "$srv_before" "arq_received")
     nack_before=$(extract_stat "$srv_before" "nacks_sent")
     drop_before=$(extract_stat "$srv_before" "drop_packets")
 
@@ -607,7 +607,7 @@ run_single_path_test() {
     srv_after=$(get_server_stats)
     local fec_after arq_after nack_after drop_after
     fec_after=$(extract_stat "$srv_after" "fec_recovered")
-    arq_after=$(extract_stat "$srv_after" "arq_retransmit_ok")
+    arq_after=$(extract_stat "$srv_after" "arq_received")
     nack_after=$(extract_stat "$srv_after" "nacks_sent")
     drop_after=$(extract_stat "$srv_after" "drop_packets")
 

@@ -255,6 +255,7 @@ type Manager struct {
 	nacksReceived    atomic.Uint64
 	arqRetransmitOK  atomic.Uint64
 	arqRetransmitMiss atomic.Uint64
+	arqReceived      atomic.Uint64 // retransmissions received from peer
 	arqDeadlineSkip  atomic.Uint64
 
 	// Lifecycle
@@ -716,6 +717,7 @@ func (m *Manager) handleControl(ps *peerState, packet []byte, pathID int) [][]by
 	case controlTypeRetransmit:
 		seq, payload := parseRetransmitPacket(packet)
 		if payload != nil {
+			m.arqReceived.Add(1)
 			if ps.jitterBuf != nil {
 				ps.jitterBuf.Insert(payload, seq, sourceARQ)
 				return nil
@@ -944,6 +946,7 @@ type Stats struct {
 	NACKsReceived     uint64
 	ARQRetransmitOK   uint64
 	ARQRetransmitMiss uint64
+	ARQReceived       uint64
 	ARQDeadlineSkip   uint64
 	Paths             []PathHealthSnapshot
 }
@@ -960,6 +963,7 @@ func (m *Manager) GetStats() Stats {
 		NACKsReceived:     m.nacksReceived.Load(),
 		ARQRetransmitOK:   m.arqRetransmitOK.Load(),
 		ARQRetransmitMiss: m.arqRetransmitMiss.Load(),
+		ARQReceived:       m.arqReceived.Load(),
 		ARQDeadlineSkip:   m.arqDeadlineSkip.Load(),
 	}
 
