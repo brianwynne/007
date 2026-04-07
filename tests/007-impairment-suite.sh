@@ -459,6 +459,210 @@ run_test "H2: Burst W+1=6 (exceeds window, ARQ)" \
     10 1 1
 
 # ============================================================================
+# I. SINGLE-PATH TESTS (FEC/ARQ Isolation)
+# ============================================================================
+# Multi-path sends every packet on ALL interfaces. Independent per-interface
+# loss means compound loss probability is very low (e.g. 30% per path = 9%
+# both). FEC never activates because path diversity absorbs the loss.
+#
+# These tests clear bond endpoints so only the primary WireGuard path remains.
+# With a single path, tc/netem loss hits every packet — FEC and ARQ MUST work.
+# ============================================================================
+echo ""
+echo -e "${BOLD}=== I. Single-Path Tests (FEC/ARQ Isolation) ===${RESET}"
+
+# Get WireGuard peer info for UAPI restore
+WG_SOCK="/var/run/wireguard/bond0.sock"
+WG_ENDPOINT=$(wg show bond0 endpoints 2>/dev/null | awk '{print $2}' | head -1)
+WG_PEER_PUB=$(wg show bond0 peers 2>/dev/null | head -1)
+WG_PEER_PUB_HEX=$(echo "$WG_PEER_PUB" | base64 -d 2>/dev/null | xxd -p -c 32 2>/dev/null || echo "")
+WG_SERVER_IP=$(echo "$WG_ENDPOINT" | cut -d: -f1)
+
+if [ -z "$WG_PEER_PUB_HEX" ] || [ -z "$WG_SERVER_IP" ]; then
+    echo -e "  ${RED}[SKIP]${RESET} Cannot determine WireGuard peer info for UAPI — skipping single-path tests"
+else
+
+# Detect all bond-eligible interfaces and their local IPs (for restore)
+declare -a BOND_IFACES=()
+declare -a BOND_LOCAL_IPS=()
+for iface in $(ip -4 -o addr show scope global | awk '{print $2}' | sort -u); do
+    [ "$iface" = "bond0" ] && continue
+    local_ip=$(ip -4 addr show "$iface" | grep inet | awk '{print $2}' | cut -d/ -f1 | head -1)
+    if [ -n "$local_ip" ]; then
+        BOND_IFACES+=("$iface")
+        BOND_LOCAL_IPS+=("$local_ip")
+    fi
+done
+
+# Function: clear bond endpoints (single-path mode)
+enter_single_path() {
+    printf "set=1\npublic_key=%s\nclear_bond_endpoints=true\n\n" "$WG_PEER_PUB_HEX" \
+        | nc -U "$WG_SOCK" -w 1 2>/dev/null || true
+    sleep 0.5
+}
+
+# Function: restore bond endpoints (multi-path mode)
+restore_bond_paths() {
+    local cmd="set=1\npublic_key=${WG_PEER_PUB_HEX}\n"
+    for i in "${!BOND_LOCAL_IPS[@]}"; do
+        cmd="${cmd}bond_endpoint=${WG_SERVER_IP}:51820@${BOND_LOCAL_IPS[$i]}\n"
+    done
+    printf "${cmd}\n" | nc -U "$WG_SOCK" -w 1 2>/dev/null || true
+    sleep 1
+}
+
+# Determine primary interface (the one WireGuard endpoint is bound to)
+PRIMARY_IFACE="$IFACE1"
+for i in "${!BOND_LOCAL_IPS[@]}"; do
+    if ip -4 addr show "${BOND_IFACES[$i]}" | grep -q "$WG_SERVER_IP" 2>/dev/null; then
+        PRIMARY_IFACE="${BOND_IFACES[$i]}"
+    fi
+done
+# The primary interface is whichever carries the WG endpoint traffic
+# For netem, we apply to IFACE1 (ens5) which is typically the primary path
+echo -e "  ${CYAN}Primary interface for single-path: $IFACE1${RESET}"
+echo -e "  ${CYAN}Bond paths will be cleared, traffic forced through primary WG path${RESET}"
+
+# Wrapper for single-path tests
+run_single_path_test() {
+    local name="$1"
+    local setup_fn="$2"
+    local min_rx="$3"
+    local expect_fec="${4:-0}"
+    local expect_arq="${5:-0}"
+
+    echo ""
+    echo -e "${CYAN}--- $name ---${RESET}"
+
+    # Clean tc and enter single-path mode
+    cleanup_tc
+    cleanup_links
+    enter_single_path
+    sleep 0.5
+
+    # Verify single-path connectivity
+    if ! ping -c 2 -W 3 "$SERVER" > /dev/null 2>&1; then
+        echo -e "  ${RED}[SKIP]${RESET} $name — tunnel not reachable in single-path mode"
+        restore_bond_paths
+        return
+    fi
+
+    # Stats before
+    local before
+    before=$(get_stats)
+    local fec_before arq_before nack_before drop_before
+    fec_before=$(extract_stat "$before" "fec_recovered")
+    arq_before=$(extract_stat "$before" "arq_retransmit_ok")
+    nack_before=$(extract_stat "$before" "nacks_sent")
+    drop_before=$(extract_stat "$before" "drop_packets")
+
+    # Apply impairment to ALL interfaces (only primary matters, but be safe)
+    eval "$setup_fn"
+    sleep 0.3
+
+    # Run traffic — more packets for statistical significance
+    local ping_out
+    ping_out=$(run_ping 50 "$PING_INTERVAL")
+    local rx
+    rx=$(count_received "$ping_out")
+
+    # Remove impairment
+    cleanup_tc
+
+    # Stats after
+    sleep 0.5
+    local after
+    after=$(get_stats)
+    local fec_after arq_after nack_after drop_after
+    fec_after=$(extract_stat "$after" "fec_recovered")
+    arq_after=$(extract_stat "$after" "arq_retransmit_ok")
+    nack_after=$(extract_stat "$after" "nacks_sent")
+    drop_after=$(extract_stat "$after" "drop_packets")
+
+    # Deltas
+    local d_fec d_arq d_nack d_drop
+    d_fec=$((fec_after - fec_before))
+    d_arq=$((arq_after - arq_before))
+    d_nack=$((nack_after - nack_before))
+    d_drop=$((drop_after - drop_before))
+
+    # Determine verdict
+    local verdict="PASS"
+    local detail="[single-path]"
+
+    if [ "$rx" -lt "$min_rx" ]; then
+        verdict="FAIL"
+        detail="$detail (rx below threshold $min_rx)"
+    fi
+
+    if [ "$expect_fec" -eq 1 ] && [ "$d_fec" -eq 0 ]; then
+        verdict="FAIL"
+        detail="$detail (EXPECTED FEC recovery, got 0)"
+    fi
+
+    if [ "$expect_arq" -eq 1 ] && [ "$d_arq" -eq 0 ] && [ "$d_nack" -eq 0 ]; then
+        detail="$detail (expected ARQ activity, got 0)"
+    fi
+
+    record_result "$name" "$verdict" "$rx/50" "$d_fec" "$d_arq" "$d_drop" "$detail"
+
+    # Restore bond paths for next test
+    restore_bond_paths
+}
+
+# I1: 10% random loss, single path — FEC MUST recover some packets
+# With W=5 sliding XOR, single isolated losses within any window are recoverable
+run_single_path_test "I1: 10% loss single-path (FEC must recover)" \
+    "tc qdisc add dev $IFACE1 root netem loss 10%; tc qdisc add dev $IFACE2 root netem loss 10%" \
+    40 1 0
+
+# I2: 20% random loss, single path — heavy FEC + ARQ stress
+run_single_path_test "I2: 20% loss single-path (FEC+ARQ stress)" \
+    "tc qdisc add dev $IFACE1 root netem loss 20%; tc qdisc add dev $IFACE2 root netem loss 20%" \
+    30 1 1
+
+# I3: 2-packet burst loss, single path — sliding FEC window recovery
+# gemodel p=2%, r=50% => avg burst ~2 pkts
+run_single_path_test "I3: 2-pkt burst single-path (FEC window)" \
+    "tc qdisc add dev $IFACE1 root netem loss gemodel 2% 50%; tc qdisc add dev $IFACE2 root netem loss gemodel 2% 50%" \
+    38 1 0
+
+# I4: 5-packet burst, single path — at W=5 limit, FEC should partially recover
+# gemodel p=5%, r=20% => avg burst ~5 pkts
+run_single_path_test "I4: 5-pkt burst single-path (W=5 limit)" \
+    "tc qdisc add dev $IFACE1 root netem loss gemodel 5% 20%; tc qdisc add dev $IFACE2 root netem loss gemodel 5% 20%" \
+    25 1 1
+
+# I5: 10-packet burst, single path — exceeds FEC, ARQ MUST recover
+# gemodel p=8%, r=10% => avg burst ~10 pkts
+run_single_path_test "I5: 10-pkt burst single-path (ARQ must help)" \
+    "tc qdisc add dev $IFACE1 root netem loss gemodel 8% 10%; tc qdisc add dev $IFACE2 root netem loss gemodel 8% 10%" \
+    15 1 1
+
+# I6: 5% loss + 20ms jitter, single path — realistic single-link conditions
+run_single_path_test "I6: 5% loss + jitter single-path (realistic)" \
+    "tc qdisc add dev $IFACE1 root netem loss 5% delay 20ms 10ms distribution normal; tc qdisc add dev $IFACE2 root netem loss 5% delay 20ms 10ms distribution normal" \
+    40 1 0
+
+# I7: 30% loss, single path — extreme stress, many FEC + ARQ recoveries expected
+run_single_path_test "I7: 30% loss single-path (extreme stress)" \
+    "tc qdisc add dev $IFACE1 root netem loss 30%; tc qdisc add dev $IFACE2 root netem loss 30%" \
+    20 1 1
+
+# I8: 3% loss + reorder, single path — ARQ must NOT false-trigger on reorder
+run_single_path_test "I8: 3% loss + reorder single-path (false NACK)" \
+    "tc qdisc add dev $IFACE1 root netem loss 3% delay 10ms reorder 70%; tc qdisc add dev $IFACE2 root netem loss 3% delay 10ms reorder 70%" \
+    40 1 0
+
+echo ""
+echo -e "  ${CYAN}Bond paths restored — back to multi-path mode${RESET}"
+
+fi  # end WG_PEER_PUB_HEX check
+
+# Allow bond paths to stabilise after restore
+sleep 2
+
+# ============================================================================
 # Verify tunnel still works after all tests
 # ============================================================================
 echo ""
@@ -518,10 +722,12 @@ echo -e "${BOLD}================================================================
 echo -e "${BOLD}  MINIMUM VALIDATION SUITE (run these 5 first)${RESET}"
 echo -e "${BOLD}================================================================${RESET}"
 echo "  1. A1 — 5% single-path loss (confirms path diversity works)"
-echo "  2. A2 — 10% all-path loss (confirms FEC is recovering packets)"
-echo "  3. B2 — 5-pkt burst all paths (stresses sliding FEC window W=5)"
-echo "  4. C2 — Extreme delay asymmetry (confirms reorder buffer handles it)"
-echo "  5. F1 — 200ms single-path blackout (confirms failover works)"
+echo "  2. I1 — 10% loss single-path (confirms FEC actually recovers packets)"
+echo "  3. I4 — 5-pkt burst single-path (stresses sliding FEC window W=5)"
+echo "  4. I5 — 10-pkt burst single-path (confirms ARQ recovers beyond FEC)"
+echo "  5. C2 — Extreme delay asymmetry (confirms reorder buffer handles it)"
+echo "  6. F1 — 200ms single-path blackout (confirms failover works)"
+echo "  7. A2 — 10% all-path loss (confirms multi-path absorbs loss)"
 
 # ============================================================================
 # FAILURE DIAGNOSIS GUIDE
@@ -581,6 +787,22 @@ echo "  5. F1 — 200ms single-path blackout (confirms failover works)"
 # G tests fail (combined scenarios):
 #   -> Usually indicates a specific subsystem struggling under combined load
 #   -> Run the individual component tests (A/B/C/D/E) to isolate
+#
+# I1-I8 single-path tests — fec_recovered still 0:
+#   -> Bond endpoints not actually cleared. Check UAPI socket path.
+#   -> Verify with: wg show bond0 — should show no bond endpoints
+#   -> If tunnel unreachable in single-path: WG endpoint may be on ens6, not ens5
+#   -> If FEC recovering but verdict FAIL: repair packets also lost (expected at high loss)
+#
+# I1-I8 — tunnel unreachable after clearing bond endpoints:
+#   -> Primary WireGuard path uses a different interface than expected
+#   -> WG endpoint bound to ens6 but tc applied to ens5
+#   -> Fix: apply netem to ALL interfaces in single-path tests (already done)
+#
+# I5 — ARQ not recovering despite bursts exceeding FEC:
+#   -> Retransmit arriving after playout deadline
+#   -> Check arq_deadline_skip — if high, playout buffer too shallow
+#   -> Or: NACKs themselves lost in the impaired path
 #
 # General: fec_recovered always 0:
 #   -> FEC not enabled. Check BOND_FEC_MODE env var.
