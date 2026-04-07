@@ -477,6 +477,7 @@ func (m *Manager) ProcessInbound(peerID uint32, packet []byte, nonce uint64, pat
 		var result [][]byte
 
 		if ps.jitterBuf != nil {
+			// Step 1: Insert data packet (detects gaps in sequence)
 			if data != nil {
 				if isControlPacket(data.Data) {
 					m.handleControl(ps, data.Data, pathID)
@@ -484,13 +485,11 @@ func (m *Manager) ProcessInbound(peerID uint32, packet []byte, nonce uint64, pat
 					ps.jitterBuf.Insert(data.Data, data.DataSeq, sourceData)
 				}
 			}
-			for _, rec := range recovered {
-				if isControlPacket(rec.Data) {
-					m.handleControl(ps, rec.Data, pathID)
-				} else {
-					ps.jitterBuf.Insert(rec.Data, rec.DataSeq, sourceFEC)
-				}
-			}
+
+			// Step 2: Fire ARQ BEFORE inserting FEC-recovered packets.
+			// ARQ races FEC — NACK every gap immediately. If FEC recovers
+			// the packet, the retransmit arrives as a harmless duplicate.
+			// If FEC fails, ARQ is already in flight.
 			if m.config.ARQEnabled {
 				earlyNonces := ps.jitterBuf.DrainEarlyNACK()
 				for _, n := range earlyNonces {
@@ -516,6 +515,15 @@ func (m *Manager) ProcessInbound(peerID uint32, packet []byte, nonce uint64, pat
 				}
 				if len(earlyNonces) > 0 {
 					m.triggerNACK(ps)
+				}
+			}
+
+			// Step 3: Insert FEC-recovered packets (fills gaps that ARQ is already racing)
+			for _, rec := range recovered {
+				if isControlPacket(rec.Data) {
+					m.handleControl(ps, rec.Data, pathID)
+				} else {
+					ps.jitterBuf.Insert(rec.Data, rec.DataSeq, sourceFEC)
 				}
 			}
 			return result
@@ -549,19 +557,13 @@ func (m *Manager) ProcessInbound(peerID uint32, packet []byte, nonce uint64, pat
 					ps.jitterBuf.Insert(data.Data, data.DataSeq, sourceData)
 				}
 			}
-			// Insert recovered packets (FEC fills gaps within the buffer window)
-			for _, rec := range recovered {
-				if isControlPacket(rec.Data) {
-					m.handleControl(ps, rec.Data, pathID)
-				} else {
-					ps.jitterBuf.Insert(rec.Data, rec.DataSeq, sourceFEC)
-				}
-			}
-			// Early NACKs from jitter buffer gap detection
+			// Step 2: Fire ARQ BEFORE inserting FEC-recovered packets.
+			// ARQ races FEC — NACK every gap immediately. If FEC recovers
+			// the packet, the retransmit arrives as a harmless duplicate.
+			// If FEC fails, ARQ is already in flight.
 			if m.config.ARQEnabled {
 				earlyNonces := ps.jitterBuf.DrainEarlyNACK()
 				for _, n := range earlyNonces {
-					// Check if retransmit can arrive before playout deadline
 					if m.config.ARQDeadlineCheck {
 						deadline := ps.jitterBuf.PlayoutDeadline(n)
 						if !deadline.IsZero() {
@@ -584,6 +586,14 @@ func (m *Manager) ProcessInbound(peerID uint32, packet []byte, nonce uint64, pat
 				}
 				if len(earlyNonces) > 0 {
 					m.triggerNACK(ps)
+				}
+			}
+			// Step 3: Insert FEC-recovered packets (fills gaps that ARQ is already racing)
+			for _, rec := range recovered {
+				if isControlPacket(rec.Data) {
+					m.handleControl(ps, rec.Data, pathID)
+				} else {
+					ps.jitterBuf.Insert(rec.Data, rec.DataSeq, sourceFEC)
 				}
 			}
 			// Jitter buffer delivers via callback — return nil
