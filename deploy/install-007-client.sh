@@ -46,6 +46,7 @@ CONFIG_DIR="/etc/007"
 DATA_DIR="/var/lib/007"
 LOG_DIR="/var/log/007"
 SERVICE_NAME="007-bond"
+SERVICE_USER="bond007"
 INTERFACE="bond0"
 TUNNEL_IP="10.7.0.2/24"
 SERVER_PORT="51820"
@@ -122,6 +123,15 @@ for pkg in wireguard-tools curl jq; do
     fi
 done
 
+# ─── Create service user ─────────────────────────────────────────────────
+if ! id "$SERVICE_USER" > /dev/null 2>&1; then
+    info "Creating service user: $SERVICE_USER"
+    useradd --system --no-create-home --shell /usr/sbin/nologin "$SERVICE_USER"
+    ok "User created: $SERVICE_USER"
+else
+    ok "User exists: $SERVICE_USER"
+fi
+
 # ─── Stop existing service ───────────────────────────────────────────────
 if systemctl is-active --quiet "$SERVICE_NAME" 2>/dev/null; then
     info "Stopping $SERVICE_NAME..."
@@ -158,12 +168,17 @@ mv "$INSTALL_DIR/007.new" "$INSTALL_DIR/007"
 ok "Binary installed: $INSTALLED_VERSION"
 
 # ─── Create directories ──────────────────────────────────────────────────
-mkdir -p "$CONFIG_DIR" "$DATA_DIR" "$LOG_DIR"
+mkdir -p "$CONFIG_DIR" "$DATA_DIR" "$LOG_DIR" /var/run/wireguard
+chown "$SERVICE_USER":"$SERVICE_USER" "$INSTALL_DIR" "$DATA_DIR" "$LOG_DIR"
+chown root:"$SERVICE_USER" "$CONFIG_DIR"
+chmod 750 "$CONFIG_DIR"
+chown "$SERVICE_USER":"$SERVICE_USER" /var/run/wireguard
 
 # ─── Save WireGuard keys (first install only) ────────────────────────────
 if [[ ! -f "$CONFIG_DIR/client.key" && -n "$CLI_KEY" ]]; then
     info "Saving WireGuard keys..."
     echo "$CLI_KEY" > "$CONFIG_DIR/client.key"
+    chown "$SERVICE_USER":"$SERVICE_USER" "$CONFIG_DIR/client.key"
     chmod 600 "$CONFIG_DIR/client.key"
     ok "Client private key saved"
 fi
@@ -201,7 +216,8 @@ CONFIG_DIR=$CONFIG_DIR
 DATA_DIR=$DATA_DIR
 LOG_DIR=$LOG_DIR
 EOF
-    chmod 600 "$CONFIG_DIR/.env"
+    chown root:"$SERVICE_USER" "$CONFIG_DIR/.env"
+    chmod 640 "$CONFIG_DIR/.env"
     ok "Configuration created: $CONFIG_DIR/.env"
 else
     ok "Existing configuration preserved"
@@ -298,6 +314,8 @@ Wants=network-online.target
 
 [Service]
 Type=simple
+User=$SERVICE_USER
+Group=$SERVICE_USER
 EnvironmentFile=$CONFIG_DIR/.env
 ExecStart=$INSTALL_DIR/007 -f \${INTERFACE}
 ExecStartPost=$INSTALL_DIR/setup-wg.sh
@@ -312,6 +330,10 @@ StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=007-bond
 
+# Capabilities — 007 needs network admin for TUN/WireGuard, not full root
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_NET_BIND_SERVICE
+
 # Security hardening
 NoNewPrivileges=true
 ProtectHome=true
@@ -319,6 +341,8 @@ ProtectKernelTunables=true
 ProtectKernelModules=true
 ProtectControlGroups=true
 RestrictSUIDSGID=true
+PrivateTmp=true
+ProtectSystem=strict
 ReadWritePaths=$DATA_DIR $LOG_DIR /var/run/wireguard
 
 [Install]
@@ -336,6 +360,10 @@ Requires=${SERVICE_NAME}.service
 
 [Service]
 Type=oneshot
+User=$SERVICE_USER
+Group=$SERVICE_USER
+AmbientCapabilities=CAP_NET_ADMIN
+CapabilityBoundingSet=CAP_NET_ADMIN
 ExecStart=$INSTALL_DIR/add-bond-paths.sh
 StandardOutput=journal
 SyslogIdentifier=007-bond-paths
