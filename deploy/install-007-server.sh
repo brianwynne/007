@@ -169,6 +169,8 @@ TUNNEL_IP=$TUNNEL_IP
 LISTEN_PORT=$LISTEN_PORT
 
 # Bond features
+# Presets: broadcast (40ms), studio (80ms), field (200ms)
+BOND_PRESET=field
 BOND_FEC_MODE=sliding
 BOND_API=$API_ADDR
 BOND_API_KEY=$API_KEY

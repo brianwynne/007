@@ -206,7 +206,18 @@ func main() {
 	dev := device.NewDevice(tdev, conn.NewDefaultBind(), logger)
 
 	// 007 Bond: Create and attach bond manager
-	bondCfg := bond.DefaultConfig()
+	// Preset selects base configuration; individual BOND_* vars override.
+	var bondCfg bond.Config
+	switch os.Getenv("BOND_PRESET") {
+	case "broadcast":
+		bondCfg = bond.BroadcastPreset() // 40ms latency, K=2 M=2
+	case "studio":
+		bondCfg = bond.StudioPreset() // 80ms latency, K=2 M=2
+	case "field":
+		bondCfg = bond.FieldPreset() // 200ms latency, K=2 M=4
+	default:
+		bondCfg = bond.DefaultConfig() // field preset
+	}
 	// Allow disabling bond features via environment
 	if os.Getenv("BOND_FEC") == "0" {
 		bondCfg.FECEnabled = false
