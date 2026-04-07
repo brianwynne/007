@@ -794,6 +794,7 @@ func (m *Manager) handleControl(ps *peerState, packet []byte, pathID int) [][]by
 		return nil
 	}
 	controlType := packet[2]
+	m.logger.Info("handleControl", "type", controlType, "len", len(packet))
 
 	switch controlType {
 	case controlTypeNACK:
@@ -855,6 +856,7 @@ func (m *Manager) handleControl(ps *peerState, packet []byte, pathID int) [][]by
 
 	case controlTypePreset:
 		preset := parsePresetPacket(packet)
+		m.logger.Info("received preset control packet", "preset", preset, "peer", ps.peerID, "len", len(packet))
 		if preset != "" {
 			m.SetPeerPreset(ps.peerID, preset)
 		}
