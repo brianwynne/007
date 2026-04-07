@@ -74,15 +74,19 @@ TAG=""
 SRV_IP="${SERVER_IP:-}"
 SRV_PUB="${SERVER_PUB:-}"
 CLI_KEY="${CLIENT_KEY:-}"
+ENROLL_URL="${ENROLL_URL:-}"
+ENROLL_TOKEN="${ENROLL_TOKEN:-}"
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --tag)        TAG="$2"; shift 2 ;;
-        --server-ip)  SRV_IP="$2"; shift 2 ;;
-        --server-pub) SRV_PUB="$2"; shift 2 ;;
-        --client-key) CLI_KEY="$2"; shift 2 ;;
+        --tag)         TAG="$2"; shift 2 ;;
+        --server-ip)   SRV_IP="$2"; shift 2 ;;
+        --server-pub)  SRV_PUB="$2"; shift 2 ;;
+        --client-key)  CLI_KEY="$2"; shift 2 ;;
         --server-port) SERVER_PORT="$2"; shift 2 ;;
-        *)            die "Unknown argument: $1" ;;
+        --enroll)      ENROLL_URL="$2"; shift 2 ;;
+        --token)       ENROLL_TOKEN="$2"; shift 2 ;;
+        *)             die "Unknown argument: $1" ;;
     esac
 done
 
@@ -108,10 +112,23 @@ if [[ -f "$CONFIG_DIR/.env" ]]; then
 fi
 
 # Validate required params for fresh install
+ENROLL_MODE=false
 if [[ "$UPGRADE" == "false" ]]; then
-    [[ -n "$SRV_IP" ]]  || die "SERVER_IP required (env var or --server-ip)"
-    [[ -n "$SRV_PUB" ]] || die "SERVER_PUB required (env var or --server-pub)"
-    [[ -n "$CLI_KEY" ]] || die "CLIENT_KEY required (env var or --client-key)"
+    if [[ -n "$ENROLL_URL" && -n "$ENROLL_TOKEN" ]]; then
+        ENROLL_MODE=true
+        info "Enrollment mode: will exchange keys with $ENROLL_URL"
+    elif [[ -n "$SRV_IP" && -n "$SRV_PUB" && -n "$CLI_KEY" ]]; then
+        : # Manual key mode — all params provided
+    else
+        echo ""
+        echo "Usage — either provide keys directly:"
+        echo "  sudo SERVER_IP=x SERVER_PUB=x CLIENT_KEY=x bash $0"
+        echo ""
+        echo "Or use enrollment (recommended):"
+        echo "  sudo ENROLL_URL=http://server:8017 ENROLL_TOKEN=<token> bash $0"
+        echo ""
+        die "Missing required parameters"
+    fi
 fi
 
 # ─── Install system dependencies ─────────────────────────────────────────
@@ -173,6 +190,35 @@ chown "$SERVICE_USER":"$SERVICE_USER" "$INSTALL_DIR" "$DATA_DIR" "$LOG_DIR"
 chown root:"$SERVICE_USER" "$CONFIG_DIR"
 chmod 750 "$CONFIG_DIR"
 chown "$SERVICE_USER":"$SERVICE_USER" /var/run/wireguard
+
+# ─── Enrollment key exchange ──────────────────────────────────────────────
+if [[ "$ENROLL_MODE" == "true" && ! -f "$CONFIG_DIR/client.key" ]]; then
+    info "Generating local WireGuard keypair..."
+    CLI_KEY=$(wg genkey)
+    CLI_PUB=$(echo "$CLI_KEY" | wg pubkey)
+
+    info "Enrolling with server at $ENROLL_URL..."
+    ENROLL_RESP=$(curl -fsSL --max-time 10 \
+        -X POST "$ENROLL_URL/api/enroll" \
+        -H "Content-Type: application/json" \
+        -d "{\"token\": \"$ENROLL_TOKEN\", \"public_key\": \"$CLI_PUB\"}" \
+        2>/dev/null) || die "Enrollment failed — check ENROLL_URL and token"
+
+    # Parse response
+    ENROLL_STATUS=$(echo "$ENROLL_RESP" | jq -r '.status // empty' 2>/dev/null)
+    if [[ "$ENROLL_STATUS" != "enrolled" ]]; then
+        ENROLL_ERR=$(echo "$ENROLL_RESP" | jq -r '.error // "unknown error"' 2>/dev/null)
+        die "Enrollment rejected: $ENROLL_ERR"
+    fi
+
+    SRV_PUB=$(echo "$ENROLL_RESP" | jq -r '.server_pub')
+    TUNNEL_IP=$(echo "$ENROLL_RESP" | jq -r '.tunnel_ip')/24
+    ENDPOINT=$(echo "$ENROLL_RESP" | jq -r '.endpoint')
+    SRV_IP=$(echo "$ENDPOINT" | cut -d: -f1)
+    SERVER_PORT=$(echo "$ENDPOINT" | cut -d: -f2)
+
+    ok "Enrolled — tunnel IP: ${TUNNEL_IP%/*}, server: $ENDPOINT"
+fi
 
 # ─── Save WireGuard keys (first install only) ────────────────────────────
 if [[ ! -f "$CONFIG_DIR/client.key" && -n "$CLI_KEY" ]]; then

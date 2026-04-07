@@ -267,6 +267,55 @@ EOF
 systemctl daemon-reload
 ok "Systemd service created: $SERVICE_NAME"
 
+# ─── Install enrollment service ──────────────────────────────────────────
+info "Installing enrollment service..."
+curl -fsSL "https://raw.githubusercontent.com/$REPO/main/deploy/enroll-server.sh" -o "$INSTALL_DIR/enroll-server.sh" 2>/dev/null \
+    || cp "$(dirname "$0")/enroll-server.sh" "$INSTALL_DIR/enroll-server.sh" 2>/dev/null \
+    || warn "Could not install enrollment service"
+
+if [[ -f "$INSTALL_DIR/enroll-server.sh" ]]; then
+    chmod +x "$INSTALL_DIR/enroll-server.sh"
+    chown "$SERVICE_USER":"$SERVICE_USER" "$INSTALL_DIR/enroll-server.sh"
+    mkdir -p "$CONFIG_DIR/tokens"
+    chown "$SERVICE_USER":"$SERVICE_USER" "$CONFIG_DIR/tokens"
+
+    cat > "/etc/systemd/system/${SERVICE_NAME}-enroll.service" << EOF
+[Unit]
+Description=007 Bond — Client Enrollment Service
+After=${SERVICE_NAME}.service
+Requires=${SERVICE_NAME}.service
+
+[Service]
+Type=simple
+User=$SERVICE_USER
+Group=$SERVICE_USER
+EnvironmentFile=$CONFIG_DIR/.env
+Environment=ENROLL_PORT=8017
+ExecStart=$INSTALL_DIR/enroll-server.sh
+
+AmbientCapabilities=CAP_NET_ADMIN
+CapabilityBoundingSet=CAP_NET_ADMIN
+
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=007-enroll
+
+NoNewPrivileges=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=$CONFIG_DIR/tokens /var/run/wireguard
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    systemctl daemon-reload
+    systemctl enable "${SERVICE_NAME}-enroll" > /dev/null 2>&1
+    systemctl start "${SERVICE_NAME}-enroll" 2>/dev/null || true
+    ok "Enrollment service on port 8017"
+fi
+
 # ─── Firewall ────────────────────────────────────────────────────────────
 if command -v ufw > /dev/null 2>&1; then
     info "Configuring firewall..."
@@ -275,6 +324,8 @@ if command -v ufw > /dev/null 2>&1; then
 
     # Allow API from tunnel only
     ufw allow from 10.7.0.0/24 to any port 8007 proto tcp comment "007 API (tunnel only)" > /dev/null 2>&1 || true
+    # Enrollment port — open to all (token-authenticated, one-time use)
+    ufw allow 8017/tcp comment "007 enrollment" > /dev/null 2>&1 || true
 
     if ! ufw status | grep -q "Status: active"; then
         ufw --force enable > /dev/null 2>&1

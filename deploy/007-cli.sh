@@ -225,6 +225,89 @@ cmd_uninstall() {
     echo "  To fully remove: sudo rm -rf $CONFIG_DIR /var/lib/007 /var/log/007"
 }
 
+cmd_enroll_token() {
+    require_root
+    local tunnel_ip="${1:-}"
+    local token_dir="$CONFIG_DIR/tokens"
+    mkdir -p "$token_dir"
+
+    # Auto-assign tunnel IP if not specified
+    if [[ -z "$tunnel_ip" ]]; then
+        # Find next available IP in 10.7.0.0/24 range
+        # .1 = server, .2+ = clients
+        local max_ip=1
+        # Check existing WireGuard peers
+        for ip in $(wg show bond0 allowed-ips 2>/dev/null | grep -oP '10\.7\.0\.\K\d+'); do
+            [[ "$ip" -gt "$max_ip" ]] && max_ip="$ip"
+        done
+        # Check existing tokens
+        for tf in "$token_dir"/*; do
+            [[ -f "$tf" ]] || continue
+            local tip
+            tip=$(cat "$tf" 2>/dev/null)
+            local octet
+            octet=$(echo "$tip" | grep -oP '10\.7\.0\.\K\d+' || true)
+            [[ -n "$octet" && "$octet" -gt "$max_ip" ]] && max_ip="$octet"
+        done
+        tunnel_ip="10.7.0.$((max_ip + 1))"
+    fi
+
+    # Generate token
+    local token
+    token=$(head -c 16 /dev/urandom | base64 | tr -dc 'A-Za-z0-9' | head -c 16)
+
+    # Save token with allocated IP
+    echo "$tunnel_ip" > "$token_dir/$token"
+    chmod 600 "$token_dir/$token"
+    chown bond007:bond007 "$token_dir/$token" 2>/dev/null || true
+
+    local server_ip
+    server_ip=$(hostname -I | awk '{print $1}')
+
+    echo ""
+    echo -e "${BOLD}Enrollment token generated${NC}"
+    echo ""
+    echo -e "  Token:     ${GREEN}$token${NC}"
+    echo -e "  Tunnel IP: $tunnel_ip"
+    echo -e "  Expires:   on first use (one-time)"
+    echo ""
+    echo -e "  ${BOLD}Client install command:${NC}"
+    echo ""
+    echo "  curl -fsSL https://raw.githubusercontent.com/$REPO/main/deploy/install-007-client.sh | \\"
+    echo "    sudo ENROLL_URL=http://${server_ip}:8017 ENROLL_TOKEN=$token bash"
+    echo ""
+}
+
+cmd_list_tokens() {
+    local token_dir="$CONFIG_DIR/tokens"
+    if [[ ! -d "$token_dir" ]] || [[ -z "$(ls -A "$token_dir" 2>/dev/null)" ]]; then
+        info "No pending enrollment tokens"
+        return
+    fi
+    echo -e "${BOLD}Pending enrollment tokens:${NC}"
+    for tf in "$token_dir"/*; do
+        [[ -f "$tf" ]] || continue
+        local token
+        token=$(basename "$tf")
+        local ip
+        ip=$(cat "$tf")
+        echo "  $token → $ip"
+    done
+}
+
+cmd_revoke_token() {
+    require_root
+    local token="${1:-}"
+    [[ -n "$token" ]] || { err "Usage: 007-bond revoke-token <token>"; exit 1; }
+    local token_file="$CONFIG_DIR/tokens/$token"
+    if [[ -f "$token_file" ]]; then
+        rm -f "$token_file"
+        ok "Token revoked: $token"
+    else
+        err "Token not found: $token"
+    fi
+}
+
 cmd_help() {
     echo "Usage: 007-bond <command> [args]"
     echo ""
@@ -237,6 +320,9 @@ cmd_help() {
     echo "  stop                Stop the service"
     echo "  restart             Restart the service"
     echo "  add-client <key>    Add a WireGuard client peer"
+    echo "  enroll-token [ip]   Generate one-time enrollment token for a client"
+    echo "  list-tokens         Show pending enrollment tokens"
+    echo "  revoke-token <tok>  Revoke an unused enrollment token"
     echo "  upgrade [--tag v]   Upgrade to latest or specific version"
     echo "  version             Show installed version"
     echo "  uninstall           Remove 007 Bond (preserves config/data)"
@@ -245,17 +331,20 @@ cmd_help() {
 
 # ─── Dispatch ─────────────────────────────────────────────────────────────
 case "${1:-help}" in
-    status)     cmd_status ;;
-    stats)      cmd_stats ;;
-    paths)      cmd_paths ;;
-    logs)       cmd_logs ;;
-    start)      cmd_start ;;
-    stop)       cmd_stop ;;
-    restart)    cmd_restart ;;
-    add-client) shift; cmd_add_client "$@" ;;
-    upgrade)    shift; cmd_upgrade "$@" ;;
-    version)    cmd_version ;;
-    uninstall)  cmd_uninstall ;;
+    status)       cmd_status ;;
+    stats)        cmd_stats ;;
+    paths)        cmd_paths ;;
+    logs)         cmd_logs ;;
+    start)        cmd_start ;;
+    stop)         cmd_stop ;;
+    restart)      cmd_restart ;;
+    add-client)   shift; cmd_add_client "$@" ;;
+    enroll-token) shift; cmd_enroll_token "$@" ;;
+    list-tokens)  cmd_list_tokens ;;
+    revoke-token) shift; cmd_revoke_token "$@" ;;
+    upgrade)      shift; cmd_upgrade "$@" ;;
+    version)      cmd_version ;;
+    uninstall)    cmd_uninstall ;;
     help|--help|-h) cmd_help ;;
     *)          err "Unknown command: $1"; cmd_help; exit 1 ;;
 esac
