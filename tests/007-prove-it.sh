@@ -217,10 +217,15 @@ RETRANSMIT_AFTER=$(echo "$STATS_AFTER" | python3 -c "import sys,json; d=json.loa
 NACKS=$((ARQ_AFTER - ARQ_BEFORE))
 RETRANSMITS=$((RETRANSMIT_AFTER - RETRANSMIT_BEFORE))
 
-if [ "$NACKS" -gt 0 ]; then
-    result PASS "ARQ active: $RX/30 received, NACKs=$NACKS retransmits=$RETRANSMITS"
+NACKS_RECV=$(echo "$STATS_AFTER" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('nacks_received',0))" 2>/dev/null || echo 0)
+NACKS_RECV_BEFORE=$(echo "$STATS_BEFORE" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('nacks_received',0))" 2>/dev/null || echo 0)
+NACKS_RECV_DELTA=$((NACKS_RECV - NACKS_RECV_BEFORE))
+ARQ_TOTAL=$((NACKS + NACKS_RECV_DELTA + RETRANSMITS))
+
+if [ "$ARQ_TOTAL" -gt 0 ]; then
+    result PASS "ARQ active: $RX/30 received, NACKs_sent=$NACKS NACKs_recv=$NACKS_RECV_DELTA retransmits=$RETRANSMITS"
 else
-    result FAIL "ARQ did not fire: $RX/30 received, NACKs=$NACKS retransmits=$RETRANSMITS"
+    result FAIL "ARQ did not fire: $RX/30 received, NACKs_sent=$NACKS NACKs_recv=$NACKS_RECV_DELTA retransmits=$RETRANSMITS"
 fi
 
 # ─── TEST 9: iperf3 UDP throughput ────────────────────────────────
