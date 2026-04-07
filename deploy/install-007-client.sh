@@ -329,16 +329,26 @@ SERVER_PUB_HEX=$(cat "$CONFIG_DIR/server.pub" | base64 -d | xxd -p -c 32)
 UAPI_CMD="set=1\npublic_key=${SERVER_PUB_HEX}\nclear_bond_endpoints=true\n"
 
 COUNT=0
+SKIPPED=0
 for iface in $(ip -4 -o addr show scope global | awk '{print $2}' | sort -u); do
     # Skip the tunnel interface itself
     [[ "$iface" == "$IFACE" ]] && continue
 
     LOCAL_IP=$(ip -4 addr show "$iface" | grep inet | awk '{print $2}' | cut -d/ -f1 | head -1)
-    if [[ -n "$LOCAL_IP" ]]; then
-        echo "  Bond path: $iface ($LOCAL_IP) → ${SERVER_IP_SAVED}:${SERVER_PORT}"
-        UAPI_CMD="${UAPI_CMD}bond_endpoint=${SERVER_IP_SAVED}:${SERVER_PORT}@${LOCAL_IP}\n"
-        COUNT=$((COUNT + 1))
+    if [[ -z "$LOCAL_IP" ]]; then
+        continue
     fi
+
+    # Verify this interface can route to the server
+    if ! ip route get "$SERVER_IP_SAVED" from "$LOCAL_IP" > /dev/null 2>&1; then
+        echo "  Skip:      $iface ($LOCAL_IP) — no route to ${SERVER_IP_SAVED}"
+        SKIPPED=$((SKIPPED + 1))
+        continue
+    fi
+
+    echo "  Bond path: $iface ($LOCAL_IP) → ${SERVER_IP_SAVED}:${SERVER_PORT}"
+    UAPI_CMD="${UAPI_CMD}bond_endpoint=${SERVER_IP_SAVED}:${SERVER_PORT}@${LOCAL_IP}\n"
+    COUNT=$((COUNT + 1))
 done
 
 if [[ "$COUNT" -eq 0 ]]; then
@@ -347,7 +357,7 @@ if [[ "$COUNT" -eq 0 ]]; then
 fi
 
 printf "${UAPI_CMD}\n" | nc -U "$WG_SOCK" -w 1 > /dev/null 2>&1 || true
-echo "Configured $COUNT bond path(s)"
+echo "Configured $COUNT bond path(s)${SKIPPED:+, skipped $SKIPPED (no route)}"
 PATHS_EOF
 chmod +x "$INSTALL_DIR/add-bond-paths.sh"
 
