@@ -953,6 +953,11 @@ func (m *Manager) GetStats() Stats {
 			s.FECRecovered += recovered
 			s.FECFailed += failed
 		}
+		if ps.slidingDec != nil {
+			recovered, failed := ps.slidingDec.Stats()
+			s.FECRecovered += recovered
+			s.FECFailed += failed
+		}
 		if ps.reorderBuf != nil {
 			inOrder, reordered, gaps, dups, late, windowMs := ps.reorderBuf.Stats()
 			s.ReorderInOrder += inOrder
