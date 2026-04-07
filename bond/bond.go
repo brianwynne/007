@@ -116,7 +116,9 @@ type Config struct {
 
 	// FEC
 	FECEnabled      bool         // enable forward error correction
-	FECAdaptive     bool         // dynamically adjust FEC ratio
+	FECMode         string       // "block" (default) or "sliding"
+	FECAdaptive     bool         // dynamically adjust FEC ratio (block mode only)
+	SlidingWindowSize int        // sliding mode: window size W (default 5)
 	FECBlockTimeoutMs int        // max ms to wait for complete FEC block
 	FECLossWindow   int          // packets in loss measurement sliding window
 	FECAdaptIntervalMs int       // ms between FEC ratio adaptation
@@ -167,7 +169,9 @@ func BroadcastPreset() Config {
 		PacketIntervalMs: 20,
 
 		FECEnabled:  true,
-		FECAdaptive: false, // fixed K/M, no auto-tuning
+		FECMode:     "block", // "block" or "sliding" — block is default, sliding is opt-in
+		FECAdaptive: false,
+		SlidingWindowSize: DefaultSlidingWindow,
 		FECLowK: 2, FECLowM: 2,
 		FECMedK: 2, FECMedM: 2,
 		FECHighK: 2, FECHighM: 2,
@@ -216,10 +220,12 @@ func FieldPreset() Config {
 
 // peerState holds per-peer FEC, jitter buffer, ARQ, and path health state.
 type peerState struct {
-	encoder    *FECEncoder
-	decoder    *FECDecoder
-	reorderBuf *ReorderBuffer  // legacy — used when JitterEnabled=false
-	jitterBuf  *JitterBuffer   // playout-deadline-aware buffer
+	encoder    *FECEncoder         // block FEC encoder
+	decoder    *FECDecoder         // block FEC decoder
+	slidingEnc *SlidingFECEncoder  // sliding-window FEC encoder
+	slidingDec *SlidingFECDecoder  // sliding-window FEC decoder
+	reorderBuf *ReorderBuffer      // legacy — used when JitterEnabled=false
+	jitterBuf  *JitterBuffer       // playout-deadline-aware buffer
 	retransmit        *retransmitBuffer
 	nackTrack         *nackTracker
 	pathTrack         *pathTracker
@@ -284,21 +290,26 @@ func (m *Manager) getPeerState(peerID uint32) *peerState {
 	if !exists {
 		ps = &peerState{}
 		if m.config.FECEnabled {
-			enc, err := NewFECEncoder(m.config)
-			if err != nil {
-				m.logger.Error("failed to create FEC encoder", "peer", peerID, "err", err)
-			} else {
-				ps.encoder = enc
-				// Auto-compute block timeout from K and packet interval,
-				// capped by latency budget to prevent exceeding playout deadline
-				blockTimeout := m.config.FECBlockTimeoutMs
-				if blockTimeout <= 0 {
-					blockTimeout = m.config.FECLowK*m.config.PacketIntervalMs + 50
+			switch m.config.FECMode {
+			case "sliding":
+				ps.slidingEnc = NewSlidingFECEncoder(m.config.SlidingWindowSize)
+				ps.slidingDec = NewSlidingFECDecoder(DefaultMaxRepairs, DefaultRepairMaxAge)
+				m.logger.Info("sliding FEC created", "peer", peerID, "window", m.config.SlidingWindowSize)
+			default: // "block" or empty
+				enc, err := NewFECEncoder(m.config)
+				if err != nil {
+					m.logger.Error("failed to create FEC encoder", "peer", peerID, "err", err)
+				} else {
+					ps.encoder = enc
+					blockTimeout := m.config.FECBlockTimeoutMs
+					if blockTimeout <= 0 {
+						blockTimeout = m.config.FECLowK*m.config.PacketIntervalMs + 50
+					}
+					if m.config.LatencyBudgetMs > 0 && blockTimeout > m.config.LatencyBudgetMs {
+						blockTimeout = m.config.LatencyBudgetMs
+					}
+					ps.decoder = NewFECDecoder(blockTimeout, 256)
 				}
-				if m.config.LatencyBudgetMs > 0 && blockTimeout > m.config.LatencyBudgetMs {
-					blockTimeout = m.config.LatencyBudgetMs
-				}
-				ps.decoder = NewFECDecoder(blockTimeout, 256)
 			}
 		}
 		if m.config.JitterEnabled {
@@ -416,16 +427,20 @@ func (m *Manager) ProcessOutbound(peerID uint32, packet []byte, nonce uint64) []
 
 	ps := m.getPeerState(peerID)
 
+	// Sliding-window FEC path
+	if m.config.FECEnabled && ps.slidingEnc != nil {
+		encodedData, repairPkt, dataSeq := ps.slidingEnc.Encode(packet, nonce)
+		ps.retransmit.Store(packet, dataSeq)
+		return [][]byte{encodedData, repairPkt}
+	}
+
+	// Block FEC path
 	if !m.config.FECEnabled || ps.encoder == nil {
-		// No FEC — store with nonce as fallback sequence number
 		ps.retransmit.Store(packet, nonce)
 		return [][]byte{packet}
 	}
 
-	// FEC encode — prepends header + dataSeq, generates parity when block is full
 	encodedData, parityPackets, dataSeq := ps.encoder.Encode(packet, nonce)
-
-	// Store with dataSeq (not WG nonce) so ARQ can retransmit with correct sequence
 	ps.retransmit.Store(packet, dataSeq)
 
 	result := make([][]byte, 0, 1+len(parityPackets))
@@ -455,7 +470,68 @@ func (m *Manager) ProcessInbound(peerID uint32, packet []byte, nonce uint64, pat
 		return m.handleControl(ps, packet, pathID)
 	}
 
-	// FEC decode
+	// Sliding-window FEC decode
+	if m.config.FECEnabled && ps.slidingDec != nil && IsSlidingFECPacket(packet) {
+		data, recovered := ps.slidingDec.Decode(packet)
+
+		var result [][]byte
+
+		if ps.jitterBuf != nil {
+			if data != nil {
+				if isControlPacket(data.Data) {
+					m.handleControl(ps, data.Data, pathID)
+				} else {
+					ps.jitterBuf.Insert(data.Data, data.DataSeq, sourceData)
+				}
+			}
+			for _, rec := range recovered {
+				if isControlPacket(rec.Data) {
+					m.handleControl(ps, rec.Data, pathID)
+				} else {
+					ps.jitterBuf.Insert(rec.Data, rec.DataSeq, sourceFEC)
+				}
+			}
+			if m.config.ARQEnabled {
+				earlyNonces := ps.jitterBuf.DrainEarlyNACK()
+				for _, n := range earlyNonces {
+					if m.config.ARQDeadlineCheck {
+						deadline := ps.jitterBuf.PlayoutDeadline(n)
+						if !deadline.IsZero() {
+							remaining := time.Until(deadline)
+							paths := ps.pathTrack.GetAll()
+							canArrive := false
+							for _, p := range paths {
+								if p.RTT > 0 && p.RTT < remaining {
+									canArrive = true
+									break
+								}
+							}
+							if !canArrive && len(paths) > 0 {
+								m.arqDeadlineSkip.Add(1)
+								continue
+							}
+						}
+					}
+					ps.nackTrack.AddMissing(n)
+				}
+				if len(earlyNonces) > 0 {
+					m.triggerNACK(ps)
+				}
+			}
+			return result
+		}
+
+		// No jitter buffer — return directly
+		if data != nil {
+			result = append(result, data.Data)
+		}
+		for _, rec := range recovered {
+			result = append(result, rec.Data)
+		}
+		return result
+	}
+
+	// Block FEC decode
 	if m.config.FECEnabled && ps.decoder != nil && len(packet) > FECHeaderSize {
 		data, recovered := ps.decoder.Decode(packet)
 

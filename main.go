@@ -214,6 +214,9 @@ func main() {
 	if os.Getenv("BOND_REORDER") == "0" {
 		bondCfg.ReorderEnabled = false
 	}
+	if os.Getenv("BOND_FEC_MODE") == "sliding" {
+		bondCfg.FECMode = "sliding"
+	}
 	if os.Getenv("BOND_JITTER") == "0" {
 		bondCfg.JitterEnabled = false
 		bondCfg.ReorderEnabled = true
