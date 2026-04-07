@@ -4,11 +4,9 @@
 set -euo pipefail
 
 echo "[+] Cleaning up..."
-for pid in $(pgrep -x 007 2>/dev/null) $(pgrep -x 007-proxy 2>/dev/null); do
-    kill -9 "$pid" 2>/dev/null || true
-done
-sleep 1
-rm -f /var/run/wireguard/*.sock
+for pid in $(pgrep -x 007 2>/dev/null) $(pgrep -x 007-proxy 2>/dev/null) $(pgrep -x iperf3 2>/dev/null); do kill -9 "$pid" 2>/dev/null || true; done
+sleep 2
+rm -f /var/run/wireguard/*.sock /opt/007/007
 for iface in $(wg show interfaces 2>/dev/null); do ip link del "$iface" 2>/dev/null || true; done
 ip link del bond0 2>/dev/null || true
 
