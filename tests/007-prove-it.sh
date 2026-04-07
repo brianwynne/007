@@ -194,6 +194,35 @@ else
     result FAIL "Combined ALL-path impairment: $RX/50 received (FEC: $FEC_RECOVERED, NACKs: $NACKS)"
 fi
 
+# ─── TEST 8b: ARQ isolation — extreme loss to overwhelm FEC ──────
+echo ""
+echo "=== TEST 8b: ARQ — 70% loss ALL paths (overwhelms FEC, forces ARQ) ==="
+echo "  (K=2 M=4: FEC needs 2 of 6 shards. At 70% per-path loss, ~12% of blocks lose >4 shards)"
+STATS_BEFORE=$(curl -s --max-time 3 http://127.0.0.1:8007/api/stats 2>/dev/null)
+ARQ_BEFORE=$(echo "$STATS_BEFORE" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('nacks_sent',0))" 2>/dev/null || echo 0)
+RETRANSMIT_BEFORE=$(echo "$STATS_BEFORE" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('arq_retransmit_ok',0))" 2>/dev/null || echo 0)
+
+for iface in $IFACES; do
+    tc qdisc add dev "$iface" root netem loss 70% 2>/dev/null || true
+done
+ping -c 30 -i 0.2 "$SERVER" > /tmp/007-arq.txt 2>&1 || true
+for iface in $IFACES; do
+    tc qdisc del dev "$iface" root 2>/dev/null || true
+done
+
+RX=$(grep -c "bytes from" /tmp/007-arq.txt 2>/dev/null); RX=${RX:-0}
+STATS_AFTER=$(curl -s --max-time 3 http://127.0.0.1:8007/api/stats 2>/dev/null)
+ARQ_AFTER=$(echo "$STATS_AFTER" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('nacks_sent',0))" 2>/dev/null || echo 0)
+RETRANSMIT_AFTER=$(echo "$STATS_AFTER" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('arq_retransmit_ok',0))" 2>/dev/null || echo 0)
+NACKS=$((ARQ_AFTER - ARQ_BEFORE))
+RETRANSMITS=$((RETRANSMIT_AFTER - RETRANSMIT_BEFORE))
+
+if [ "$NACKS" -gt 0 ]; then
+    result PASS "ARQ active: $RX/30 received, NACKs=$NACKS retransmits=$RETRANSMITS"
+else
+    result FAIL "ARQ did not fire: $RX/30 received, NACKs=$NACKS retransmits=$RETRANSMITS"
+fi
+
 # ─── TEST 9: iperf3 UDP throughput ────────────────────────────────
 echo ""
 echo "=== TEST 9: iperf3 UDP tests ==="
