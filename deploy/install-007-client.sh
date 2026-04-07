@@ -454,6 +454,41 @@ $LOG_DIR/*.log {
 }
 EOF
 
+# ─── Login banner (MOTD) ─────────────────────────────────────────────────
+MOTD_FILE="/etc/update-motd.d/10-007-bond"
+if [[ ! -f "$MOTD_FILE" ]]; then
+    info "Creating login welcome screen..."
+    cat > "$MOTD_FILE" << 'MOTDEOF'
+#!/bin/bash
+echo ""
+echo "  ======================================================"
+echo "           007 Bond — Multi-Path Bonding Client"
+echo "  ======================================================"
+echo ""
+echo "  Service:"
+echo "    sudo 007-bond status            Service & tunnel status"
+echo "    sudo 007-bond start             Start 007"
+echo "    sudo 007-bond stop              Stop 007"
+echo "    sudo 007-bond restart           Restart 007"
+echo "    sudo 007-bond logs              Tail service logs"
+echo ""
+echo "  Monitoring:"
+echo "    sudo 007-bond stats             FEC, ARQ, jitter stats"
+echo "    sudo 007-bond paths             Per-path health (RTT, loss)"
+echo "    sudo 007-bond version           Show installed version"
+echo ""
+echo "  Maintenance:"
+echo "    sudo 007-bond upgrade           Upgrade to latest release"
+echo "    sudo 007-bond uninstall         Remove 007 Bond"
+echo ""
+echo "  Config: /etc/007/.env"
+echo "  Logs:   journalctl -u 007-bond -f"
+echo ""
+MOTDEOF
+    chmod 755 "$MOTD_FILE"
+    ok "Login welcome screen created"
+fi
+
 # ─── Enable and start ────────────────────────────────────────────────────
 info "Enabling and starting services..."
 systemctl enable "$SERVICE_NAME" > /dev/null 2>&1
