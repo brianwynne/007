@@ -308,6 +308,45 @@ cmd_revoke_token() {
     fi
 }
 
+cmd_preset() {
+    require_root
+    local preset="${1:-}"
+    if [[ -z "$preset" ]]; then
+        load_env
+        local current="${BOND_PRESET:-field}"
+        echo -e "${BOLD}Current preset: $current${NC}"
+        echo ""
+        echo "  broadcast   40ms latency, 20ms jitter buffer  — live broadcast"
+        echo "  studio      80ms latency, 60ms jitter buffer  — studio links"
+        echo "  field      200ms latency, 180ms jitter buffer — WiFi + cellular"
+        echo ""
+        echo "Usage: sudo 007-bond preset <broadcast|studio|field>"
+        return
+    fi
+
+    case "$preset" in
+        broadcast|studio|field) ;;
+        *) err "Unknown preset: $preset (use broadcast, studio, or field)"; exit 1 ;;
+    esac
+
+    if ! grep -q "^BOND_PRESET=" "$CONFIG_DIR/.env" 2>/dev/null; then
+        echo "BOND_PRESET=$preset" >> "$CONFIG_DIR/.env"
+    else
+        sed -i "s/^BOND_PRESET=.*/BOND_PRESET=$preset/" "$CONFIG_DIR/.env"
+    fi
+
+    ok "Preset set to $preset"
+    info "Restarting service..."
+    systemctl restart "$SERVICE_NAME"
+    sleep 2
+    if systemctl is-active --quiet "$SERVICE_NAME"; then
+        ok "Service restarted with $preset preset"
+    else
+        err "Service failed to restart"
+        journalctl -u "$SERVICE_NAME" --no-pager -n 10
+    fi
+}
+
 cmd_help() {
     echo "Usage: 007-bond <command> [args]"
     echo ""
@@ -319,6 +358,7 @@ cmd_help() {
     echo "  start               Start the service"
     echo "  stop                Stop the service"
     echo "  restart             Restart the service"
+    echo "  preset [name]       Show or set latency preset (broadcast/studio/field)"
     echo "  add-client <key>    Add a WireGuard client peer"
     echo "  enroll-token [ip]   Generate one-time enrollment token for a client"
     echo "  list-tokens         Show pending enrollment tokens"
@@ -338,6 +378,7 @@ case "${1:-help}" in
     start)        cmd_start ;;
     stop)         cmd_stop ;;
     restart)      cmd_restart ;;
+    preset)       shift; cmd_preset "$@" ;;
     add-client)   shift; cmd_add_client "$@" ;;
     enroll-token) shift; cmd_enroll_token "$@" ;;
     list-tokens)  cmd_list_tokens ;;
