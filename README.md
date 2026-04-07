@@ -1,97 +1,146 @@
 # 007 Bond — Multi-Path Network Bonding
 
-007 Bond is a multi-path network bonding solution built on [wireguard-go](https://git.zx2c4.com/wireguard-go). It sends every packet simultaneously across all configured network interfaces (ethernet, WiFi, cellular) and uses FEC, reordering, and ARQ to deliver reliable, low-latency connectivity over unreliable links.
+007 Bond is a multi-path network bonding solution built on [wireguard-go](https://git.zx2c4.com/wireguard-go). It sends every packet simultaneously across all configured network interfaces (ethernet, WiFi, cellular) and uses FEC, ARQ, and a jitter buffer to deliver reliable, low-latency connectivity over unreliable links.
 
 Designed for broadcast field contribution where dropping audio is not an option.
 
 ## How It Works
 
 ```
-APP (e.g. SIP codec)
+APP (e.g. SIP Reporter)
         |
-   ┌────┴────┐ TUN interface (bond0)
-   │   007   │ FEC encode → encrypt → multi-path send
-   └──┬───┬──┘
-      |   |
-   eth0  wlan0  ──── all paths simultaneously ────  server
+   ┌────┴────┐  TUN interface (bond0)
+   │   007   │  FEC encode → encrypt → multi-path send
+   └──┬──┬──┬┘
+      |  |  |
+   eth0 wlan0 wwan0  ── all paths simultaneously ──  server
 ```
 
 - Every encrypted packet is sent on ALL configured paths
 - Receiver discards duplicates (WireGuard replay filter)
-- FEC (Reed-Solomon) recovers lost packets without retransmission
-- Reorder buffer delivers packets in sequence despite path latency differences
-- ARQ requests retransmission for anything FEC can't recover
+- Sliding-window FEC (XOR) recovers single losses in 20ms
+- ARQ fires NACKs for every gap, racing FEC in parallel
+- Jitter buffer holds packets until playout deadline
 - Per-path health tracking (RTT, loss, jitter) drives adaptive timeouts
 
-## Quick Start
+## Install
+
+### Server
 
 ```bash
-# Build
-go build -o 007 .
-
-# Server
-sudo ip tuntap add dev bond0 mode tun
-sudo ./007 -f bond0 &
-sudo wg set bond0 listen-port 51820 private-key ./server.key
-sudo wg set bond0 peer <CLIENT_PUBKEY> allowed-ips 10.7.0.2/32
-sudo ip addr add 10.7.0.1/24 dev bond0
-sudo ip link set bond0 up
-
-# Client
-sudo ip tuntap add dev bond0 mode tun
-sudo ./007 -f bond0 &
-sudo wg set bond0 private-key ./client.key \
-  peer <SERVER_PUBKEY> \
-    endpoint server:51820 \
-    allowed-ips 10.7.0.0/24 \
-    persistent-keepalive 25 \
-    bond_endpoint=server:51820@192.168.1.100 \
-    bond_endpoint=server:51820@10.0.0.50
-sudo ip addr add 10.7.0.2/24 dev bond0
-sudo ip link set bond0 up
+curl -fsSL https://raw.githubusercontent.com/brianwynne/007/main/deploy/install-007-server.sh | sudo -E bash
 ```
 
-`bond_endpoint=dest@localip` — send to `dest` via the interface that owns `localip`.
+### Client (via enrollment)
 
-## Features
+```bash
+# On server — generate a one-time enrollment token:
+sudo 007-bond enroll-token
 
-| Feature | Description |
-|---------|-------------|
-| Multi-path send | Every packet sent on all configured endpoints simultaneously |
-| FEC | Adaptive Reed-Solomon (K=8-16, M=2-6), adjusts to measured loss |
-| Reorder buffer | Adaptive window (20-200ms), per-path timeout based on measured RTT |
-| ARQ | NACK-based retransmission for gaps FEC can't recover |
-| Path health | Probe/echo RTT, per-path loss and jitter tracking |
-| Per-peer isolation | Multiple devices connect to one server without interference |
-| Interface binding | Per-path UDP sockets bound to specific local IPs |
-| Management API | REST API on :8007 for stats, path health, config |
-| WireGuard compatible | Standard `wg` tool for key management and peer config |
-| Auto MTU | Effective MTU reduced automatically for FEC overhead |
+# On client — install with token (generates keys locally, exchanges via API):
+curl -fsSL https://raw.githubusercontent.com/brianwynne/007/main/deploy/install-007-client.sh | \
+  sudo ENROLL_URL=http://<server>:8017 ENROLL_TOKEN=<token> bash
+```
+
+### Client (manual keys)
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/brianwynne/007/main/deploy/install-007-client.sh | \
+  sudo SERVER_IP=<ip> SERVER_PUB=<key> CLIENT_KEY=<key> bash
+```
+
+## Presets
+
+| Preset | Latency Budget | Jitter Buffer | FEC | Use Case |
+|--------|---------------|---------------|-----|----------|
+| broadcast | 40ms | 20ms (1 slot) | K=2 M=2 | Live broadcast, low latency critical |
+| studio | 80ms | 60ms (3 slots) | K=2 M=2 | Studio-to-studio, managed networks |
+| field | 200ms | 180ms (9 slots) | K=2 M=4 | Field contribution, WiFi + cellular |
+
+Change preset at runtime (no restart — signals peers automatically):
+
+```bash
+sudo 007-bond preset broadcast    # set locally + signal all peers
+sudo 007-bond preset field 10.7.0.3  # set on a specific peer (remote help)
+```
+
+## Management CLI
+
+```bash
+sudo 007-bond status          # service, interface, peers, preset
+sudo 007-bond stats           # FEC, ARQ, jitter buffer statistics
+sudo 007-bond paths           # per-path health (RTT, loss, jitter)
+sudo 007-bond preset [name]   # show or set latency preset
+sudo 007-bond logs            # tail service logs
+sudo 007-bond start|stop|restart
+sudo 007-bond enroll-token    # generate one-time client enrollment token
+sudo 007-bond list-tokens     # show pending enrollment tokens
+sudo 007-bond upgrade         # upgrade to latest release
+sudo 007-bond version         # show installed version
+sudo 007-bond uninstall       # remove (preserves config/data)
+```
 
 ## Management API
 
 ```bash
-curl http://127.0.0.1:8007/api/stats   # FEC, reorder, ARQ stats + paths
-curl http://127.0.0.1:8007/api/paths   # per-path RTT, jitter, loss
-curl http://127.0.0.1:8007/api/config  # current configuration
-curl http://127.0.0.1:8007/api/health  # health check
+curl http://127.0.0.1:8007/api/stats    # FEC, ARQ, jitter stats + paths
+curl http://127.0.0.1:8007/api/paths    # per-path RTT, jitter, loss
+curl http://127.0.0.1:8007/api/config   # current configuration
+curl http://127.0.0.1:8007/api/preset   # current preset and latency budget
+curl http://127.0.0.1:8007/api/health   # health check
+```
+
+POST `/api/preset` with `{"preset":"broadcast"}` to change at runtime.
+
+## Recovery Chain
+
+```
+1. Multi-path diversity — same packet on all interfaces (first line of defence)
+2. Sliding FEC (XOR, W=5) — recovers single losses within 20ms window
+3. ARQ — NACKs fire for every gap, racing FEC in parallel
+4. Jitter buffer — holds packets for playout deadline, delivers in order
 ```
 
 ## Environment Variables
 
 | Variable | Default | Description |
 |----------|---------|-------------|
+| `BOND_PRESET` | `field` | Latency preset: `broadcast`, `studio`, `field` |
+| `BOND_FEC_MODE` | `block` | FEC strategy: `block` (Reed-Solomon) or `sliding` (XOR) |
 | `BOND_FEC` | enabled | Set to `0` to disable FEC |
+| `BOND_JITTER` | enabled | Set to `0` to disable jitter buffer |
 | `BOND_REORDER` | enabled | Set to `0` to disable reorder buffer |
 | `BOND_API` | `127.0.0.1:8007` | Management API listen address |
-| `LOG_LEVEL` | `error` | Set to `verbose` for debug logging |
+| `BOND_API_KEY` | empty | Optional API authentication key |
+| `LOG_LEVEL` | `error` | `verbose`, `error`, or `silent` |
 
-## Documentation
+## Deployment Layout
 
-- [Installation and Testing Guide](docs/INSTALL.md) — full setup, 6 test scenarios, troubleshooting
-- [Implementation Log](docs/IMPLEMENTATION.md) — architecture, design decisions, wire formats
+```
+/opt/007/           — binary, helper scripts
+/etc/007/           — config (.env), WireGuard keys, enrollment tokens
+/var/lib/007/       — persistent data
+/var/log/007/       — logs
+```
 
-## Building
+Runs as dedicated `bond007` system user with Linux capabilities (`CAP_NET_ADMIN`, `CAP_NET_RAW`, `CAP_NET_BIND_SERVICE`) — not root.
+
+Systemd services:
+- `007-bond` — main bonding service
+- `007-bond-enroll` — enrollment API (server only, port 8017)
+- `007-bond-paths.timer` — auto-detects interfaces every 30s (client only)
+
+## Testing
+
+```bash
+# Run impairment test suite (32 tests across 10 sections)
+curl -fsSL https://raw.githubusercontent.com/brianwynne/007/main/tests/007-impairment-suite.sh | sudo bash
+
+# Run unit tests
+go test ./bond/ -v
+```
+
+## Building from Source
 
 Requires Go 1.23+.
 
@@ -99,8 +148,12 @@ Requires Go 1.23+.
 go build -o 007 .                                    # Linux (native)
 GOOS=linux GOARCH=arm64 go build -o 007-arm64 .      # Raspberry Pi 4
 GOOS=linux GOARCH=arm go build -o 007-arm .           # Raspberry Pi 3
-go test ./bond/ -v                                    # Run tests
 ```
+
+## Documentation
+
+- [Installation and Testing Guide](docs/INSTALL.md)
+- [Implementation Details](docs/IMPLEMENTATION.md)
 
 ## Based On
 

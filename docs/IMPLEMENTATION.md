@@ -1,206 +1,190 @@
-# 007 Bond — Implementation Log
+# 007 Bond — Implementation Details
 
-## Base: wireguard-go (MIT License)
-- Cloned from: https://github.com/WireGuard/wireguard-go
-- Upstream remote: `upstream`
-- Branch: `main`
+## Base
 
-## Change Log
+Fork of [wireguard-go](https://github.com/WireGuard/wireguard-go) (MIT License). The WireGuard encryption, handshake, and key management are unmodified. 007 Bond adds a bond layer between the TUN interface and the crypto layer.
 
-### Phase 1: Multi-Path Send
+## Architecture
 
-**Goal**: Send every encrypted packet to ALL configured peer endpoints simultaneously.
-
-#### Change 1.1: Extend Peer endpoint storage
-
-**File**: `device/peer.go`
-
-**Change**: Added `bondEndpoints []conn.Endpoint` slice alongside the primary `val` endpoint.
-
-**Rationale**: The primary endpoint (`val`) is used for handshake and roaming. Additional endpoints (`bondEndpoints`) are used for multi-path redundancy. All encrypted packets are sent to all endpoints.
-
-#### Change 1.2: Modify SendBuffers to send to all endpoints
-
-**File**: `device/peer.go`
-
-**Change**: `SendBuffers()` loops over primary + all bond endpoints, sending to each.
-
-**Rationale**: Core multi-path change. Each encrypted packet is sent via all paths. The receiver gets duplicates and uses the first arrival, discarding the rest via the replay filter.
-
-#### Change 1.3: Extend UAPI to accept multiple endpoints
-
-**File**: `device/uapi.go`
-
-**Change**: Accept `bond_endpoint=<ip>:<port>` for additional endpoints, `clear_bond_endpoints` to remove them. Standard `endpoint=` unchanged.
-
-**Rationale**: Backward compatible — standard WireGuard config still works. Bond endpoints are send-only redundancy paths.
-
----
-
-### Phase 2: FEC (Forward Error Correction)
-
-**Goal**: Add adaptive Reed-Solomon FEC to recover from packet loss without retransmission.
-
-#### Change 2.1: FEC encoder/decoder
-
-**File**: `bond/fec.go`
-
-**Design**:
-- Groups outgoing packets into blocks of K packets
-- Generates M parity packets using Reed-Solomon (`klauspost/reedsolomon`)
-- Parity packets sent alongside data packets
-- Adaptive: adjusts K,M based on measured loss rate every 500ms
-
-**Packet format for FEC (13 bytes overhead per data packet)**:
 ```
-[FEC header (5)][WG nonce (8)][IP packet]  ← cleartext before WireGuard encryption
+SEND PATH:
+  App → TUN (bond0) → FEC encode → WireGuard encrypt → multi-path send (all interfaces)
+  Control packets (probes/NACKs/preset) bypass FEC — sent raw
 
-FEC header (5 bytes):
-  - Block ID (16 bits): which FEC block this packet belongs to
-  - Index (8 bits): position within block (0..K-1 = data, K..K+M-1 = parity)
-  - K value (8 bits): number of data packets in this block
-  - M value (8 bits): number of parity packets in this block
-
-The WireGuard nonce is embedded in the FEC-protected region so that
-recovered packets have their original nonce for reorder buffer insertion.
+RECEIVE PATH:
+  multi-path receive → WireGuard decrypt → control packet check →
+    FEC decode → ARQ gap detection (races FEC) → jitter buffer → TUN
 ```
 
-**Adaptive FEC presets** (adjusted every 500ms based on measured loss):
-| Loss rate | K | M | Overhead |
-|-----------|---|---|----------|
-| <1%       | 16| 2 | 12.5%    |
-| 1-5%      | 12| 4 | 25%      |
-| >5%       | 8 | 6 | 42%      |
+## Recovery Chain
 
-**Decoder**:
-- Collects packets by Block ID into shard arrays
-- Data packets (index < K): delivered immediately, also stored for potential recovery
-- Parity packets (index >= K): stored, triggers RS recovery if K shards present
-- Recovery is synchronous — happens on each shard arrival
-- Block timeout (50ms): cleans up incomplete blocks, counts as failed recovery
-- Keepalive packets (empty payload) bypass FEC entirely
+Recovery mechanisms fire in this order, each independent:
 
-#### Change 2.2: Bond manager
+1. **Multi-path diversity** — same packet sent on all interfaces. First copy wins. Independent per-path loss means compound loss probability is very low (30% per path = 9% both).
 
-**File**: `bond/bond.go`
+2. **Sliding-window FEC (XOR, W=5)** — each data packet generates one repair packet covering the last 5 data packets. Single loss recovery in 20ms. Overlapping windows recover bursts up to W-1=4 consecutive losses.
 
-**Design**:
-- `ProcessOutbound(packet, nonce) → [][]byte`: FEC encode, returns data + parity packets
-- `ProcessInbound(packet, nonce, pathID) → [][]byte`: FEC decode, returns clean IP packets
-- Adaptive FEC ratio goroutine (500ms interval)
-- Stats API for monitoring
+3. **ARQ (NACK-based)** — fires for every sequence gap immediately, racing FEC in parallel. If FEC recovers the packet, the retransmit is a harmless duplicate. If FEC fails, ARQ is already in flight. Deadline-checked against jitter buffer playout time.
 
-#### Change 2.3: Pipeline integration
+4. **Jitter buffer** — per-packet playout deadline. Each packet gets `deadline = insertTime + bufferDepth`. Rate-independent — works for any traffic pattern.
 
-**Files**: `device/send.go`, `device/receive.go`, `device/device.go`
+## Presets
 
-**Send path** (`SendStagedPackets`, after nonce assignment):
-1. Skip keepalive packets (empty) — no FEC encoding
-2. For each data packet, call `ProcessOutbound` which prepends 5-byte FEC header
-3. When FEC block fills (K packets), parity packets are generated
-4. Each parity packet gets a new `QueueOutboundElement` with its own nonce from `keypair.sendNonce`
-5. Parity elements appended to container — go through normal encryption and multi-path send
+| Preset | LatencyBudgetMs | FEC K | FEC M | Jitter Buffer | Use Case |
+|--------|----------------|-------|-------|---------------|----------|
+| broadcast | 40 | 2 | 2 | 20ms (1 slot) | Live contribution |
+| studio | 80 | 2 | 2 | 60ms (3 slots) | Studio links |
+| field | 200 | 2 | 4 | 180ms (9 slots) | WiFi + cellular |
 
-**Receive path** (`RoutineSequentialReceiver`, after replay filter):
-1. Keepalive detection occurs before bond processing (standard WireGuard check)
-2. Call `ProcessInbound` which strips FEC header and returns clean IP packets
-3. Data packets: payload delivered immediately
-4. Parity packets: trigger RS recovery of missing data if enough shards present
-5. All returned packets undergo IP validation (IPv4/IPv6 header + allowed IPs)
-6. FEC-recovered packets get new message buffers, tracked and freed after TUN write
+Jitter buffer depth = LatencyBudgetMs - (K-1) * PacketIntervalMs.
 
-**Device** (`device/device.go`):
-- `bondManager` interface with `ProcessOutbound(peerID, ...)`/`ProcessInbound(peerID, ...)` methods
-- `SetBondManager()` — must be called before device is brought up
-- Interface type avoids circular imports between `device` and `bond` packages
-- `nextBondPeerID` atomic counter assigns unique IDs to peers
-- Each peer carries `bondPeerID` (assigned in `NewPeer`) for per-peer FEC isolation
+Runtime preset changes via `POST /api/preset` or `007-bond preset <name>`. Client sends preset control packet (type=5) through the tunnel — server changes only that peer's jitter buffer. Each peer has an independent jitter buffer on the server.
 
----
+## Wire Formats
 
-### Phase 3: Reorder Buffer
+### Sliding FEC Data Packet
+```
+[Type=0x01][Flags=0x00][DataSeq (8 bytes)][IP payload]
+```
 
-**Goal**: Deliver packets to TUN in sequence order despite multi-path arrival timing differences.
+### Sliding FEC Repair Packet
+```
+[Type=0x02][Flags=0x00][RepairSeq (8)][WindowStart (8)][WindowSize (1)][XOR data]
+```
 
-**File**: `bond/reorder.go`
+### Block FEC (Reed-Solomon)
+```
+[BlockID (2)][Idx (1)][K (1)][M (1)][DataSeq (8)][IP payload or parity shard]
+```
 
-**Design**:
-- Ring buffer (64 slots, zero-alloc after init)
-- Synchronous API: `Insert()` returns packets ready for delivery
-- Uses WireGuard nonce (64-bit counter) as sequence number
-- Per-path timeout based on measured RTT: `RTT + 2*RTTVar + 10ms`
-- Adaptive window: 80ms default, 20ms min, 200ms max
-- Gap handling: gap timeout checked on each Insert call + periodic Flush
-- Per-peer: each peer gets its own reorder buffer (nonces are per-peer)
+### Control Packets
+All control packets start with `BlockID=0xFFFF` to distinguish from FEC data:
+```
+[0xFF][0xFF][Type (1)][K=0][M=0][payload...]
+```
 
-**Integration with FEC**:
-- WireGuard nonce embedded in FEC-protected payload (8 bytes after FEC header)
-- FEC `Decode()` returns `DecodedPacket{Data, Nonce}` for both data and recovered
-- ALL packets (data and FEC-recovered) go through reorder buffer with correct nonce
-- FEC recovery reconstructs the nonce alongside the IP payload via Reed-Solomon
-- Periodic Flush (10ms) advances `nextExpect` during idle periods
+| Type | Format | Purpose |
+|------|--------|---------|
+| 1 (NACK) | `[count (2)][seq1 (8)][seq2 (8)]...` | Request retransmission |
+| 2 (Probe) | `[pathID (4)][timestamp (8)]...` | RTT measurement |
+| 3 (Echo) | `[pathID (4)][timestamp (8)]...` | RTT response |
+| 4 (Retransmit) | `[dataSeq (8)][IP payload]` | Retransmitted packet |
+| 5 (Preset) | `[preset name bytes]` | Signal preset change |
 
----
+Control packets bypass FEC encoding (not assigned dataSeq, not counted in FEC blocks).
 
-### Phase 4: ARQ (Automatic Repeat Request)
+## FEC Decoder Gap Detection
 
-**Goal**: Request retransmission of packets that FEC cannot recover.
+The sliding FEC decoder tracks the highest data sequence seen (`nextExpected`). When a data packet arrives with `seq > nextExpected`, all sequences between are reported as missing — regardless of whether FEC has already recovered them. This ensures ARQ fires for every gap unconditionally, racing FEC.
 
-**File**: `bond/arq.go`
+```go
+// In SlidingFECDecoder.Decode():
+if seq > d.nextExpected {
+    for s := d.nextExpected; s < seq; s++ {
+        missing = append(missing, s)  // no d.received check — race FEC
+    }
+}
+```
 
-**Design**:
-- Sender: ring buffer of 512 recent cleartext packets keyed by nonce
-- Receiver: detects unrecoverable gaps via reorder buffer skipped nonces
-- NACK: control packet (blockID=0xFFFF) with list of missing nonces
-- NACK travels encrypted through the WireGuard tunnel
-- Sender retransmits from buffer via SendFunc callback
-- Retransmitted packets re-enter the full send pipeline (new nonce, new FEC)
-- Rate limited: max 1 NACK per 10ms, max 32 nonces per NACK
+## ARQ Flow
 
-**Integration**:
-- ProcessOutbound stores each packet in per-peer retransmit buffer
-- ProcessInbound detects control packets (blockID=0xFFFF) and handles NACKs
-- Reorder buffer records skipped nonces via DrainSkippedNonces()
-- SendFunc callback (set via SetPeerSendFunc) injects packets into send path
-- Device registers SendFunc in Peer.Start() using StagePackets/SendStagedPackets
+1. Receiver detects gap (FEC decoder reports missing sequences)
+2. NACKs fired immediately via `nackTracker` → `sendFunc`
+3. FEC recovery runs in parallel (may fill the gap)
+4. Sender receives NACK → looks up original packet in `retransmitBuffer` → sends retransmit
+5. Retransmit arrives as control packet (type=4) → inserted into jitter buffer with `sourceARQ`
+6. If FEC already recovered it, retransmit is a duplicate (harmlessly discarded)
 
----
+Deadline check: before sending a NACK, verify at least one path has RTT < remaining time until playout deadline. If not, skip (`arq_deadline_skip` counter).
+
+## Per-Path Health
+
+Each path tracks:
+- **RTT** via probe/echo packets (EWMA)
+- **Jitter** from RTT variance
+- **Loss** via sliding window
+- **Burst loss** count and max burst length
+- **State machine**: healthy → degraded → unstable → failed → recovering
+
+## Bond Path Configuration
+
+Via WireGuard UAPI:
+```bash
+# Add bond paths
+wg set bond0 peer <pubkey> \
+  bond_endpoint=server:51820@eth0_ip \
+  bond_endpoint=server:51820@wlan0_ip
+
+# Clear all bond paths
+printf "set=1\npublic_key=<hex>\nclear_bond_endpoints=true\n" | \
+  nc -U /var/run/wireguard/bond0.sock -w 1
+```
+
+The client's path monitor timer (`007-bond-paths.timer`) re-scans interfaces every 30 seconds. Only interfaces with a route to the server are added as bond paths.
 
 ## File Map
 
-| File | Status | Description |
-|------|--------|-------------|
-| `device/peer.go` | MODIFIED | Multi-endpoint storage + SendBuffers loop |
-| `device/uapi.go` | MODIFIED | bond_endpoint= config |
-| `device/device.go` | MODIFIED | bondManager interface + SetBondManager() |
-| `device/send.go` | MODIFIED | FEC encode in SendStagedPackets |
-| `device/receive.go` | MODIFIED | FEC decode in RoutineSequentialReceiver |
-| `bond/fec.go` | IMPLEMENTED | Reed-Solomon FEC encoder/decoder (5-byte header) |
-| `bond/reorder.go` | IMPLEMENTED | Adaptive reorder buffer (not yet wired) |
-| `bond/bond.go` | IMPLEMENTED | Bond manager — ProcessOutbound/ProcessInbound API |
-| `bond/arq.go` | IMPLEMENTED | NACK-based retransmission + retransmit buffer |
-| `bond/path.go` | IMPLEMENTED | Path health tracking — probe/echo RTT, loss, jitter |
-| `docs/IMPLEMENTATION.md` | IMPLEMENTED | This file |
+### Bond Package (`bond/`)
+| File | Purpose |
+|------|---------|
+| `bond.go` | Manager, ProcessInbound/Outbound, presets, SetPreset/SetPeerPreset |
+| `fec_sliding.go` | XOR sliding-window FEC encoder/decoder with gap detection |
+| `fec.go` | Reed-Solomon block FEC encoder/decoder |
+| `jitter.go` | Per-packet-deadline jitter buffer with SetDepth |
+| `arq.go` | NACK tracker, retransmit buffer, control packet builders |
+| `path.go` | Per-path health tracking, state machine, probe/echo |
+| `reorder.go` | Legacy reorder buffer (used when jitter disabled) |
+| `api.go` | REST management API |
 
-## What's Connected
-- [x] Multi-path send (peer.go SendBuffers sends to all endpoints)
-- [x] UAPI bond_endpoint config (uapi.go)
-- [x] FEC encoder/decoder (bond/fec.go, 5-byte header with K and M)
-- [x] Bond manager API (bond/bond.go)
-- [x] ProcessOutbound wired into device/send.go (keepalive-safe)
-- [x] ProcessInbound wired into device/receive.go (with IP validation + buffer management)
-- [x] Reorder buffer wired into receive pipeline (per-peer, synchronous API)
+### Modified WireGuard Files (`device/`)
+| File | Changes |
+|------|---------|
+| `device.go` | BondManager interface, SetBondManager, bondFECOverhead MTU |
+| `peer.go` | BondPath struct, AddBondPath, bondPeerID, sendFunc/tunWriter callbacks |
+| `send.go` | FEC encode block, control packet skip, parity element creation |
+| `receive.go` | ProcessInbound call, IP validation for recovered packets, bondExtraBufs |
+| `uapi.go` | `bond_endpoint` and `clear_bond_endpoints` UAPI commands |
 
-## What's Connected (continued)
-- [x] Interface manager — per-path UDP sockets bound to specific local IPs
+### Deployment (`deploy/`)
+| File | Purpose |
+|------|---------|
+| `install-007-server.sh` | Server installer (FHS, systemd, enrollment, firewall) |
+| `install-007-client.sh` | Client installer (enrollment or manual keys, path monitor) |
+| `007-cli.sh` | Management CLI (`/usr/local/bin/007-bond`) |
+| `enroll-server.sh` | Python enrollment HTTP service |
 
-## What's NOT Connected Yet
-- [x] ARQ — NACK-based retransmission with per-peer retransmit buffer
-- [x] Path health tracking — probe/echo RTT, per-path loss + jitter
-- [x] Management API — REST on :8007 (stats, paths, config, health)
+### Tests (`tests/`)
+| File | Purpose |
+|------|---------|
+| `007-impairment-suite.sh` | 32-test tc/netem + iptables impairment suite |
+| `007-sliding-server.sh` | Self-contained sliding FEC server test |
+| `007-sliding-client.sh` | Self-contained sliding FEC client test |
 
-## Design Constraints
-- **Per-peer FEC state**: Each peer gets its own FEC encoder/decoder via `peerID`. Multiple devices (e.g. field SIP Reporters) connecting to a single 007 server each have isolated FEC blocks — packets from different peers are never mixed.
-- **Both ends must run 007**: FEC header prepended to all data packets makes them incompatible with standard WireGuard receivers. No negotiation/fallback.
-- **MTU auto-adjustment**: FEC adds 13 bytes per data packet (5 header + 8 nonce). Effective MTU is automatically reduced by 13 when bond manager is attached. No user configuration needed.
-- **Traffic separation**: Only traffic routed to the WireGuard TUN interface enters the bond tunnel. Other system traffic uses normal interfaces. Application binds to tunnel IP or uses policy routing.
+## API Response Examples
+
+### GET /api/stats
+```json
+{
+  "system_state": "healthy",
+  "tx_packets": 1957,
+  "rx_packets": 5765,
+  "fec_recovered": 32,
+  "nacks_sent": 27,
+  "arq_received": 36,
+  "jitter_delivered": 1779,
+  "jitter_late": 14,
+  "jitter_fec_fills": 30,
+  "jitter_arq_fills": 2,
+  "paths": [
+    {"path_id": 1603322990, "state": "healthy", "rtt_ms": 0.61, "loss": 0}
+  ]
+}
+```
+
+### GET /api/preset
+```json
+{
+  "preset": "broadcast",
+  "latency_budget_ms": 40
+}
+```

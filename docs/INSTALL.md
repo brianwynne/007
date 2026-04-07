@@ -1,344 +1,263 @@
-# 007 Bond — Installation and Testing Guide
+# 007 Bond — Installation Guide
 
-## Prerequisites
+## Production Install (Recommended)
 
-- **Go 1.23+**: https://go.dev/dl/
-- **Linux** (kernel 3.10+) for TUN device support
-- **Root access** for creating TUN interfaces
-- **Two or more network interfaces** for actual multi-path testing
+### Server
 
 ```bash
-# Verify Go version
-go version    # must be 1.23 or later
+curl -fsSL https://raw.githubusercontent.com/brianwynne/007/main/deploy/install-007-server.sh | sudo -E bash
 ```
 
-## Build
+This will:
+- Download the latest release binary for your platform
+- Create `bond007` system user with Linux capabilities
+- Set up systemd service, firewall (ufw), log rotation
+- Generate WireGuard keys
+- Start the enrollment service (port 8017)
+- Install the `007-bond` management CLI
+- Print the client connection command
+
+### Client (Token Enrollment)
+
+On the **server**, generate a one-time enrollment token:
 
 ```bash
-cd /mnt/c/Users/tighm/007
-
-# Run tests first
-go test ./bond/ -v
-
-# Build the binary
-go build -o 007 .
-
-# Verify
-./007 --version
+sudo 007-bond enroll-token
 ```
 
-Cross-compile for a target device (e.g., Raspberry Pi):
-```bash
-GOOS=linux GOARCH=arm64 go build -o 007-arm64 .
-GOOS=linux GOARCH=arm   go build -o 007-arm .
-```
-
-## Network Setup
-
-### Architecture
-
-```
-┌─────────────────────────┐         ┌─────────────────────────┐
-│  CLIENT (field device)  │         │  SERVER (data centre)   │
-│                         │         │                         │
-│  ┌─────────┐            │         │            ┌─────────┐  │
-│  │ bond0   │ tunnel IP  │         │  tunnel IP │ bond0   │  │
-│  │10.7.0.2 │            │         │            │10.7.0.1 │  │
-│  └────┬────┘            │         │            └────┬────┘  │
-│       │ 007             │         │             007 │       │
-│  ┌────┴────────────┐    │         │    ┌────────────┴────┐  │
-│  │ eth0   │ wlan0  │    │         │    │ eth0 (public)   │  │
-│  │.1.100  │ .0.50  │    │         │    │ 203.0.113.1     │  │
-│  └────┬───┴───┬────┘    │         │    └────────┬────────┘  │
-└───────┼───────┼─────────┘         └─────────────┼───────────┘
-        │       │                                 │
-    ethernet   WiFi ─────────────────────────── internet
-```
-
-### Server Setup
-
-The server is the fixed endpoint that all field devices connect to.
+This prints a client install command. On the **client**:
 
 ```bash
-# 1. Generate keys
-wg genkey | tee server_private.key | wg pubkey > server_public.key
-wg genkey | tee client_private.key | wg pubkey > client_public.key
-
-# 2. Create TUN interface
-sudo ip tuntap add dev bond0 mode tun
-
-# 3. Start 007
-sudo ./007 -f bond0 &
-
-# 4. Configure WireGuard identity
-sudo wg set bond0 \
-  listen-port 51820 \
-  private-key ./server_private.key
-
-# 5. Add client peer
-sudo wg set bond0 \
-  peer $(cat client_public.key) \
-  allowed-ips 10.7.0.2/32
-
-# 6. Assign tunnel IP and bring up
-sudo ip addr add 10.7.0.1/24 dev bond0
-sudo ip link set bond0 up
-
-# 7. Enable IP forwarding (if routing traffic)
-sudo sysctl -w net.ipv4.ip_forward=1
+curl -fsSL https://raw.githubusercontent.com/brianwynne/007/main/deploy/install-007-client.sh | \
+  sudo ENROLL_URL=http://<server_ip>:8017 ENROLL_TOKEN=<token> bash
 ```
 
-### Client Setup
+The client generates its own WireGuard keypair locally (private key never leaves the device), sends only the public key to the server, and receives the server's public key and tunnel IP in return.
 
-The client is the field device with multiple network interfaces.
+### Client (Manual Keys)
+
+If you already have keys:
 
 ```bash
-# 1. Create TUN interface
-sudo ip tuntap add dev bond0 mode tun
-
-# 2. Start 007
-sudo ./007 -f bond0 &
-
-# 3. Configure WireGuard identity + server endpoint
-sudo wg set bond0 \
-  private-key ./client_private.key \
-  peer $(cat server_public.key) \
-    endpoint 203.0.113.1:51820 \
-    allowed-ips 10.7.0.0/24 \
-    persistent-keepalive 25 \
-    bond_endpoint=203.0.113.1:51820@192.168.1.100 \
-    bond_endpoint=203.0.113.1:51820@10.0.0.50
-
-# 4. Assign tunnel IP and bring up
-sudo ip addr add 10.7.0.2/24 dev bond0
-sudo ip link set bond0 up
+curl -fsSL https://raw.githubusercontent.com/brianwynne/007/main/deploy/install-007-client.sh | \
+  sudo SERVER_IP=<ip> SERVER_PUB=<base64_key> CLIENT_KEY=<base64_key> bash
 ```
 
-**Key line**: `bond_endpoint=203.0.113.1:51820@192.168.1.100` means "send to server:51820 via the interface that owns 192.168.1.100 (ethernet)". The `@` binds the send socket to that local IP.
+### Upgrade
 
-### Verify Connectivity
+Re-run the installer — it detects existing installations and preserves config/keys:
 
 ```bash
-# From client
-ping 10.7.0.1
+# Server
+curl -fsSL https://raw.githubusercontent.com/brianwynne/007/main/deploy/install-007-server.sh | sudo -E bash
 
-# From server
-ping 10.7.0.2
+# Client
+curl -fsSL https://raw.githubusercontent.com/brianwynne/007/main/deploy/install-007-client.sh -o /tmp/007.sh && sudo bash /tmp/007.sh
 
-# Check WireGuard status
-sudo wg show bond0
-
-# Check bond stats
-curl http://127.0.0.1:8007/api/stats | jq .
-curl http://127.0.0.1:8007/api/paths | jq .
+# Or use the CLI
+sudo 007-bond upgrade
+sudo 007-bond upgrade --tag v0.3.3
 ```
 
-## Testing Scenarios
+## Directory Layout
 
-### Test 1: Basic Tunnel
+```
+/opt/007/                   — binary, helper scripts
+  007                       — main binary
+  setup-wg.sh              — WireGuard setup (runs on start)
+  add-bond-paths.sh        — interface detection (client only)
+  enroll-server.sh         — enrollment service (server only)
 
-Verify the tunnel works before adding bond paths.
+/etc/007/                   — configuration
+  .env                     — environment config (BOND_PRESET, BOND_FEC_MODE, etc.)
+  server.key / server.pub  — WireGuard keys (server)
+  client.key / server.pub  — WireGuard keys (client)
+  tokens/                  — enrollment tokens (server only)
 
-```bash
-# Client (no bond endpoints yet):
-sudo wg set bond0 peer $(cat server_public.key) \
-  endpoint 203.0.113.1:51820 \
-  allowed-ips 10.7.0.0/24
-
-ping -c 10 10.7.0.1
-# Should see ~0% loss, RTT matching your primary path
+/var/lib/007/              — persistent data
+/var/log/007/              — logs
 ```
 
-### Test 2: Multi-Path Redundancy
+## Systemd Services
 
-Add bond endpoints and verify traffic flows on all paths.
+| Service | Purpose | Both Sides |
+|---------|---------|------------|
+| `007-bond` | Main bonding service | Yes |
+| `007-bond-enroll` | Enrollment API (port 8017) | Server only |
+| `007-bond-paths.timer` | Auto-detect interfaces every 30s | Client only |
 
 ```bash
-# Add bond paths
-sudo wg set bond0 peer $(cat server_public.key) \
-  bond_endpoint=203.0.113.1:51820@192.168.1.100 \
-  bond_endpoint=203.0.113.1:51820@10.0.0.50
-
-# Monitor traffic on each interface (in separate terminals)
-sudo tcpdump -i eth0 udp port 51820 -c 20
-sudo tcpdump -i wlan0 udp port 51820 -c 20
-
-# Generate traffic
-ping -c 20 10.7.0.1
-
-# Both tcpdump sessions should show packets — multi-path is working
+sudo systemctl status 007-bond
+sudo journalctl -u 007-bond -f
 ```
 
-### Test 3: Path Failure Recovery
+## Configuration
 
-Simulate a path failure and verify seamless failover.
+Edit `/etc/007/.env`:
 
 ```bash
-# Start a continuous ping
-ping 10.7.0.1
+# Presets: broadcast (40ms), studio (80ms), field (200ms)
+BOND_PRESET=field
 
-# In another terminal, disable WiFi
-sudo ip link set wlan0 down
+# FEC strategy
+BOND_FEC_MODE=sliding
 
-# Ping should continue without interruption (ethernet still active)
+# API
+BOND_API=0.0.0.0:8007
+BOND_API_KEY=<auto-generated>
 
-# Re-enable WiFi
-sudo ip link set wlan0 up
-
-# Check stats — should show brief gap on WiFi path
-curl http://127.0.0.1:8007/api/paths | jq .
+# Logging
+LOG_LEVEL=error
 ```
 
-### Test 4: FEC Recovery
-
-Simulate packet loss and verify FEC recovers without retransmission.
+Change preset at runtime (no restart needed):
 
 ```bash
-# Add artificial packet loss on one interface (30% loss)
-sudo tc qdisc add dev eth0 root netem loss 30%
-
-# Run iperf through the tunnel
-# Server:
-iperf3 -s -B 10.7.0.1
-
-# Client:
-iperf3 -c 10.7.0.1 -t 30
-
-# Check FEC stats
-curl http://127.0.0.1:8007/api/stats | jq '{fec_recovered, fec_failed, reorder_gaps}'
-
-# Clean up
-sudo tc qdisc del dev eth0 root
+sudo 007-bond preset broadcast
 ```
 
-### Test 5: Reorder Buffer
-
-Simulate path latency differential and verify in-order delivery.
+## Management CLI
 
 ```bash
-# Add 50ms delay to WiFi path
-sudo tc qdisc add dev wlan0 root netem delay 50ms
-
-# Run traffic
-ping -c 100 10.7.0.1
-
-# Check reorder stats
-curl http://127.0.0.1:8007/api/stats | jq '{reorder_in_order, reorder_reordered, reorder_gaps, reorder_window_ms}'
-
-# Clean up
-sudo tc qdisc del dev wlan0 root
-```
-
-### Test 6: Audio (SIP Reporter Integration)
-
-Test with actual RTP audio through the tunnel.
-
-```bash
-# On the field device, configure SIP Reporter to bind to tunnel IP:
-# In settings: bind_address = 10.7.0.2
-
-# On the server, route SIP traffic to Kamailio:
-sudo iptables -t nat -A PREROUTING -d 10.7.0.1 -p udp --dport 5060 \
-  -j DNAT --to-destination 127.0.0.1:5060
-
-# Make a test call, then pull interfaces during the call
-# Audio should continue seamlessly
+sudo 007-bond status              # service, interface, peers, preset
+sudo 007-bond stats               # FEC, ARQ, jitter buffer statistics
+sudo 007-bond paths               # per-path health (RTT, loss, jitter)
+sudo 007-bond preset              # show current preset
+sudo 007-bond preset broadcast    # change preset (signals peers)
+sudo 007-bond preset field 10.7.0.3  # change preset on specific peer
+sudo 007-bond logs                # tail service logs
+sudo 007-bond start|stop|restart  # service management
+sudo 007-bond enroll-token        # generate enrollment token (server)
+sudo 007-bond list-tokens         # show pending tokens (server)
+sudo 007-bond revoke-token <tok>  # revoke token (server)
+sudo 007-bond add-client <key>    # add WireGuard peer manually
+sudo 007-bond upgrade             # upgrade to latest release
+sudo 007-bond version             # show installed version
+sudo 007-bond uninstall           # remove (preserves config/data)
 ```
 
 ## Management API
 
-The management API runs on `127.0.0.1:8007` by default. Change with `BOND_API` env var.
+All endpoints require `X-API-Key` header if `BOND_API_KEY` is set.
 
 ```bash
-# Full stats
-curl -s http://127.0.0.1:8007/api/stats | jq .
-# {
-#   "tx_packets": 15234,
-#   "rx_packets": 15200,
-#   "fec_recovered": 12,
-#   "fec_failed": 0,
-#   "reorder_in_order": 14800,
-#   "reorder_reordered": 388,
-#   "reorder_gaps": 2,
-#   "reorder_window_ms": 45,
-#   "paths": [
-#     { "path_id": 0, "rtt_ms": 12.5, "jitter_ms": 1.2, "loss": 0.001, "rx_count": 15200 }
-#   ]
-# }
+# Stats (FEC, ARQ, jitter buffer, paths)
+curl -H "X-API-Key:<key>" http://127.0.0.1:8007/api/stats | jq .
 
 # Per-path health
-curl -s http://127.0.0.1:8007/api/paths | jq .
+curl -H "X-API-Key:<key>" http://127.0.0.1:8007/api/paths | jq .
 
-# Config
-curl -s http://127.0.0.1:8007/api/config | jq .
+# Current preset
+curl -H "X-API-Key:<key>" http://127.0.0.1:8007/api/preset | jq .
 
-# Health check
-curl -s http://127.0.0.1:8007/api/health
+# Change preset at runtime
+curl -X POST -H "X-API-Key:<key>" -H "Content-Type: application/json" \
+  http://127.0.0.1:8007/api/preset -d '{"preset":"broadcast"}'
+
+# Health check (no auth required)
+curl http://127.0.0.1:8007/api/health
 ```
 
-## Environment Variables
+## Network Impairment Testing
 
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `BOND_FEC` | `1` (enabled) | Set to `0` to disable FEC |
-| `BOND_REORDER` | `1` (enabled) | Set to `0` to disable reorder buffer |
-| `BOND_API` | `127.0.0.1:8007` | Management API listen address |
-| `LOG_LEVEL` | `error` | Set to `verbose` for debug logging |
+The test suite validates FEC, ARQ, and multi-path recovery under simulated network conditions:
+
+```bash
+# Full suite (32 tests across 10 sections)
+curl -fsSL https://raw.githubusercontent.com/brianwynne/007/main/tests/007-impairment-suite.sh | sudo bash
+
+# Requires:
+# - 007 running with bond paths configured
+# - Server API accessible via tunnel (BOND_API=0.0.0.0:8007)
+# - Root privileges (tc/netem + iptables)
+```
+
+### Test Sections
+
+| Section | Tests | What It Validates |
+|---------|-------|-------------------|
+| A | Random loss | Multi-path absorbs per-interface loss |
+| B | Burst loss | FEC window recovery, ARQ for long bursts |
+| C | Path asymmetry | Reorder buffer handles delay differences |
+| D | Reorder | Jitter buffer delivers in order |
+| E | Jitter | Jitter buffer absorbs delay variation |
+| F | Short outages | Path failover and recovery |
+| G | Combined | Real-world WiFi/cellular scenarios |
+| H | Sliding FEC | Window-specific edge cases |
+| I | Single-path egress | Server FEC/ARQ recovery (no multi-path) |
+| J | Inbound loss | Client FEC/ARQ recovery (iptables) |
+
+## Firewall
+
+The installer configures ufw:
+
+| Port | Protocol | Purpose |
+|------|----------|---------|
+| 22 | TCP | SSH |
+| 51820 | UDP | WireGuard tunnel |
+| 8007 | TCP | Management API (tunnel-only on server) |
+| 8017 | TCP | Enrollment API (server only) |
+
+## Building from Source
+
+```bash
+# Prerequisites
+go version    # 1.23+
+
+# Build
+go build -o 007 .
+
+# Cross-compile for Raspberry Pi
+GOOS=linux GOARCH=arm64 go build -o 007-arm64 .    # RPi 4
+GOOS=linux GOARCH=arm go build -o 007-arm .         # RPi 3
+
+# Run tests
+go test ./bond/ -v
+
+# Help
+./007 --help
+```
 
 ## Troubleshooting
 
-### No traffic on bond paths
+### Tunnel not working after restart
+
 ```bash
-# Check bond paths are configured
-sudo wg show bond0
-
-# Verify local IPs exist
-ip addr show eth0     # should show the @localip you configured
-ip addr show wlan0
-
-# Check for firewall rules blocking UDP
-sudo iptables -L -n | grep 51820
+sudo 007-bond status         # check service is running
+sudo wg show bond0           # check WireGuard handshake
+sudo 007-bond restart        # restart service
 ```
 
-### FEC not recovering
-```bash
-# Check FEC stats
-curl -s http://127.0.0.1:8007/api/stats | jq '{fec_recovered, fec_failed}'
+### Stats showing "unauthorized"
 
-# fec_failed > 0 means loss exceeds FEC capacity
-# Consider: loss on ALL paths simultaneously exceeds M parity packets
-# Increase FEC ratio or add more paths
+The API key is set in `/etc/007/.env`. Use the CLI which handles auth automatically:
+
+```bash
+sudo 007-bond stats
 ```
 
-### High reorder gaps
-```bash
-# Check reorder window vs path latency
-curl -s http://127.0.0.1:8007/api/stats | jq '{reorder_window_ms}'
-curl -s http://127.0.0.1:8007/api/paths | jq '.[].rtt_ms'
+### High ping latency
 
-# If RTT >> window, the window is adapting (increases 10% per gap)
-# Should stabilise after ~30 seconds of traffic
+Check the preset — field preset adds 360ms (180ms each side):
+
+```bash
+sudo 007-bond preset         # show current preset
+sudo 007-bond preset broadcast   # switch to 40ms total
 ```
 
-### Tunnel works but slow
-```bash
-# Check MTU — 007 reduces it by 13 bytes for FEC overhead
-ip link show bond0    # should show mtu 1407 (1420 - 13)
+### FEC not recovering packets
 
-# If MTU is too low, application fragments more
-# Ensure outer link MTU is at least 1500
+Check FEC mode and verify with the impairment suite:
+
+```bash
+grep BOND_FEC_MODE /etc/007/.env    # should be "sliding"
+sudo 007-bond stats | grep fec     # check fec_recovered
 ```
 
-## Cleanup
+### Bond paths not detected
 
 ```bash
-# Stop 007
-sudo kill $(pgrep 007)
-
-# Remove TUN interface
-sudo ip link del bond0
-
-# Remove artificial network conditions
-sudo tc qdisc del dev eth0 root 2>/dev/null
-sudo tc qdisc del dev wlan0 root 2>/dev/null
+sudo 007-bond paths          # show active paths
+sudo systemctl status 007-bond-paths.timer   # check path monitor
+sudo /opt/007/add-bond-paths.sh              # manually re-scan
 ```
