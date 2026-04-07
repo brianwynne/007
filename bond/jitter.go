@@ -83,6 +83,14 @@ type JitterConfig struct {
 	DeliverFunc    func([]byte)  // called at playout time with packet data
 }
 
+// SetDepth changes the jitter buffer depth at runtime.
+// New packets will use the updated deadline; in-flight packets keep their existing deadline.
+func (jb *JitterBuffer) SetDepth(depth time.Duration) {
+	jb.mu.Lock()
+	defer jb.mu.Unlock()
+	jb.bufferDepth = depth
+}
+
 // NewJitterBuffer creates a new jitter buffer.
 func NewJitterBuffer(cfg JitterConfig) *JitterBuffer {
 	bufSize := int(cfg.BufferDepth / cfg.PacketInterval)

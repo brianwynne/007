@@ -46,6 +46,7 @@ func NewAPI(mgr *Manager, listenAddr, apiKey string) *API {
 	mux.HandleFunc("/api/stats", a.auth(a.handleStats))
 	mux.HandleFunc("/api/paths", a.auth(a.handlePaths))
 	mux.HandleFunc("/api/config", a.auth(a.handleConfig))
+	mux.HandleFunc("/api/preset", a.auth(a.handlePreset))
 	mux.HandleFunc("/api/health", a.handleHealth) // health check unauthenticated
 
 	a.server = &http.Server{
@@ -226,6 +227,33 @@ func (a *API) handleConfig(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, resp)
+}
+
+func (a *API) handlePreset(w http.ResponseWriter, r *http.Request) {
+	if r.Method == http.MethodGet {
+		s := a.mgr.GetStats()
+		writeJSON(w, map[string]interface{}{
+			"preset":            s.Preset,
+			"latency_budget_ms": s.LatencyBudgetMs,
+		})
+		return
+	}
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var req struct {
+		Preset string `json:"preset"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "invalid JSON", http.StatusBadRequest)
+		return
+	}
+	if err := a.mgr.SetPreset(req.Preset); err != nil {
+		writeJSON(w, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, map[string]string{"status": "ok", "preset": req.Preset})
 }
 
 func (a *API) handleHealth(w http.ResponseWriter, r *http.Request) {

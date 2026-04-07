@@ -407,6 +407,58 @@ func (m *Manager) Start() {
 		"latency_budget_ms", m.config.LatencyBudgetMs)
 }
 
+// SetPreset changes the latency preset at runtime without restart.
+// Updates config and adjusts jitter buffer depth on all peer states.
+func (m *Manager) SetPreset(name string) error {
+	var cfg Config
+	switch name {
+	case "broadcast":
+		cfg = BroadcastPreset()
+	case "studio":
+		cfg = StudioPreset()
+	case "field":
+		cfg = FieldPreset()
+	default:
+		return fmt.Errorf("unknown preset: %s (use broadcast, studio, or field)", name)
+	}
+
+	// Preserve runtime overrides
+	cfg.FECMode = m.config.FECMode
+	cfg.FECEnabled = m.config.FECEnabled
+	cfg.ARQEnabled = m.config.ARQEnabled
+	cfg.JitterEnabled = m.config.JitterEnabled
+
+	// Update config
+	m.config = cfg
+
+	// Calculate new jitter buffer depth
+	depthMs := cfg.LatencyBudgetMs
+	if cfg.FECEnabled {
+		fecFill := (cfg.FECLowK - 1) * cfg.PacketIntervalMs
+		depthMs -= fecFill
+	}
+	if depthMs < cfg.PacketIntervalMs {
+		depthMs = cfg.PacketIntervalMs
+	}
+	depth := time.Duration(depthMs) * time.Millisecond
+
+	// Update all active jitter buffers
+	m.peersMu.Lock()
+	for _, ps := range m.peers {
+		if ps.jitterBuf != nil {
+			ps.jitterBuf.SetDepth(depth)
+		}
+	}
+	m.peersMu.Unlock()
+
+	m.logger.Info("preset changed",
+		"preset", name,
+		"latency_budget_ms", cfg.LatencyBudgetMs,
+		"jitter_depth_ms", depthMs)
+
+	return nil
+}
+
 // Stop shuts down background goroutines.
 func (m *Manager) Stop() {
 	if !m.running.Swap(false) {
@@ -930,6 +982,8 @@ func (m *Manager) fecAdaptLoop() {
 // Stats returns current bond statistics.
 type Stats struct {
 	SystemState       string
+	Preset            string
+	LatencyBudgetMs   int
 	TxPackets         uint64
 	RxPackets         uint64
 	DropPackets       uint64
@@ -959,8 +1013,21 @@ type Stats struct {
 
 // GetStats returns current statistics aggregated across all peers.
 func (m *Manager) GetStats() Stats {
+	// Derive preset name from latency budget
+	preset := "field"
+	switch m.config.LatencyBudgetMs {
+	case 40:
+		preset = "broadcast"
+	case 80:
+		preset = "studio"
+	case 200:
+		preset = "field"
+	}
+
 	s := Stats{
 		SystemState:       SystemState(m.systemState.Load()).String(),
+		Preset:            preset,
+		LatencyBudgetMs:   m.config.LatencyBudgetMs,
 		TxPackets:         m.txPackets.Load(),
 		RxPackets:         m.rxPackets.Load(),
 		DropPackets:       m.dropPackets.Load(),

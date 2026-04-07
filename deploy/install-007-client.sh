@@ -50,7 +50,7 @@ SERVICE_USER="bond007"
 INTERFACE="bond0"
 TUNNEL_IP="10.7.0.2/24"
 SERVER_PORT="51820"
-API_ADDR="127.0.0.1:8007"
+API_ADDR="0.0.0.0:8007"
 
 # ─── Colours ──────────────────────────────────────────────────────────────
 RED='\033[0;31m'

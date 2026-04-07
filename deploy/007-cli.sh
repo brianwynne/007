@@ -329,22 +329,46 @@ cmd_preset() {
         *) err "Unknown preset: $preset (use broadcast, studio, or field)"; exit 1 ;;
     esac
 
+    # Update .env for persistence across restarts
     if ! grep -q "^BOND_PRESET=" "$CONFIG_DIR/.env" 2>/dev/null; then
         echo "BOND_PRESET=$preset" >> "$CONFIG_DIR/.env"
     else
         sed -i "s/^BOND_PRESET=.*/BOND_PRESET=$preset/" "$CONFIG_DIR/.env"
     fi
 
-    ok "Preset set to $preset"
-    info "Restarting service..."
-    systemctl restart "$SERVICE_NAME"
-    sleep 2
-    if systemctl is-active --quiet "$SERVICE_NAME"; then
-        ok "Service restarted with $preset preset"
+    # Apply at runtime via API (no restart needed)
+    load_env
+    local api_addr="${BOND_API:-127.0.0.1:8007}"
+    local api_key="${BOND_API_KEY:-}"
+    local auth_header=""
+    [[ -n "$api_key" ]] && auth_header="-H X-API-Key:$api_key"
+
+    if curl -s --max-time 3 $auth_header -X POST "http://${api_addr}/api/preset" \
+        -H "Content-Type: application/json" \
+        -d "{\"preset\":\"$preset\"}" | grep -q '"ok"' 2>/dev/null; then
+        ok "Local preset changed to $preset (runtime, no restart)"
     else
-        err "Service failed to restart"
-        journalctl -u "$SERVICE_NAME" --no-pager -n 10
+        info "Restarting service to apply preset..."
+        systemctl restart "$SERVICE_NAME"
+        sleep 2
     fi
+
+    # Push to all connected peers via tunnel
+    for peer_ip in $(wg show bond0 allowed-ips 2>/dev/null | awk '{print $2}' | cut -d/ -f1); do
+        # Skip our own tunnel IP
+        load_env
+        local my_ip="${TUNNEL_IP%%/*}"
+        [[ "$peer_ip" == "$my_ip" ]] && continue
+
+        info "Pushing preset to peer $peer_ip..."
+        if curl -s --max-time 3 -X POST "http://${peer_ip}:8007/api/preset" \
+            -H "Content-Type: application/json" \
+            -d "{\"preset\":\"$preset\"}" | grep -q '"ok"' 2>/dev/null; then
+            ok "Peer $peer_ip → $preset"
+        else
+            warn "Peer $peer_ip — could not reach API (may need BOND_API=0.0.0.0:8007)"
+        fi
+    done
 }
 
 cmd_help() {
