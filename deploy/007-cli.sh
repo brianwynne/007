@@ -86,11 +86,15 @@ cmd_status() {
         fi
     fi
 
-    # API health
+    # API health (health endpoint is unauthenticated)
     load_env
     local api_addr="${BOND_API:-127.0.0.1:8007}"
     if curl -s --max-time 2 "http://${api_addr}/api/health" | grep -q ok 2>/dev/null; then
+        # Get preset from authenticated stats
+        local cur_preset
+        cur_preset=$(api_curl /api/preset 2>/dev/null | python3 -c "import sys,json; print(json.load(sys.stdin).get('preset','?'))" 2>/dev/null || echo "?")
         echo -e "  API:      ${GREEN}healthy${NC} (http://${api_addr})"
+        echo "  Preset:   $cur_preset"
     else
         echo -e "  API:      ${RED}unreachable${NC}"
     fi
@@ -98,16 +102,22 @@ cmd_status() {
     echo ""
 }
 
-cmd_stats() {
+# Helper: curl with API key authentication
+api_curl() {
     load_env
     local api_addr="${BOND_API:-127.0.0.1:8007}"
-    curl -s --max-time 3 "http://${api_addr}/api/stats" | python3 -m json.tool 2>/dev/null || err "Stats unavailable"
+    local api_key="${BOND_API_KEY:-}"
+    local auth=()
+    [[ -n "$api_key" ]] && auth=(-H "X-API-Key:$api_key")
+    curl -s --max-time 3 "${auth[@]}" "http://${api_addr}$1" "${@:2}"
+}
+
+cmd_stats() {
+    api_curl /api/stats | python3 -m json.tool 2>/dev/null || err "Stats unavailable"
 }
 
 cmd_paths() {
-    load_env
-    local api_addr="${BOND_API:-127.0.0.1:8007}"
-    curl -s --max-time 3 "http://${api_addr}/api/paths" | python3 -m json.tool 2>/dev/null || err "Paths unavailable"
+    api_curl /api/paths | python3 -m json.tool 2>/dev/null || err "Paths unavailable"
 }
 
 cmd_logs() {
@@ -356,13 +366,7 @@ cmd_preset() {
     # Apply at runtime via API (no restart needed)
     # SetPreset also sends a preset control packet to all peers,
     # so the peer's jitter buffer for us changes automatically.
-    load_env
-    local api_addr="${BOND_API:-127.0.0.1:8007}"
-    local api_key="${BOND_API_KEY:-}"
-    local auth_header=""
-    [[ -n "$api_key" ]] && auth_header="-H X-API-Key:$api_key"
-
-    if curl -s --max-time 3 $auth_header -X POST "http://${api_addr}/api/preset" \
+    if api_curl /api/preset -X POST \
         -H "Content-Type: application/json" \
         -d "{\"preset\":\"$preset\"}" | grep -q '"ok"' 2>/dev/null; then
         ok "Preset → $preset (applied locally + signalled to peers)"
