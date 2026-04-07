@@ -35,14 +35,41 @@ const (
 )
 
 func printUsage() {
-	fmt.Printf("Usage: %s [-f/--foreground] INTERFACE-NAME\n", os.Args[0])
-	fmt.Printf("\n007 Bond — Multi-path network bonding with FEC and reordering\n")
-	fmt.Printf("Configure bond paths via UAPI: bond_endpoint=dest:port@localip\n")
+	fmt.Printf("Usage: %s [-f/--foreground] INTERFACE-NAME\n\n", os.Args[0])
+	fmt.Printf("007 Bond — Multi-path network bonding with FEC, ARQ, and jitter buffer\n\n")
+	fmt.Printf("Options:\n")
+	fmt.Printf("  -f, --foreground    Run in foreground (default: daemonize)\n")
+	fmt.Printf("  --version           Show version and exit\n")
+	fmt.Printf("  --help              Show this help\n\n")
+	fmt.Printf("Environment Variables:\n")
+	fmt.Printf("  BOND_PRESET         Latency preset (default: field)\n")
+	fmt.Printf("                        broadcast  40ms  — live broadcast, 20ms jitter buffer\n")
+	fmt.Printf("                        studio     80ms  — studio links, 60ms jitter buffer\n")
+	fmt.Printf("                        field      200ms — WiFi + cellular, 180ms jitter buffer\n")
+	fmt.Printf("  BOND_FEC_MODE       FEC strategy: block (default) or sliding (XOR window)\n")
+	fmt.Printf("  BOND_FEC            Set to 0 to disable FEC\n")
+	fmt.Printf("  BOND_JITTER         Set to 0 to disable jitter buffer (use legacy reorder)\n")
+	fmt.Printf("  BOND_REORDER        Set to 0 to disable reorder buffer\n")
+	fmt.Printf("  BOND_API            Management API listen address (default: 127.0.0.1:8007)\n")
+	fmt.Printf("  BOND_API_KEY        Optional API authentication key\n")
+	fmt.Printf("  LOG_LEVEL           Logging: verbose, error (default), silent\n\n")
+	fmt.Printf("Bond paths are configured via WireGuard UAPI:\n")
+	fmt.Printf("  wg set bond0 peer <pubkey> bond_endpoint=<server>:51820@<local_ip>\n\n")
+	fmt.Printf("Management API:\n")
+	fmt.Printf("  GET /api/stats      FEC, ARQ, jitter buffer statistics\n")
+	fmt.Printf("  GET /api/paths      Per-path health (RTT, loss, jitter)\n")
+	fmt.Printf("  GET /api/config     Current configuration\n")
+	fmt.Printf("  GET /api/health     Health check\n")
 }
 
 func main() {
 	if len(os.Args) == 2 && os.Args[1] == "--version" {
-		fmt.Printf("007 Bond v%s\n\nMulti-path network bonding for %s-%s.\nBased on wireguard-go. https://github.com/brianwynne/007\n", Version, runtime.GOOS, runtime.GOARCH)
+		fmt.Printf("007 Bond v%s (%s-%s)\n", Version, runtime.GOOS, runtime.GOARCH)
+		return
+	}
+
+	if len(os.Args) == 2 && (os.Args[1] == "--help" || os.Args[1] == "-h") {
+		printUsage()
 		return
 	}
 
