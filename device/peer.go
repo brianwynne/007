@@ -33,7 +33,14 @@ type Peer struct {
 		bondPaths      []BondPath    // multi-path send via per-interface sockets
 		clearSrcOnTx   bool          // signal to val.ClearSrc() prior to next packet transmission
 		disableRoaming bool
+
+		// Auto-discovered remote endpoints for multi-path send.
+		// When a peer sends from multiple source IPs (e.g. eth0 + wlan0),
+		// we track all of them and send replies to ALL — enabling seamless
+		// failover without requiring UAPI bond_endpoint configuration.
+		discovered     map[string]discoveredEndpoint // key = DstToString()
 	}
+
 
 	timers struct {
 		retransmitHandshake     *Timer
@@ -170,6 +177,14 @@ func (peer *Peer) SendBuffers(buffers [][]byte) error {
 	}
 	// Snapshot bond paths under lock (slice header only — BondPath structs are small)
 	bondPaths := peer.endpoint.bondPaths
+	// Snapshot discovered endpoints for multi-path send
+	var discoveredEPs []conn.Endpoint
+	primaryKey := endpoint.DstToString()
+	for key, de := range peer.endpoint.discovered {
+		if key != primaryKey { // don't duplicate the primary
+			discoveredEPs = append(discoveredEPs, de.endpoint)
+		}
+	}
 	peer.endpoint.Unlock()
 
 	// Send to primary endpoint via standard bind
@@ -182,8 +197,15 @@ func (peer *Peer) SendBuffers(buffers [][]byte) error {
 		peer.txBytes.Add(totalLen)
 	}
 
-	// Send to all bond paths via dedicated per-interface sockets
-	// Errors on bond paths are non-fatal — primary is authoritative
+	// Send to all discovered remote endpoints (auto-learned multi-path)
+	// This enables server→client multi-path without UAPI configuration.
+	// Errors are non-fatal — if a path is dead, packets are simply dropped.
+	for _, ep := range discoveredEPs {
+		peer.device.net.bind.Send(buffers, ep)
+	}
+
+	// Send to all configured bond paths via dedicated per-interface sockets
+	// (These are explicitly configured via UAPI bond_endpoint=)
 	for i := range bondPaths {
 		bondPaths[i].Send(buffers)
 	}
@@ -427,6 +449,11 @@ func (peer *Peer) Stop() {
 	peer.ClearBondPaths()
 }
 
+type discoveredEndpoint struct {
+	endpoint conn.Endpoint
+	lastSeen time.Time
+}
+
 func (peer *Peer) SetEndpointFromPacket(endpoint conn.Endpoint) {
 	peer.endpoint.Lock()
 	defer peer.endpoint.Unlock()
@@ -435,6 +462,26 @@ func (peer *Peer) SetEndpointFromPacket(endpoint conn.Endpoint) {
 	}
 	peer.endpoint.clearSrcOnTx = false
 	peer.endpoint.val = endpoint
+
+	// Track this source address for multi-path send.
+	// When a client sends from eth0 and wlan0, both addresses are
+	// recorded. SendBuffers sends to ALL discovered endpoints.
+	key := endpoint.DstToString()
+	if peer.endpoint.discovered == nil {
+		peer.endpoint.discovered = make(map[string]discoveredEndpoint)
+	}
+	peer.endpoint.discovered[key] = discoveredEndpoint{
+		endpoint: endpoint,
+		lastSeen: time.Now(),
+	}
+
+	// Evict endpoints not seen in the last 60 seconds
+	now := time.Now()
+	for k, de := range peer.endpoint.discovered {
+		if now.Sub(de.lastSeen) > 60*time.Second {
+			delete(peer.endpoint.discovered, k)
+		}
+	}
 }
 
 func (peer *Peer) markEndpointSrcForClearing() {
