@@ -382,6 +382,103 @@ cmd_preset() {
     fi
 }
 
+cmd_gateway() {
+    require_root
+    local action="${1:-}"
+    load_env
+    local iface
+    iface=$(ip route show default | awk '{print $5}' | head -1)
+    iface="${iface:-ens5}"
+
+    if [[ -z "$action" ]]; then
+        # Show current state
+        if grep -q "^BOND_GATEWAY=on" "$CONFIG_DIR/.env" 2>/dev/null; then
+            echo -e "${BOLD}Gateway mode: ${GREEN}ON${NC}"
+        else
+            echo -e "${BOLD}Gateway mode: ${RED}OFF${NC}"
+        fi
+        echo ""
+        echo "  When ON, the server NATs tunnel traffic to the internet."
+        echo "  Clients can route all traffic through the bond tunnel."
+        echo ""
+        echo "Usage:"
+        echo "  sudo 007-bond gateway on       Enable NAT gateway"
+        echo "  sudo 007-bond gateway off      Disable NAT gateway"
+        return
+    fi
+
+    case "$action" in
+        on)
+            # Enable IP forwarding
+            sysctl -w net.ipv4.ip_forward=1 > /dev/null
+            echo 'net.ipv4.ip_forward=1' > /etc/sysctl.d/007-forward.conf
+
+            # Add iptables rules (idempotent — delete first, then add)
+            iptables -D FORWARD -i bond0 -o "$iface" -j ACCEPT 2>/dev/null || true
+            iptables -D FORWARD -i "$iface" -o bond0 -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true
+            iptables -t nat -D POSTROUTING -s 10.7.0.0/24 -o "$iface" -j MASQUERADE 2>/dev/null || true
+
+            iptables -I FORWARD 1 -i bond0 -o "$iface" -j ACCEPT
+            iptables -I FORWARD 2 -i "$iface" -o bond0 -m state --state RELATED,ESTABLISHED -j ACCEPT
+            iptables -t nat -A POSTROUTING -s 10.7.0.0/24 -o "$iface" -j MASQUERADE
+
+            # Update all peers to allow all traffic
+            for peer in $(wg show bond0 peers 2>/dev/null); do
+                local current
+                current=$(wg show bond0 allowed-ips | grep "$peer" | awk '{print $2}')
+                if [[ "$current" != "0.0.0.0/0" ]]; then
+                    wg set bond0 peer "$peer" allowed-ips 0.0.0.0/0
+                fi
+            done
+
+            # Persist
+            if ! grep -q "^BOND_GATEWAY=" "$CONFIG_DIR/.env" 2>/dev/null; then
+                echo "BOND_GATEWAY=on" >> "$CONFIG_DIR/.env"
+            else
+                sed -i "s/^BOND_GATEWAY=.*/BOND_GATEWAY=on/" "$CONFIG_DIR/.env"
+            fi
+
+            ok "Gateway mode ON — tunnel clients can access the internet via this server"
+            info "Outgoing interface: $iface"
+            ;;
+        off)
+            # Remove iptables rules
+            iptables -D FORWARD -i bond0 -o "$iface" -j ACCEPT 2>/dev/null || true
+            iptables -D FORWARD -i "$iface" -o bond0 -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true
+            iptables -t nat -D POSTROUTING -s 10.7.0.0/24 -o "$iface" -j MASQUERADE 2>/dev/null || true
+
+            # Restore peers to tunnel-only
+            for peer in $(wg show bond0 peers 2>/dev/null); do
+                local peer_ip
+                peer_ip=$(wg show bond0 allowed-ips | grep "$peer" | awk '{print $2}')
+                if [[ "$peer_ip" == "0.0.0.0/0" ]]; then
+                    # Find the peer's tunnel IP from the routing table
+                    local tunnel_ip
+                    tunnel_ip=$(ip route show dev bond0 | grep -oP '10\.7\.0\.\d+' | head -1)
+                    if [[ -n "$tunnel_ip" ]]; then
+                        wg set bond0 peer "$peer" allowed-ips "${tunnel_ip}/32"
+                    fi
+                fi
+            done
+
+            # Disable forwarding
+            sysctl -w net.ipv4.ip_forward=0 > /dev/null
+            rm -f /etc/sysctl.d/007-forward.conf
+
+            # Persist
+            if grep -q "^BOND_GATEWAY=" "$CONFIG_DIR/.env" 2>/dev/null; then
+                sed -i "s/^BOND_GATEWAY=.*/BOND_GATEWAY=off/" "$CONFIG_DIR/.env"
+            fi
+
+            ok "Gateway mode OFF — tunnel restricted to bond network only"
+            ;;
+        *)
+            err "Usage: sudo 007-bond gateway on|off"
+            exit 1
+            ;;
+    esac
+}
+
 cmd_help() {
     echo "Usage: 007-bond <command> [args]"
     echo ""
@@ -395,6 +492,7 @@ cmd_help() {
     echo "  restart             Restart the service"
     echo "  preset [name]       Set latency preset locally + push to all peers"
     echo "  preset [name] <ip>  Set preset on a specific peer (remote help)"
+    echo "  gateway [on|off]    Enable/disable NAT gateway for tunnel clients"
     echo "  add-client <key>    Add a WireGuard client peer"
     echo "  enroll-token [ip]   Generate one-time enrollment token for a client"
     echo "  list-tokens         Show pending enrollment tokens"
@@ -415,6 +513,7 @@ case "${1:-help}" in
     stop)         cmd_stop ;;
     restart)      cmd_restart ;;
     preset)       shift; cmd_preset "$@" ;;
+    gateway)      shift; cmd_gateway "$@" ;;
     add-client)   shift; cmd_add_client "$@" ;;
     enroll-token) shift; cmd_enroll_token "$@" ;;
     list-tokens)  cmd_list_tokens ;;

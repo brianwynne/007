@@ -216,6 +216,18 @@ wg set "$INTERFACE" \
 ip addr add "$TUNNEL_IP" dev "$INTERFACE" 2>/dev/null || true
 ip link set "$INTERFACE" up
 
+# Re-apply gateway mode if enabled
+if [[ "${BOND_GATEWAY:-}" == "on" ]]; then
+    OUTIF=$(ip route show default | awk '{print $5}' | head -1)
+    OUTIF="${OUTIF:-ens5}"
+    sysctl -w net.ipv4.ip_forward=1 > /dev/null
+    iptables -I FORWARD 1 -i "$INTERFACE" -o "$OUTIF" -j ACCEPT 2>/dev/null || true
+    iptables -I FORWARD 2 -i "$OUTIF" -o "$INTERFACE" -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true
+    iptables -t nat -C POSTROUTING -s 10.7.0.0/24 -o "$OUTIF" -j MASQUERADE 2>/dev/null || \
+        iptables -t nat -A POSTROUTING -s 10.7.0.0/24 -o "$OUTIF" -j MASQUERADE
+    echo "Gateway mode re-applied (NAT via $OUTIF)"
+fi
+
 echo "WireGuard configured on $INTERFACE"
 SETUP_EOF
 chmod +x "$INSTALL_DIR/setup-wg.sh"

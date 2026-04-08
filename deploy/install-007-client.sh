@@ -287,11 +287,18 @@ done
 ip link show "$INTERFACE" > /dev/null 2>&1 || { echo "ERROR: $INTERFACE not created"; exit 1; }
 
 # Configure WireGuard
+# If gateway mode: allow all traffic through tunnel (server NATs it)
+# Otherwise: only tunnel network
+ALLOWED_IPS="10.7.0.0/24"
+if [[ "${BOND_GATEWAY:-}" == "on" ]]; then
+    ALLOWED_IPS="0.0.0.0/0"
+fi
+
 wg set "$INTERFACE" \
     private-key "$CONFIG_DIR/client.key" \
     peer "$(cat "$CONFIG_DIR/server.pub")" \
     endpoint "${SERVER_IP_SAVED}:${SERVER_PORT}" \
-    allowed-ips 10.7.0.0/24 \
+    allowed-ips "$ALLOWED_IPS" \
     persistent-keepalive 25
 
 # Assign tunnel IP and bring up
