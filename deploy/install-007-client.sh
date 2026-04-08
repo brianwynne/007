@@ -385,6 +385,17 @@ for iface in $(ip -4 -o addr show scope global | awk '{print $2}' | sort -u); do
     echo "  Bond path: $iface ($LOCAL_IP) → ${SERVER_IP_SAVED}:${SERVER_PORT}"
     UAPI_CMD="${UAPI_CMD}bond_endpoint=${SERVER_IP_SAVED}:${SERVER_PORT}@${LOCAL_IP}\n"
     COUNT=$((COUNT + 1))
+
+    # Policy-based routing: ensure each interface's traffic exits via that
+    # interface, not the default route. Critical when multiple interfaces
+    # share the same subnet (e.g. eth0 + wlan0 on same home router).
+    TABLE=$((100 + COUNT))
+    GW=$(ip route show default dev "$iface" 2>/dev/null | awk '{print $3}' | head -1)
+    if [[ -n "$GW" ]]; then
+        ip rule add from "$LOCAL_IP" table "$TABLE" prio $((32700 + COUNT)) 2>/dev/null || true
+        ip route replace default via "$GW" dev "$iface" table "$TABLE" 2>/dev/null || true
+        ip route replace "${LOCAL_IP%.*}.0/24" dev "$iface" scope link table "$TABLE" 2>/dev/null || true
+    fi
 done
 
 if [[ "$COUNT" -eq 0 ]]; then
