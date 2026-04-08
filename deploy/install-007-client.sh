@@ -133,7 +133,7 @@ fi
 
 # ─── Install system dependencies ─────────────────────────────────────────
 info "Checking dependencies..."
-for pkg in wireguard-tools curl jq; do
+for pkg in wireguard-tools curl jq xxd; do
     if ! dpkg -s "$pkg" > /dev/null 2>&1; then
         info "Installing $pkg..."
         DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "$pkg" > /dev/null 2>&1
