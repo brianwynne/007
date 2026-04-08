@@ -479,6 +479,113 @@ cmd_gateway() {
     esac
 }
 
+cmd_route() {
+    require_root
+    local action="${1:-}"
+    load_env
+    local current="${BOND_ROUTES:-}"
+
+    if [[ -z "$action" ]]; then
+        echo -e "${BOLD}Bond routes:${NC}"
+        if [[ -z "$current" ]]; then
+            echo "  (none — all traffic uses default route)"
+        else
+            IFS=',' read -ra ROUTES <<< "$current"
+            for host in "${ROUTES[@]}"; do
+                host=$(echo "$host" | xargs)
+                [[ -z "$host" ]] && continue
+                local resolved
+                if [[ "$host" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+                    resolved="$host"
+                else
+                    resolved=$(getent hosts "$host" 2>/dev/null | awk '{print $1}' | head -1)
+                fi
+                local via
+                via=$(ip route get "$resolved" 2>/dev/null | grep -oP 'dev \K\S+' | head -1)
+                echo "  $host ($resolved) via $via"
+            done
+        fi
+        echo ""
+        echo "Usage:"
+        echo "  sudo 007-bond route add <host>     Route host through bond tunnel"
+        echo "  sudo 007-bond route del <host>     Remove bond route"
+        echo "  sudo 007-bond route flush          Remove all bond routes"
+        return
+    fi
+
+    case "$action" in
+        add)
+            local host="${2:-}"
+            [[ -n "$host" ]] || { err "Usage: 007-bond route add <hostname_or_ip>"; exit 1; }
+
+            # Add to BOND_ROUTES in .env
+            if [[ -z "$current" ]]; then
+                new_routes="$host"
+            else
+                # Check for duplicate
+                if echo ",$current," | grep -q ",$host,"; then
+                    ok "$host already routed through bond"
+                    return
+                fi
+                new_routes="${current},${host}"
+            fi
+
+            if ! grep -q "^BOND_ROUTES=" "$CONFIG_DIR/.env" 2>/dev/null; then
+                echo "BOND_ROUTES=$new_routes" >> "$CONFIG_DIR/.env"
+            else
+                sed -i "s|^BOND_ROUTES=.*|BOND_ROUTES=$new_routes|" "$CONFIG_DIR/.env"
+            fi
+
+            # Apply immediately
+            local route_ip
+            if [[ "$host" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+                route_ip="$host"
+            else
+                route_ip=$(getent hosts "$host" 2>/dev/null | awk '{print $1}' | head -1)
+            fi
+            if [[ -n "$route_ip" ]]; then
+                ip route replace "$route_ip/32" via 10.7.0.1 dev bond0 2>/dev/null || true
+                ok "$host ($route_ip) → bond tunnel"
+            else
+                err "Could not resolve $host"
+            fi
+            ;;
+        del|remove)
+            local host="${2:-}"
+            [[ -n "$host" ]] || { err "Usage: 007-bond route del <hostname_or_ip>"; exit 1; }
+
+            # Remove from BOND_ROUTES
+            new_routes=$(echo "$current" | sed "s/$host//g" | sed 's/,,/,/g' | sed 's/^,//;s/,$//')
+            sed -i "s|^BOND_ROUTES=.*|BOND_ROUTES=$new_routes|" "$CONFIG_DIR/.env"
+
+            # Remove route immediately
+            local route_ip
+            if [[ "$host" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+                route_ip="$host"
+            else
+                route_ip=$(getent hosts "$host" 2>/dev/null | awk '{print $1}' | head -1)
+            fi
+            if [[ -n "$route_ip" ]]; then
+                ip route del "$route_ip/32" dev bond0 2>/dev/null || true
+            fi
+            ok "$host removed from bond routes"
+            ;;
+        flush)
+            sed -i "s|^BOND_ROUTES=.*|BOND_ROUTES=|" "$CONFIG_DIR/.env"
+            # Remove all bond0 host routes
+            ip route show dev bond0 | grep -v "10.7.0" | while read -r line; do
+                dest=$(echo "$line" | awk '{print $1}')
+                ip route del "$dest" dev bond0 2>/dev/null || true
+            done
+            ok "All bond routes removed"
+            ;;
+        *)
+            err "Usage: 007-bond route add|del|flush <host>"
+            exit 1
+            ;;
+    esac
+}
+
 cmd_help() {
     echo "Usage: 007-bond <command> [args]"
     echo ""
@@ -492,6 +599,7 @@ cmd_help() {
     echo "  restart             Restart the service"
     echo "  preset [name]       Set latency preset locally + push to all peers"
     echo "  preset [name] <ip>  Set preset on a specific peer (remote help)"
+    echo "  route [add|del] <h> Route specific hosts through bond tunnel"
     echo "  gateway [on|off]    Enable/disable NAT gateway for tunnel clients"
     echo "  add-client <key>    Add a WireGuard client peer"
     echo "  enroll-token [ip]   Generate one-time enrollment token for a client"
@@ -513,6 +621,7 @@ case "${1:-help}" in
     stop)         cmd_stop ;;
     restart)      cmd_restart ;;
     preset)       shift; cmd_preset "$@" ;;
+    route)        shift; cmd_route "$@" ;;
     gateway)      shift; cmd_gateway "$@" ;;
     add-client)   shift; cmd_add_client "$@" ;;
     enroll-token) shift; cmd_enroll_token "$@" ;;

@@ -258,6 +258,10 @@ BOND_FEC_MODE=sliding
 BOND_API=$API_ADDR
 LOG_LEVEL=error
 
+# Route these hosts through the bond tunnel (comma-separated)
+# e.g. BOND_ROUTES=sip.rtegroup.ie,54.220.131.205
+BOND_ROUTES=
+
 # Paths (do not change)
 INSTALL_DIR=$INSTALL_DIR
 CONFIG_DIR=$CONFIG_DIR
@@ -306,6 +310,31 @@ ip addr add "$TUNNEL_IP" dev "$INTERFACE" 2>/dev/null || true
 ip link set "$INTERFACE" up
 
 echo "WireGuard configured on $INTERFACE → ${SERVER_IP_SAVED}:${SERVER_PORT}"
+
+# Route specific hosts through the bond tunnel
+# BOND_ROUTES is a comma-separated list of hostnames or IPs
+# e.g. BOND_ROUTES=sip.rtegroup.ie,54.220.131.205
+if [[ -n "${BOND_ROUTES:-}" ]]; then
+    TUNNEL_GW="${TUNNEL_IP%%/*}"
+    TUNNEL_GW="${TUNNEL_GW%.*}.1"  # e.g. 10.7.0.1
+    IFS=',' read -ra ROUTES <<< "$BOND_ROUTES"
+    for host in "${ROUTES[@]}"; do
+        host=$(echo "$host" | xargs)  # trim whitespace
+        [[ -z "$host" ]] && continue
+        # Resolve hostname to IP if needed
+        if [[ "$host" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            ROUTE_IP="$host"
+        else
+            ROUTE_IP=$(getent hosts "$host" 2>/dev/null | awk '{print $1}' | head -1)
+        fi
+        if [[ -n "$ROUTE_IP" ]]; then
+            ip route replace "$ROUTE_IP/32" via "$TUNNEL_GW" dev "$INTERFACE" 2>/dev/null || true
+            echo "Route: $host ($ROUTE_IP) → tunnel via $TUNNEL_GW"
+        else
+            echo "WARNING: Could not resolve $host — skipping route"
+        fi
+    done
+fi
 
 # Add bond paths for all available interfaces
 /opt/007/add-bond-paths.sh || true
