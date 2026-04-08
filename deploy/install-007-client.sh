@@ -291,11 +291,23 @@ done
 ip link show "$INTERFACE" > /dev/null 2>&1 || { echo "ERROR: $INTERFACE not created"; exit 1; }
 
 # Configure WireGuard
-# If gateway mode: allow all traffic through tunnel (server NATs it)
-# Otherwise: only tunnel network
+# Build allowed-ips: tunnel network + any BOND_ROUTES destinations
 ALLOWED_IPS="10.7.0.0/24"
 if [[ "${BOND_GATEWAY:-}" == "on" ]]; then
     ALLOWED_IPS="0.0.0.0/0"
+elif [[ -n "${BOND_ROUTES:-}" ]]; then
+    # Add routed host IPs to allowed-ips so WireGuard accepts them
+    IFS=',' read -ra ROUTES <<< "$BOND_ROUTES"
+    for host in "${ROUTES[@]}"; do
+        host=$(echo "$host" | xargs)
+        [[ -z "$host" ]] && continue
+        if [[ "$host" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            ALLOWED_IPS="${ALLOWED_IPS},${host}/32"
+        else
+            RESOLVED=$(getent hosts "$host" 2>/dev/null | awk '{print $1}' | head -1)
+            [[ -n "$RESOLVED" ]] && ALLOWED_IPS="${ALLOWED_IPS},${RESOLVED}/32"
+        fi
+    done
 fi
 
 wg set "$INTERFACE" \
@@ -310,6 +322,7 @@ ip addr add "$TUNNEL_IP" dev "$INTERFACE" 2>/dev/null || true
 ip link set "$INTERFACE" up
 
 echo "WireGuard configured on $INTERFACE → ${SERVER_IP_SAVED}:${SERVER_PORT}"
+echo "Allowed IPs: $ALLOWED_IPS"
 
 # Route specific hosts through the bond tunnel
 # BOND_ROUTES is a comma-separated list of hostnames or IPs
