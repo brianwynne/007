@@ -105,6 +105,14 @@ class EnrollHandler(http.server.BaseHTTPRequestHandler):
             self._respond(500, {"error": "wg command not found"})
             return
 
+        # Persist peer for server restarts
+        peers_dir = os.path.join(CONFIG_DIR, "peers")
+        os.makedirs(peers_dir, exist_ok=True)
+        peer_file = os.path.join(peers_dir, tunnel_ip.replace(".", "_"))
+        with open(peer_file, "w") as f:
+            f.write(f"{client_pub}\n{tunnel_ip}\n")
+        os.chmod(peer_file, 0o600)
+
         # Consume token (one-time use)
         os.remove(token_file)
 

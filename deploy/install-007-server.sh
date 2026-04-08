@@ -216,6 +216,20 @@ wg set "$INTERFACE" \
 ip addr add "$TUNNEL_IP" dev "$INTERFACE" 2>/dev/null || true
 ip link set "$INTERFACE" up
 
+# Load persisted enrolled peers
+PEERS_DIR="$CONFIG_DIR/peers"
+if [[ -d "$PEERS_DIR" ]]; then
+    for pf in "$PEERS_DIR"/*; do
+        [[ -f "$pf" ]] || continue
+        PEER_PUB=$(sed -n '1p' "$pf")
+        PEER_IP=$(sed -n '2p' "$pf")
+        if [[ -n "$PEER_PUB" && -n "$PEER_IP" ]]; then
+            wg set "$INTERFACE" peer "$PEER_PUB" allowed-ips "${PEER_IP}/32"
+            echo "Loaded peer: $PEER_IP ($PEER_PUB)"
+        fi
+    done
+fi
+
 # Re-apply gateway mode if enabled
 if [[ "${BOND_GATEWAY:-}" == "on" ]]; then
     OUTIF=$(ip route show default | awk '{print $5}' | head -1)
@@ -277,6 +291,7 @@ ProtectControlGroups=true
 RestrictSUIDSGID=true
 PrivateTmp=true
 ProtectSystem=strict
+RuntimeDirectory=wireguard
 ReadWritePaths=$DATA_DIR $LOG_DIR /var/run/wireguard
 
 [Install]
@@ -295,7 +310,7 @@ curl -fsSL "https://raw.githubusercontent.com/$REPO/main/deploy/enroll-server.sh
 if [[ -f "$INSTALL_DIR/enroll-server.sh" ]]; then
     chmod +x "$INSTALL_DIR/enroll-server.sh"
     chown "$SERVICE_USER":"$SERVICE_USER" "$INSTALL_DIR/enroll-server.sh"
-    mkdir -p "$CONFIG_DIR/tokens"
+    mkdir -p "$CONFIG_DIR/tokens" "$CONFIG_DIR/peers"
     chown "$SERVICE_USER":"$SERVICE_USER" "$CONFIG_DIR/tokens"
 
     cat > "/etc/systemd/system/${SERVICE_NAME}-enroll.service" << EOF

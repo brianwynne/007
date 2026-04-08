@@ -413,6 +413,7 @@ ProtectControlGroups=true
 RestrictSUIDSGID=true
 PrivateTmp=true
 ProtectSystem=strict
+RuntimeDirectory=wireguard
 ReadWritePaths=$DATA_DIR $LOG_DIR /var/run/wireguard
 
 [Install]
