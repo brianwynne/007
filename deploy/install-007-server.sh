@@ -235,6 +235,9 @@ User=$SERVICE_USER
 Group=$SERVICE_USER
 EnvironmentFile=$CONFIG_DIR/.env
 ExecStartPre=+/bin/sh -c 'ip link del ${INTERFACE} 2>/dev/null; rm -f /var/run/wireguard/${INTERFACE}.sock; true'
+# Go runtime tuning — reduce GC frequency, cap memory
+Environment=GOGC=200
+Environment=GOMEMLIMIT=64MiB
 ExecStart=$INSTALL_DIR/007 -f \${INTERFACE}
 ExecStartPost=+$INSTALL_DIR/setup-wg.sh
 ExecStopPost=+/bin/sh -c 'ip link del ${INTERFACE} 2>/dev/null; rm -f /var/run/wireguard/${INTERFACE}.sock; true'
