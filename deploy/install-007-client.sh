@@ -291,23 +291,12 @@ done
 ip link show "$INTERFACE" > /dev/null 2>&1 || { echo "ERROR: $INTERFACE not created"; exit 1; }
 
 # Configure WireGuard
-# Build allowed-ips: tunnel network + any BOND_ROUTES destinations
+# With /etc/hosts approach, BOND_ROUTES hostnames resolve to the tunnel
+# gateway (10.7.0.1) which is inside 10.7.0.0/24 — already in allowed-ips.
+# No need to add individual IPs. Gateway mode uses 0.0.0.0/0.
 ALLOWED_IPS="10.7.0.0/24"
 if [[ "${BOND_GATEWAY:-}" == "on" ]]; then
     ALLOWED_IPS="0.0.0.0/0"
-elif [[ -n "${BOND_ROUTES:-}" ]]; then
-    # Add routed host IPs to allowed-ips so WireGuard accepts them
-    IFS=',' read -ra ROUTES <<< "$BOND_ROUTES"
-    for host in "${ROUTES[@]}"; do
-        host=$(echo "$host" | xargs)
-        [[ -z "$host" ]] && continue
-        if [[ "$host" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            ALLOWED_IPS="${ALLOWED_IPS},${host}/32"
-        else
-            RESOLVED=$(getent hosts "$host" 2>/dev/null | awk '{print $1}' | head -1)
-            [[ -n "$RESOLVED" ]] && ALLOWED_IPS="${ALLOWED_IPS},${RESOLVED}/32"
-        fi
-    done
 fi
 
 wg set "$INTERFACE" \
@@ -324,27 +313,26 @@ ip link set "$INTERFACE" up
 echo "WireGuard configured on $INTERFACE → ${SERVER_IP_SAVED}:${SERVER_PORT}"
 echo "Allowed IPs: $ALLOWED_IPS"
 
-# Route specific hosts through the bond tunnel
-# BOND_ROUTES is a comma-separated list of hostnames or IPs
-# e.g. BOND_ROUTES=sip.rtegroup.ie,54.220.131.205
+# Route hostnames through the bond tunnel via /etc/hosts override.
+# BOND_ROUTES hostnames resolve to the tunnel gateway IP (e.g. 10.7.0.1).
+# Traffic to these hostnames enters the tunnel transparently.
+# TLS certificates validate because SNI uses the original hostname.
+# No routing loop because the tunnel IP != the WireGuard endpoint IP.
 if [[ -n "${BOND_ROUTES:-}" ]]; then
     TUNNEL_GW="${TUNNEL_IP%%/*}"
     TUNNEL_GW="${TUNNEL_GW%.*}.1"  # e.g. 10.7.0.1
+
+    # Clean any previous 007 entries from /etc/hosts
+    sed -i '/# 007-bond/d' /etc/hosts
+
     IFS=',' read -ra ROUTES <<< "$BOND_ROUTES"
     for host in "${ROUTES[@]}"; do
-        host=$(echo "$host" | xargs)  # trim whitespace
+        host=$(echo "$host" | xargs)
         [[ -z "$host" ]] && continue
-        # Resolve hostname to IP if needed
-        if [[ "$host" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            ROUTE_IP="$host"
-        else
-            ROUTE_IP=$(getent hosts "$host" 2>/dev/null | awk '{print $1}' | head -1)
-        fi
-        if [[ -n "$ROUTE_IP" ]]; then
-            ip route replace "$ROUTE_IP/32" via "$TUNNEL_GW" dev "$INTERFACE" 2>/dev/null || true
-            echo "Route: $host ($ROUTE_IP) → tunnel via $TUNNEL_GW"
-        else
-            echo "WARNING: Could not resolve $host — skipping route"
+        # Only add hostnames, not raw IPs (IPs don't need DNS override)
+        if [[ ! "$host" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "$TUNNEL_GW  $host  # 007-bond" >> /etc/hosts
+            echo "Route: $host → $TUNNEL_GW (via /etc/hosts)"
         fi
     done
 fi
