@@ -468,6 +468,30 @@ type discoveredEndpoint struct {
 // rather than accumulated.
 const maxEndpointsPerIP = 3
 
+// maxEndpointsPerPeer is the global cap on discovered endpoints per peer.
+// Prevents unbounded growth when a client roams across many networks.
+// When exceeded, the globally oldest endpoint is evicted.
+const maxEndpointsPerPeer = 8
+
+// endpointGCTimeout is a long garbage-collection timeout for endpoints
+// that are truly gone (e.g. client physically disconnected an interface).
+// This is NOT a liveness check — it is deliberately much longer than
+// any keepalive or probe interval to avoid death spirals where eviction
+// removes an endpoint, stopping return traffic, which prevents the
+// endpoint from ever refreshing.
+//
+// Design rationale:
+//   - WireGuard persistent-keepalive: 25s
+//   - Bond probes: 1s (but only traverse active paths)
+//   - RFC 4787 minimum UDP NAT mapping: 2 minutes
+//   - Tailscale direct-path expiry: 2 minutes
+//   - MPTCP subflow timeout: 15-60s (but MPTCP never evicts, only marks failed)
+//
+// 10 minutes (600s) provides massive margin. The per-IP and per-peer caps
+// handle the important eviction cases (NAT rotation, interface roaming).
+// This timeout only catches endpoints that are truly abandoned.
+const endpointGCTimeout = 10 * time.Minute
+
 func (peer *Peer) SetEndpointFromPacket(endpoint conn.Endpoint) {
 	peer.endpoint.Lock()
 	defer peer.endpoint.Unlock()
@@ -494,9 +518,14 @@ func (peer *Peer) SetEndpointFromPacket(endpoint conn.Endpoint) {
 		lastSeen: now,
 	}
 
-	// Evict endpoints not seen in the last 60 seconds
+	// Garbage-collect endpoints not seen in a very long time (10 min).
+	// This is a safety net, not a liveness check. Short timeouts cause
+	// death spirals: eviction stops send traffic to that endpoint, which
+	// prevents return traffic, so the endpoint never refreshes.
+	// The per-IP and per-peer caps below handle the important cases
+	// (NAT port rotation, interface roaming) without this risk.
 	for k, de := range peer.endpoint.discovered {
-		if now.Sub(de.lastSeen) > 60*time.Second {
+		if now.Sub(de.lastSeen) > endpointGCTimeout {
 			delete(peer.endpoint.discovered, k)
 		}
 	}
@@ -520,6 +549,20 @@ func (peer *Peer) SetEndpointFromPacket(endpoint conn.Endpoint) {
 			if peer.endpoint.discovered[k].lastSeen.Before(oldestTime) {
 				oldestKey = k
 				oldestTime = peer.endpoint.discovered[k].lastSeen
+			}
+		}
+		delete(peer.endpoint.discovered, oldestKey)
+	}
+
+	// Cap total endpoints per peer: prevents unbounded growth when
+	// client roams across many different networks over time.
+	for len(peer.endpoint.discovered) > maxEndpointsPerPeer {
+		oldestKey := ""
+		var oldestTime time.Time
+		for k, de := range peer.endpoint.discovered {
+			if oldestKey == "" || de.lastSeen.Before(oldestTime) {
+				oldestKey = k
+				oldestTime = de.lastSeen
 			}
 		}
 		delete(peer.endpoint.discovered, oldestKey)
