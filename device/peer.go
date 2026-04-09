@@ -499,10 +499,11 @@ const maxEndpointsPerPeer = 8
 //   - Tailscale direct-path expiry: 2 minutes
 //   - MPTCP subflow timeout: 15-60s (but MPTCP never evicts, only marks failed)
 //
-// 10 minutes (600s) provides massive margin. The per-IP and per-peer caps
-// handle the important eviction cases (NAT rotation, interface roaming).
-// This timeout only catches endpoints that are truly abandoned.
-const endpointGCTimeout = 10 * time.Minute
+// 2 minutes (120s) matches RFC 4787 minimum UDP NAT mapping timeout.
+// With stable sockets (idempotent AddBondPath, lock file script), port
+// rotation no longer causes death spirals. Per-IP and per-peer caps
+// handle NAT rotation and interface roaming.
+const endpointGCTimeout = 2 * time.Minute
 
 func (peer *Peer) SetEndpointFromPacket(endpoint conn.Endpoint) {
 	peer.endpoint.Lock()
