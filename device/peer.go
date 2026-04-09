@@ -188,25 +188,19 @@ func (peer *Peer) SendBuffers(buffers [][]byte) error {
 
 	if len(bondPaths) == 0 {
 		// Server side — send via standard bind.
-		if len(discoveredEPs) > 0 {
-			// Discovered endpoints exist — send to ALL of them ONLY.
-			// Skip endpoint.val (primary) as it may be a stale handshake
-			// address. The discovered map contains only actively seen
-			// endpoints with 60-second expiry.
-			for _, ep := range discoveredEPs {
-				peer.device.net.bind.Send(buffers, ep)
+		// Always send to primary endpoint AND all discovered endpoints.
+		// This ensures data gets through even during the window between
+		// handshake and endpoint discovery populating.
+		err = peer.device.net.bind.Send(buffers, endpoint)
+		if err == nil {
+			var totalLen uint64
+			for _, b := range buffers {
+				totalLen += uint64(len(b))
 			}
-		} else {
-			// No discovered endpoints yet — use primary only
-			// (initial handshake, before any data packets arrive)
-			err = peer.device.net.bind.Send(buffers, endpoint)
-			if err == nil {
-				var totalLen uint64
-				for _, b := range buffers {
-					totalLen += uint64(len(b))
-				}
-				peer.txBytes.Add(totalLen)
-			}
+			peer.txBytes.Add(totalLen)
+		}
+		for _, ep := range discoveredEPs {
+			peer.device.net.bind.Send(buffers, ep)
 		}
 	} else {
 		// Bond paths configured (client side) — send via dedicated
