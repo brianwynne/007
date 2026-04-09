@@ -187,27 +187,29 @@ func (peer *Peer) SendBuffers(buffers [][]byte) error {
 	}
 	peer.endpoint.Unlock()
 
-	// Send to primary endpoint via standard bind
-	err := peer.device.net.bind.Send(buffers, endpoint)
-	if err == nil {
-		var totalLen uint64
-		for _, b := range buffers {
-			totalLen += uint64(len(b))
+	var err error
+
+	if len(bondPaths) == 0 {
+		// No bond paths configured (server side) — send via standard bind.
+		// Primary endpoint first, then all auto-discovered endpoints.
+		err = peer.device.net.bind.Send(buffers, endpoint)
+		if err == nil {
+			var totalLen uint64
+			for _, b := range buffers {
+				totalLen += uint64(len(b))
+			}
+			peer.txBytes.Add(totalLen)
 		}
-		peer.txBytes.Add(totalLen)
-	}
-
-	// Send to all discovered remote endpoints (auto-learned multi-path)
-	// This enables server→client multi-path without UAPI configuration.
-	// Errors are non-fatal — if a path is dead, packets are simply dropped.
-	for _, ep := range discoveredEPs {
-		peer.device.net.bind.Send(buffers, ep)
-	}
-
-	// Send to all configured bond paths via dedicated per-interface sockets
-	// (These are explicitly configured via UAPI bond_endpoint=)
-	for i := range bondPaths {
-		bondPaths[i].Send(buffers)
+		for _, ep := range discoveredEPs {
+			peer.device.net.bind.Send(buffers, ep)
+		}
+	} else {
+		// Bond paths configured (client side) — send via dedicated
+		// per-interface sockets ONLY. No primary bind send — that would
+		// be a redundant third copy via kernel-picked interface.
+		for i := range bondPaths {
+			bondPaths[i].Send(buffers)
+		}
 	}
 
 	return err
