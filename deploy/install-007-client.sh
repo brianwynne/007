@@ -253,7 +253,7 @@ TUNNEL_IP=$TUNNEL_IP
 
 # Bond features
 # Presets: broadcast (40ms), studio (80ms), field (200ms)
-BOND_PRESET=field
+BOND_PRESET=studio
 BOND_FEC_MODE=sliding
 BOND_API=$API_ADDR
 LOG_LEVEL=error
