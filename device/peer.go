@@ -175,33 +175,38 @@ func (peer *Peer) SendBuffers(buffers [][]byte) error {
 		endpoint.ClearSrc()
 		peer.endpoint.clearSrcOnTx = false
 	}
-	// Snapshot bond paths under lock (slice header only — BondPath structs are small)
+	// Snapshot bond paths under lock
 	bondPaths := peer.endpoint.bondPaths
-	// Snapshot discovered endpoints for multi-path send
+	// Snapshot discovered endpoints under lock
 	var discoveredEPs []conn.Endpoint
-	primaryKey := endpoint.DstToString()
-	for key, de := range peer.endpoint.discovered {
-		if key != primaryKey { // don't duplicate the primary
-			discoveredEPs = append(discoveredEPs, de.endpoint)
-		}
+	for _, de := range peer.endpoint.discovered {
+		discoveredEPs = append(discoveredEPs, de.endpoint)
 	}
 	peer.endpoint.Unlock()
 
 	var err error
 
 	if len(bondPaths) == 0 {
-		// No bond paths configured (server side) — send via standard bind.
-		// Primary endpoint first, then all auto-discovered endpoints.
-		err = peer.device.net.bind.Send(buffers, endpoint)
-		if err == nil {
-			var totalLen uint64
-			for _, b := range buffers {
-				totalLen += uint64(len(b))
+		// Server side — send via standard bind.
+		if len(discoveredEPs) > 0 {
+			// Discovered endpoints exist — send to ALL of them ONLY.
+			// Skip endpoint.val (primary) as it may be a stale handshake
+			// address. The discovered map contains only actively seen
+			// endpoints with 60-second expiry.
+			for _, ep := range discoveredEPs {
+				peer.device.net.bind.Send(buffers, ep)
 			}
-			peer.txBytes.Add(totalLen)
-		}
-		for _, ep := range discoveredEPs {
-			peer.device.net.bind.Send(buffers, ep)
+		} else {
+			// No discovered endpoints yet — use primary only
+			// (initial handshake, before any data packets arrive)
+			err = peer.device.net.bind.Send(buffers, endpoint)
+			if err == nil {
+				var totalLen uint64
+				for _, b := range buffers {
+					totalLen += uint64(len(b))
+				}
+				peer.txBytes.Add(totalLen)
+			}
 		}
 	} else {
 		// Bond paths configured (client side) — send via dedicated
