@@ -538,14 +538,22 @@ func (m *Manager) ProcessOutbound(peerID uint32, packet []byte, nonce uint64) []
 
 	ps := m.getPeerState(peerID)
 
-	// Sliding-window FEC path
+	// Non-UDP traffic (TCP, ICMP) bypasses the entire bond pipeline.
+	// No FEC encoding, no dataSeq, no repair packets. Just send raw.
+	// Multi-path still works (SendBuffers sends on all paths).
+	// TCP has its own retransmission and ordering.
+	if isNonUDP(packet) {
+		return [][]byte{packet}
+	}
+
+	// Sliding-window FEC path (UDP/RTP only)
 	if m.config.FECEnabled && ps.slidingEnc != nil {
 		encodedData, repairPkt, dataSeq := ps.slidingEnc.Encode(packet, nonce)
 		ps.retransmit.Store(packet, dataSeq)
 		return [][]byte{encodedData, repairPkt}
 	}
 
-	// Block FEC path
+	// Block FEC path (UDP/RTP only)
 	if !m.config.FECEnabled || ps.encoder == nil {
 		ps.retransmit.Store(packet, nonce)
 		return [][]byte{packet}
@@ -563,6 +571,28 @@ func (m *Manager) ProcessOutbound(peerID uint32, packet []byte, nonce uint64) []
 // ProcessInbound handles a packet on the receive path.
 // Called after decryption and replay filter validation, before TUN write.
 //
+// isNonUDP returns true for valid IP packets that are NOT UDP.
+// These bypass the entire bond recovery pipeline (FEC, ARQ, jitter buffer).
+// Only UDP (RTP audio) needs the full recovery chain.
+// Returns false for non-IP packets, short packets, and UDP — those go
+// through the normal pipeline.
+func isNonUDP(pkt []byte) bool {
+	switch pkt[0] >> 4 {
+	case 4: // IPv4: protocol at offset 9
+		if len(pkt) < 20 {
+			return false // too short for valid IPv4
+		}
+		return pkt[9] != 17 // true for TCP(6), ICMP(1), etc.
+	case 6: // IPv6: next header at offset 6
+		if len(pkt) < 40 {
+			return false
+		}
+		return pkt[6] != 17
+	default:
+		return false // not IP — don't bypass
+	}
+}
+
 // Pipeline: FEC decode → reorder data packets → deliver recovered immediately.
 // Returns IP packets ready for TUN delivery, or nil if buffered.
 func (m *Manager) ProcessInbound(peerID uint32, packet []byte, nonce uint64, pathID int) [][]byte {
@@ -579,6 +609,15 @@ func (m *Manager) ProcessInbound(peerID uint32, packet []byte, nonce uint64, pat
 	// Check for control packets (NACK, retransmit, etc.)
 	if isControlPacket(packet) {
 		return m.handleControl(ps, packet, pathID)
+	}
+
+	// Non-FEC packets (TCP, ICMP) bypass the entire recovery pipeline.
+	// These were sent raw by ProcessOutbound (no FEC header).
+	// Raw IP packets start with version nibble 4 (IPv4, min 20 bytes)
+	// or 6 (IPv6, min 40 bytes). FEC packets start with 0x01/0x02
+	// (sliding) or a blockID (block). Control = 0xFF (handled above).
+	if isNonUDP(packet) {
+		return [][]byte{packet}
 	}
 
 	// Sliding-window FEC decode
@@ -602,6 +641,10 @@ func (m *Manager) ProcessInbound(peerID uint32, packet []byte, nonce uint64, pat
 			if data != nil {
 				if isControlPacket(data.Data) {
 					m.handleControl(ps, data.Data, pathID)
+				} else if isNonUDP(data.Data) {
+					// TCP/ICMP — deliver immediately, skip jitter buffer
+					result = append(result, data.Data)
+					ps.jitterBuf.Skip(data.DataSeq)
 				} else {
 					ps.jitterBuf.Insert(data.Data, data.DataSeq, sourceData)
 				}
@@ -636,10 +679,13 @@ func (m *Manager) ProcessInbound(peerID uint32, packet []byte, nonce uint64, pat
 				}
 			}
 
-			// Step 3: Insert FEC-recovered packets (fills gaps that ARQ is already racing)
+			// Insert FEC-recovered packets (fills gaps that ARQ is already racing)
 			for _, rec := range recovered {
 				if isControlPacket(rec.Data) {
 					m.handleControl(ps, rec.Data, pathID)
+				} else if isNonUDP(rec.Data) {
+					result = append(result, rec.Data)
+					ps.jitterBuf.Skip(rec.DataSeq)
 				} else {
 					ps.jitterBuf.Insert(rec.Data, rec.DataSeq, sourceFEC)
 				}
@@ -665,12 +711,13 @@ func (m *Manager) ProcessInbound(peerID uint32, packet []byte, nonce uint64, pat
 
 		// --- JITTER BUFFER PATH ---
 		if ps.jitterBuf != nil {
-			// Insert data packet into jitter buffer (delivered by playout ticker)
-			// Skip control packets that were FEC-encoded (probes, echoes) —
-			// they're not valid IP and would cause TUN write errors.
+			// Insert data packet — control and non-UDP bypass the jitter buffer.
 			if data != nil {
 				if isControlPacket(data.Data) {
 					m.handleControl(ps, data.Data, pathID)
+				} else if isNonUDP(data.Data) {
+					result = append(result, data.Data)
+					ps.jitterBuf.Skip(data.DataSeq)
 				} else {
 					ps.jitterBuf.Insert(data.Data, data.DataSeq, sourceData)
 				}
@@ -706,10 +753,13 @@ func (m *Manager) ProcessInbound(peerID uint32, packet []byte, nonce uint64, pat
 					m.triggerNACK(ps)
 				}
 			}
-			// Step 3: Insert FEC-recovered packets (fills gaps that ARQ is already racing)
+			// Insert FEC-recovered packets (fills gaps that ARQ is already racing)
 			for _, rec := range recovered {
 				if isControlPacket(rec.Data) {
 					m.handleControl(ps, rec.Data, pathID)
+				} else if isNonUDP(rec.Data) {
+					result = append(result, rec.Data)
+					ps.jitterBuf.Skip(rec.DataSeq)
 				} else {
 					ps.jitterBuf.Insert(rec.Data, rec.DataSeq, sourceFEC)
 				}
@@ -830,6 +880,10 @@ func (m *Manager) handleControl(ps *peerState, packet []byte, pathID int) [][]by
 		if payload != nil {
 			m.arqReceived.Add(1)
 			if ps.jitterBuf != nil {
+				if isNonUDP(payload) {
+					ps.jitterBuf.Skip(seq)
+					return [][]byte{payload}
+				}
 				ps.jitterBuf.Insert(payload, seq, sourceARQ)
 				return nil
 			} else if ps.reorderBuf != nil {

@@ -110,6 +110,43 @@ func NewJitterBuffer(cfg JitterConfig) *JitterBuffer {
 	}
 }
 
+// Skip marks a dataSeq as consumed without buffering data.
+// Used for non-media packets (TCP, ICMP) that bypass the jitter buffer.
+// Prevents phantom gaps and false NACKs for skipped sequences.
+func (jb *JitterBuffer) Skip(dataSeq uint64) {
+	jb.mu.Lock()
+	defer jb.mu.Unlock()
+
+	if !jb.initialized {
+		return
+	}
+
+	if dataSeq < jb.baseSeq {
+		return // already past
+	}
+
+	if dataSeq >= jb.baseSeq+uint64(jb.bufSize) {
+		return // too far ahead
+	}
+
+	idx := dataSeq % maxJitterSlots
+	slot := &jb.slots[idx]
+
+	if slot.filled && slot.dataSeq == dataSeq {
+		return // already filled
+	}
+
+	// Mark as filled with nil data — playout loop will skip it
+	slot.data = nil
+	slot.dataSeq = dataSeq
+	slot.filled = true
+	slot.deadline = time.Time{} // zero deadline = skip immediately
+
+	if dataSeq >= jb.writeHead {
+		jb.writeHead = dataSeq + 1
+	}
+}
+
 // Insert places a packet into the jitter buffer.
 // The packet will be delivered after bufferDepth from now.
 // Returns true if accepted, false if late or duplicate.
@@ -213,14 +250,15 @@ func (jb *JitterBuffer) playoutReady() {
 
 		if slot.filled && slot.dataSeq == jb.baseSeq {
 			// Packet present — check if deadline passed
-			if now.Before(slot.deadline) {
+			// Skipped slots (nil data, zero deadline) pass through immediately
+			if slot.data != nil && now.Before(slot.deadline) {
 				break // not time yet
 			}
-			// Deliver
-			if jb.deliverFunc != nil {
+			// Deliver (skip nil data slots — they were bypassed packets)
+			if jb.deliverFunc != nil && slot.data != nil {
 				jb.deliverFunc(slot.data)
+				jb.deliveredCount++
 			}
-			jb.deliveredCount++
 			slot.data = nil
 			slot.filled = false
 			slot.source = sourceNone
