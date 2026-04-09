@@ -169,7 +169,7 @@ func BroadcastPreset() Config {
 		PacketIntervalMs: 20,
 
 		FECEnabled:  true,
-		FECMode:     "block", // "block" or "sliding" — block is default, sliding is opt-in
+		FECMode:     "sliding", // "sliding" or "block" — sliding is default
 		FECAdaptive: false,
 		SlidingWindowSize: DefaultSlidingWindow,
 		FECLowK: 2, FECLowM: 2,

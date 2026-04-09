@@ -249,9 +249,6 @@ func main() {
 	if os.Getenv("BOND_FEC") == "0" {
 		bondCfg.FECEnabled = false
 	}
-	if os.Getenv("BOND_REORDER") == "0" {
-		bondCfg.ReorderEnabled = false
-	}
 	if os.Getenv("BOND_FEC_MODE") == "sliding" {
 		bondCfg.FECMode = "sliding"
 	}
@@ -264,6 +261,10 @@ func main() {
 		bondCfg.ReorderMaxMs = 200
 		bondCfg.ReorderFlushMs = 10
 		bondCfg.ReorderAdaptSec = 1
+	}
+	// BOND_REORDER last — overrides any fallback enabling above
+	if os.Getenv("BOND_REORDER") == "0" {
+		bondCfg.ReorderEnabled = false
 	}
 	bondLogger := bond.NewStdLogger(log.New(os.Stderr, fmt.Sprintf("(%s) ", interfaceName), log.LstdFlags))
 	bondMgr, err := bond.NewManager(bondCfg, bondLogger)
