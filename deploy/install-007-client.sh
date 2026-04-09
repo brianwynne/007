@@ -359,49 +359,43 @@ cat > "$INSTALL_DIR/add-bond-paths.sh" << 'PATHS_EOF'
 #!/usr/bin/env bash
 # Detect all network interfaces and add them as bond paths.
 # Called by setup-wg.sh on startup and by the path monitor timer.
+#
+# IMPORTANT: Only reconfigures bond paths if the set of interfaces
+# has changed. Clearing and re-adding destroys sockets, rotates
+# source ports, and breaks NAT pinholes.
 set -euo pipefail
 
 source /etc/007/.env
 
 IFACE="${INTERFACE:-bond0}"
 WG_SOCK="/var/run/wireguard/${IFACE}.sock"
+STATE_FILE="/var/lib/007/bond-paths.state"
 
 if [[ ! -S "$WG_SOCK" ]]; then
     echo "UAPI socket not found: $WG_SOCK"
     exit 1
 fi
 
-# Get peer public key in hex for UAPI
-SERVER_PUB_HEX=$(cat "$CONFIG_DIR/server.pub" | base64 -d | xxd -p -c 32)
-
-# Build UAPI command: clear existing bond paths, then add all detected
-UAPI_CMD="set=1\npublic_key=${SERVER_PUB_HEX}\nclear_bond_endpoints=true\n"
-
+# Discover current interfaces with routes to server
+CURRENT_PATHS=""
 COUNT=0
 SKIPPED=0
 for iface in $(ip -4 -o addr show scope global | awk '{print $2}' | sort -u); do
-    # Skip the tunnel interface itself
     [[ "$iface" == "$IFACE" ]] && continue
 
     LOCAL_IP=$(ip -4 addr show "$iface" | grep inet | awk '{print $2}' | cut -d/ -f1 | head -1)
-    if [[ -z "$LOCAL_IP" ]]; then
-        continue
-    fi
+    [[ -z "$LOCAL_IP" ]] && continue
 
-    # Verify this interface can route to the server
     if ! ip route get "$SERVER_IP_SAVED" from "$LOCAL_IP" > /dev/null 2>&1; then
-        echo "  Skip:      $iface ($LOCAL_IP) — no route to ${SERVER_IP_SAVED}"
         SKIPPED=$((SKIPPED + 1))
         continue
     fi
 
-    echo "  Bond path: $iface ($LOCAL_IP) → ${SERVER_IP_SAVED}:${SERVER_PORT}"
-    UAPI_CMD="${UAPI_CMD}bond_endpoint=${SERVER_IP_SAVED}:${SERVER_PORT}@${LOCAL_IP}\n"
+    CURRENT_PATHS="${CURRENT_PATHS}${iface}:${LOCAL_IP}\n"
     COUNT=$((COUNT + 1))
 
-    # Policy-based routing: ensure each interface's traffic exits via that
-    # interface, not the default route. Critical when multiple interfaces
-    # share the same subnet (e.g. eth0 + wlan0 on same home router).
+    # Policy-based routing: ensure each interface's traffic exits via
+    # that interface. Critical when multiple interfaces share a subnet.
     TABLE=$((100 + COUNT))
     GW=$(ip route show default dev "$iface" 2>/dev/null | awk '{print $3}' | head -1)
     if [[ -n "$GW" ]]; then
@@ -416,7 +410,29 @@ if [[ "$COUNT" -eq 0 ]]; then
     exit 0
 fi
 
+# Compare with previous state — only reconfigure if changed
+PREVIOUS_PATHS=""
+[[ -f "$STATE_FILE" ]] && PREVIOUS_PATHS=$(cat "$STATE_FILE")
+
+if [[ "$(echo -e "$CURRENT_PATHS")" == "$PREVIOUS_PATHS" ]]; then
+    # No change — don't destroy existing sockets
+    exit 0
+fi
+
+# Interfaces changed — reconfigure bond paths
+SERVER_PUB_HEX=$(cat "$CONFIG_DIR/server.pub" | base64 -d | xxd -p -c 32)
+UAPI_CMD="set=1\npublic_key=${SERVER_PUB_HEX}\nclear_bond_endpoints=true\n"
+
+while IFS=: read -r iface local_ip; do
+    [[ -z "$iface" ]] && continue
+    echo "  Bond path: $iface ($local_ip) → ${SERVER_IP_SAVED}:${SERVER_PORT}"
+    UAPI_CMD="${UAPI_CMD}bond_endpoint=${SERVER_IP_SAVED}:${SERVER_PORT}@${local_ip}\n"
+done <<< "$(echo -e "$CURRENT_PATHS")"
+
 printf "${UAPI_CMD}\n" | nc -U "$WG_SOCK" -w 1 > /dev/null 2>&1 || true
+
+# Save state for next comparison
+echo -e "$CURRENT_PATHS" > "$STATE_FILE"
 echo "Configured $COUNT bond path(s)${SKIPPED:+, skipped $SKIPPED (no route)}"
 PATHS_EOF
 chmod +x "$INSTALL_DIR/add-bond-paths.sh"
