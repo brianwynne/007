@@ -349,8 +349,10 @@ if [[ -n "${BOND_ROUTES:-}" ]]; then
     done
 fi
 
+# Clear bond path lock — sockets are new after service restart
+rm -f /var/lib/007/bond-paths.lock
+
 # Add bond paths for all available interfaces
-# AddBondPath is idempotent — safe to call on every start
 /opt/007/add-bond-paths.sh || true
 SETUP_EOF
 chmod +x "$INSTALL_DIR/setup-wg.sh"
@@ -361,53 +363,38 @@ cat > "$INSTALL_DIR/add-bond-paths.sh" << 'PATHS_EOF'
 # Detect all network interfaces and add them as bond paths.
 # Called by setup-wg.sh on startup and by the path monitor timer.
 #
-# AddBondPath is idempotent — adding a path that already exists is
-# a no-op. No need to clear and re-add. No state file needed.
-# Existing sockets and NAT pinholes are always preserved.
+# Uses a lock file to prevent duplicate socket creation. The lock
+# contains the interface list from the last successful configure.
+# If interfaces haven't changed, the script exits early (no UAPI
+# command, no socket churn). setup-wg.sh deletes the lock on
+# service start so paths are always configured on first run.
 set -euo pipefail
 
 source /etc/007/.env
 
 IFACE="${INTERFACE:-bond0}"
 WG_SOCK="/var/run/wireguard/${IFACE}.sock"
+LOCK_FILE="/var/lib/007/bond-paths.lock"
 
 if [[ ! -S "$WG_SOCK" ]]; then
     echo "UAPI socket not found: $WG_SOCK"
     exit 1
 fi
 
-SERVER_PUB_HEX=$(cat "$CONFIG_DIR/server.pub" | base64 -d | xxd -p -c 32)
-
-# Add bond path for each interface with a route to the server.
-# AddBondPath is idempotent — existing paths are silently skipped.
-# No clear_bond_endpoints — never destroy working sockets.
-UAPI_CMD="set=1\npublic_key=${SERVER_PUB_HEX}\n"
-
+# Build desired interface list
+DESIRED=""
 COUNT=0
 SKIPPED=0
 for iface in $(ip -4 -o addr show scope global | awk '{print $2}' | sort -u); do
     [[ "$iface" == "$IFACE" ]] && continue
-
     LOCAL_IP=$(ip -4 addr show "$iface" | grep inet | awk '{print $2}' | cut -d/ -f1 | head -1)
     [[ -z "$LOCAL_IP" ]] && continue
-
     if ! ip route get "$SERVER_IP_SAVED" from "$LOCAL_IP" > /dev/null 2>&1; then
         SKIPPED=$((SKIPPED + 1))
         continue
     fi
-
-    UAPI_CMD="${UAPI_CMD}bond_endpoint=${SERVER_IP_SAVED}:${SERVER_PORT}@${LOCAL_IP}\n"
+    DESIRED="${DESIRED}${iface}:${LOCAL_IP}\n"
     COUNT=$((COUNT + 1))
-
-    # Policy-based routing: ensure each interface's traffic exits via
-    # that interface. Critical when multiple interfaces share a subnet.
-    TABLE=$((100 + COUNT))
-    GW=$(ip route show default dev "$iface" 2>/dev/null | awk '{print $3}' | head -1)
-    if [[ -n "$GW" ]]; then
-        ip rule add from "$LOCAL_IP" table "$TABLE" prio $((32700 + COUNT)) 2>/dev/null || true
-        ip route replace default via "$GW" dev "$iface" table "$TABLE" 2>/dev/null || true
-        ip route replace "${LOCAL_IP%.*}.0/24" dev "$iface" scope link table "$TABLE" 2>/dev/null || true
-    fi
 done
 
 if [[ "$COUNT" -eq 0 ]]; then
@@ -415,7 +402,35 @@ if [[ "$COUNT" -eq 0 ]]; then
     exit 0
 fi
 
+# Compare with lock — skip if unchanged
+if [[ -f "$LOCK_FILE" ]] && [[ "$(echo -e "$DESIRED")" == "$(cat "$LOCK_FILE")" ]]; then
+    exit 0
+fi
+
+# Reconfigure: clear and re-add all paths
+SERVER_PUB_HEX=$(cat "$CONFIG_DIR/server.pub" | base64 -d | xxd -p -c 32)
+UAPI_CMD="set=1\npublic_key=${SERVER_PUB_HEX}\nclear_bond_endpoints=true\n"
+
+while IFS=: read -r iface local_ip; do
+    [[ -z "$iface" ]] && continue
+    echo "  Bond path: $iface ($local_ip) -> ${SERVER_IP_SAVED}:${SERVER_PORT}"
+    UAPI_CMD="${UAPI_CMD}bond_endpoint=${SERVER_IP_SAVED}:${SERVER_PORT}@${local_ip}\n"
+
+    # Policy routing
+    TABLE=$((100 + COUNT))
+    GW=$(ip route show default dev "$iface" 2>/dev/null | awk '{print $3}' | head -1)
+    if [[ -n "$GW" ]]; then
+        ip rule add from "$local_ip" table "$TABLE" prio $((32700 + COUNT)) 2>/dev/null || true
+        ip route replace default via "$GW" dev "$iface" table "$TABLE" 2>/dev/null || true
+        ip route replace "${local_ip%.*}.0/24" dev "$iface" scope link table "$TABLE" 2>/dev/null || true
+    fi
+done <<< "$(echo -e "$DESIRED")"
+
 printf "${UAPI_CMD}\n" | nc -U "$WG_SOCK" -w 1 > /dev/null 2>&1 || true
+
+# Save lock
+echo -e "$DESIRED" > "$LOCK_FILE"
+echo "Configured $COUNT bond path(s)"
 PATHS_EOF
 chmod +x "$INSTALL_DIR/add-bond-paths.sh"
 
