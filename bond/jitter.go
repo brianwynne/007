@@ -93,9 +93,13 @@ func (jb *JitterBuffer) SetDepth(depth time.Duration) {
 
 // NewJitterBuffer creates a new jitter buffer.
 func NewJitterBuffer(cfg JitterConfig) *JitterBuffer {
-	bufSize := int(cfg.BufferDepth / cfg.PacketInterval)
-	if bufSize < 1 {
-		bufSize = 1
+	// Buffer must be larger than the number of packets expected during
+	// bufferDepth, otherwise packets arriving at the tail end of the
+	// buffer window trigger a sequence jump that wipes all buffered data.
+	// Use 4x headroom to absorb timing jitter and multi-path bursts.
+	bufSize := int(cfg.BufferDepth/cfg.PacketInterval) * 4
+	if bufSize < 4 {
+		bufSize = 4
 	}
 	if bufSize > maxJitterSlots {
 		bufSize = maxJitterSlots
