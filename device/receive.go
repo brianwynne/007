@@ -470,10 +470,13 @@ func (peer *Peer) RoutineSequentialReceiver(maxBatchSize int) {
 
 			validTailPacket = i
 			if peer.ReceivedWithKeypair(elem.keypair) {
-				peer.SetEndpointFromPacket(elem.endpoint)
 				peer.timersHandshakeComplete()
 				peer.SendStagedPackets()
 			}
+			// Update endpoint for EVERY packet — discovers all source
+			// endpoints for multi-path send. Previously only called on
+			// keypair rotation (once) and for the last packet in batch.
+			peer.SetEndpointFromPacket(elem.endpoint)
 			rxBytesLen += uint64(len(elem.packet) + MinMessageSize)
 
 			if len(elem.packet) == 0 {
@@ -578,7 +581,7 @@ func (peer *Peer) RoutineSequentialReceiver(maxBatchSize int) {
 
 		peer.rxBytes.Add(rxBytesLen)
 		if validTailPacket >= 0 {
-			peer.SetEndpointFromPacket(elemsContainer.elems[validTailPacket].endpoint)
+			// SetEndpointFromPacket already called per-packet above
 			peer.keepKeyFreshReceiving()
 			peer.timersAnyAuthenticatedPacketTraversal()
 			peer.timersAnyAuthenticatedPacketReceived()
