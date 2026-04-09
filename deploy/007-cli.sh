@@ -272,7 +272,8 @@ cmd_enroll_token() {
     chown bond007:bond007 "$token_dir/$token" 2>/dev/null || true
 
     local server_ip
-    server_ip=$(hostname -I | awk '{print $1}')
+    # Try to detect public IP (for cloud instances behind NAT)
+    server_ip=$(curl -s --max-time 3 ifconfig.me 2>/dev/null || hostname -I | awk '{print $1}')
 
     echo ""
     echo -e "${BOLD}Enrollment token generated${NC}"

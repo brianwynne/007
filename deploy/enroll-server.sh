@@ -116,13 +116,17 @@ class EnrollHandler(http.server.BaseHTTPRequestHandler):
         # Consume token (one-time use)
         os.remove(token_file)
 
-        # Get server endpoint
-        try:
-            ip = subprocess.run(
-                ["hostname", "-I"], capture_output=True, text=True, timeout=5
-            ).stdout.split()[0]
-        except Exception:
-            ip = "unknown"
+        # Get server endpoint — use the IP the client connected to
+        # (from the HTTP request), not hostname -I which returns the
+        # private IP on cloud instances behind NAT.
+        ip = self.headers.get("Host", "").split(":")[0]
+        if not ip or ip in ("localhost", "127.0.0.1", "0.0.0.0"):
+            try:
+                ip = subprocess.run(
+                    ["hostname", "-I"], capture_output=True, text=True, timeout=5
+                ).stdout.split()[0]
+            except Exception:
+                ip = "unknown"
 
         listen_port = os.environ.get("LISTEN_PORT", "51820")
 
