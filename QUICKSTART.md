@@ -88,4 +88,13 @@ sudo 007-bond restart         # restart service
 sudo 007-bond upgrade         # upgrade to latest
 ```
 
+## Prerequisites
+
+- Linux kernel bonding module (`bonding.ko`) must NOT be loaded. If present, blacklist it: `echo "blacklist bonding" > /etc/modprobe.d/007-no-bonding.conf`
+- The installer handles all other prerequisites (wireguard-tools, ARP sysctl, policy routing)
+
+## Troubleshooting
+
+If you see issues after upgrading, try a clean install -- some "regressions" (e.g. v0.5.4) turned out to be stale state from previous testing, not code bugs. A clean install resolves them.
+
 Full documentation: [INSTALL.md](docs/INSTALL.md) | [IMPLEMENTATION.md](docs/IMPLEMENTATION.md)

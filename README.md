@@ -17,7 +17,7 @@ APP (e.g. SIP Reporter)
 ```
 
 - Every encrypted packet is sent on ALL paths (client and server)
-- Server auto-discovers client endpoints from incoming packets -- no UAPI config needed on the server side
+- Server auto-discovers client endpoints from incoming packets -- no UAPI config needed on the server side (per-IP cap of 3, per-peer cap of 8, 10-minute GC timeout)
 - Client configures bond paths via UAPI (`add-bond-paths.sh` detects interfaces automatically)
 - Receiver discards duplicates (WireGuard replay filter)
 - Sliding-window FEC (XOR) recovers single losses in 20ms
@@ -29,8 +29,8 @@ APP (e.g. SIP Reporter)
 
 Multi-path works in both directions without manual server configuration:
 
-- **Client -> Server**: Client's `add-bond-paths.sh` detects all interfaces and configures bond paths via UAPI. Each interface sends through a dedicated socket.
-- **Server -> Client**: Server auto-discovers client source addresses from incoming packets. `SendBuffers` sends replies to ALL discovered endpoints. Endpoints not seen for 60s are evicted.
+- **Client -> Server**: Client's `add-bond-paths.sh` detects all interfaces and configures bond paths via UAPI. Each interface sends through a dedicated socket. `SendBuffers` sends via bond path sockets only (no primary bind send).
+- **Server -> Client**: Server auto-discovers client source addresses from incoming packets. `SendBuffers` sends to ALL discovered endpoints only (no stale primary). Per-IP cap of 3 endpoints (handles NAT port rotation), per-peer cap of 8 endpoints, 10-minute GC timeout (deliberately long to prevent death spirals where eviction stops traffic which prevents return traffic).
 
 This means the server needs zero per-client path configuration. When a client sends from eth0 and wlan0, the server automatically learns both addresses and replies to both.
 
@@ -171,7 +171,7 @@ Runs as dedicated `bond007` system user with Linux capabilities (`CAP_NET_ADMIN`
 Systemd services:
 - `007-bond` -- main bonding service (Go runtime tuned: `GOGC=200`, `GOMEMLIMIT=64MiB`)
 - `007-bond-enroll` -- enrollment API (server only, port 8017)
-- `007-bond-paths.timer` -- auto-detects interfaces every 30s (client only)
+- `007-bond-paths.timer` -- auto-detects interfaces every 30s (client only). Uses lock file (`/var/lib/007/bond-paths.lock`) to skip reconfiguration when interfaces haven't changed. Lock cleared on service start.
 
 Systemd hardening: `RuntimeDirectory=wireguard`, `ProtectSystem=strict`, `NoNewPrivileges=true`.
 
@@ -187,6 +187,27 @@ ip route replace default via <gw> dev wlan0 table 102
 ```
 
 This is automatic -- no manual configuration needed.
+
+## ARP Flux Fix
+
+When multiple interfaces share the same subnet, Linux's weak host model causes ARP flux: both interfaces answer ARP requests for each other's IPs, and the router learns the wrong MAC address. The installer applies sysctl settings to fix this:
+
+```
+net.ipv4.conf.all.arp_filter=1     # reply only on the correct interface
+net.ipv4.conf.all.arp_announce=2   # use the best local address for ARP source
+net.ipv4.conf.all.arp_ignore=1     # reply only if target IP is on the incoming interface
+```
+
+Persisted in `/etc/sysctl.d/007-arp.conf`. Without this, multi-path over same-subnet interfaces (e.g. eth0 + wlan0 on the same router) will intermittently fail.
+
+## Kernel Bonding Conflict
+
+Linux kernel bonding (`bonding.ko`) must not be loaded, as it conflicts with the `bond0` TUN interface name and can interfere with network configuration. If kernel bonding is present, blacklist it:
+
+```bash
+echo "blacklist bonding" > /etc/modprobe.d/007-no-bonding.conf
+rmmod bonding 2>/dev/null || true
+```
 
 ## Testing
 

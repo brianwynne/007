@@ -15,10 +15,16 @@ This will:
 - Set up systemd service with Go runtime tuning (`GOGC=200`, `GOMEMLIMIT=64MiB`)
 - Configure `RuntimeDirectory=wireguard` for the UAPI socket
 - Generate WireGuard keys
-- Start the enrollment service (port 8017)
+- Start the enrollment service (port 8017) with `ReadWritePaths` for `/etc/007/peers` (peer persistence)
 - Configure firewall (ufw)
 - Install the `007-bond` management CLI
 - Persist enrolled peers in `/etc/007/peers/`
+
+**Important**: If Linux kernel bonding (`bonding.ko`) is loaded, it must be removed first. It conflicts with the `bond0` TUN interface. Blacklist it with:
+```bash
+echo "blacklist bonding" > /etc/modprobe.d/007-no-bonding.conf
+rmmod bonding 2>/dev/null || true
+```
 
 ### Client (Token Enrollment)
 
@@ -103,6 +109,22 @@ sudo 007-bond enroll-token
 | `007-bond` | Main bonding service | Both |
 | `007-bond-enroll` | Enrollment API (port 8017) | Server only |
 | `007-bond-paths.timer` | Auto-detect interfaces every 30s | Client only |
+
+### Path Monitor Lock File
+
+The `007-bond-paths.timer` triggers `add-bond-paths.sh` every 30 seconds. To prevent duplicate socket creation on timer ticks, the script uses a lock file (`/var/lib/007/bond-paths.lock`) that stores the current interface list. If interfaces haven't changed since the last run, the script exits early -- no UAPI command, no socket churn. The lock file is cleared on service start (`setup-wg.sh`) so paths are always configured on first run.
+
+The Go code is also idempotent: `AddBondPath` checks for an existing path with the same local IP before creating a new socket, so it is safe to call multiple times even without the lock file.
+
+### ARP Flux Fix (Client)
+
+The client installer applies sysctl settings (`/etc/sysctl.d/007-arp.conf`) for correct ARP behaviour on multi-interface hosts sharing the same subnet:
+
+- `arp_filter=1` -- reply only on the interface that owns the IP
+- `arp_announce=2` -- use the best local address as ARP source
+- `arp_ignore=1` -- respond only if the target IP is configured on the incoming interface
+
+Without these, Linux's weak host model causes ARP flux: the router learns the wrong MAC for an IP, and traffic goes to the wrong interface.
 
 The main service runs with:
 - `GOGC=200` and `GOMEMLIMIT=64MiB` (Go runtime tuning to reduce GC frequency)
@@ -374,6 +396,10 @@ sudo 007-bond paths          # show active paths
 sudo systemctl status 007-bond-paths.timer   # check path monitor
 sudo /opt/007/add-bond-paths.sh              # manually re-scan
 ```
+
+### v0.5.4 "regression" on upgrade
+
+The v0.5.4 issues were caused by stale state from previous testing, not a code bug. A clean install (`sudo 007-bond uninstall && curl ... | sudo bash`) resolves it. When troubleshooting upgrade issues, always try a clean install first.
 
 ### xxd not found
 

@@ -45,12 +45,18 @@ peer.endpoint.discovered[key] = discoveredEndpoint{
 }
 ```
 
-When `SendBuffers` runs, it sends to:
-1. The primary endpoint (standard WireGuard)
-2. All discovered endpoints (auto-learned from incoming packets)
-3. All configured bond paths (UAPI, client-side only)
+`SendBuffers` uses two distinct strategies depending on role:
 
-Endpoints not seen for 60 seconds are evicted from the discovered map.
+- **Client (bond paths configured)**: Sends via bond path sockets ONLY. No primary bind send -- that would be a redundant copy via the kernel-picked interface.
+- **Server (no bond paths)**: Sends to ALL discovered endpoints ONLY (when any exist). The primary endpoint (`endpoint.val`) is skipped as it may be a stale handshake address. Falls back to primary only during initial handshake before any data packets arrive.
+
+### Endpoint Discovery Caps
+
+Discovered endpoints are subject to three eviction mechanisms:
+
+1. **Per-IP cap (3)**: Limits port mappings per unique source IP. When a client has N bond paths behind the same NAT, each produces a different source port. When NAT ports rotate, old entries are replaced rather than accumulated.
+2. **Per-peer cap (8)**: Global limit on discovered endpoints per peer. When exceeded, the globally oldest endpoint is evicted.
+3. **GC timeout (10 minutes)**: Endpoints not seen for 10 minutes are evicted. This is deliberately long -- short timeouts (e.g. 60s) cause death spirals where eviction stops send traffic to that endpoint, which prevents return traffic, so the endpoint never refreshes. The per-IP and per-peer caps handle the important eviction cases (NAT rotation, interface roaming). The GC timeout only catches endpoints that are truly abandoned.
 
 This design means the server automatically learns all client paths and replies to all of them -- seamless failover without UAPI configuration.
 
@@ -181,9 +187,15 @@ bond_endpoint=server:51820@wlan0_ip
 
 The client's path monitor timer (`007-bond-paths.timer`) re-scans interfaces every 30 seconds. Only interfaces with a route to the server are added as bond paths. Policy-based routing rules are created for interfaces sharing the same subnet.
 
+#### Lock file and idempotency
+
+`add-bond-paths.sh` uses a lock file (`/var/lib/007/bond-paths.lock`) containing the current interface list. If interfaces haven't changed, the script exits early -- no UAPI command, no socket churn. The lock is cleared on service start so paths are always configured on first run.
+
+The Go `AddBondPath` function is also idempotent: it checks for an existing path with the same local IP before creating a new socket. This means the script can safely call `AddBondPath` for every detected interface on every timer tick without creating duplicate sockets.
+
 ### Server side (automatic)
 
-No configuration needed. The server's `SetEndpointFromPacket` in `device/peer.go` tracks all source addresses from incoming packets. `SendBuffers` sends to all discovered endpoints plus the primary endpoint.
+No configuration needed. The server's `SetEndpointFromPacket` in `device/peer.go` tracks all source addresses from incoming packets. `SendBuffers` sends to all discovered endpoints only (not the primary endpoint, which may be stale).
 
 ## SIP/RTP Routing
 
@@ -241,9 +253,29 @@ The systemd service sets:
 
 The systemd service uses `RuntimeDirectory=wireguard` to ensure `/var/run/wireguard/` exists at startup. Without this, the UAPI socket (`/var/run/wireguard/bond0.sock`) cannot be created and `add-bond-paths.sh` fails.
 
+### Enrollment Public IP Discovery
+
+The enrollment endpoint returns the server's public IP to the client. It uses the `Host` header from the HTTP request (the IP the client actually connected to), not `hostname -I` which returns the private IP on cloud instances behind NAT (e.g. AWS). Fallback: `curl -s ifconfig.me`. The CLI (`007-bond enroll-token`) also uses `curl ifconfig.me` when displaying the enrollment command.
+
+### Enroll Service Systemd Hardening
+
+The enrollment service runs with `ProtectSystem=strict` and `ReadWritePaths` for `/etc/007/tokens`, `/etc/007/peers`, and `/var/run/wireguard`. The `/etc/007/peers` path is required for peer persistence -- without it, the service cannot save enrolled peer configs and peers would be lost on restart.
+
 ### Peer Persistence
 
 Enrolled peers are saved to `/etc/007/peers/<tunnel_ip>` (two lines: public key, tunnel IP). `setup-wg.sh` loads all persisted peers on startup, ensuring they survive service restarts.
+
+### ARP Flux Fix
+
+The client installer writes `/etc/sysctl.d/007-arp.conf` with `arp_filter=1`, `arp_announce=2`, `arp_ignore=1`. This is necessary when multiple interfaces share the same subnet (e.g. eth0 + wlan0 on the same home router). Without it, Linux's weak host model allows both interfaces to respond to ARP requests for each other's IPs, causing the router to learn the wrong MAC address and route traffic to the wrong interface.
+
+### Kernel Bonding Conflict
+
+The Linux kernel bonding module (`bonding.ko`) must not be loaded. It conflicts with 007's `bond0` TUN interface name. If present, blacklist it in `/etc/modprobe.d/007-no-bonding.conf`. The Raspberry Pi test unit had this blacklisted.
+
+### Clean Install vs Upgrade (v0.5.4)
+
+The v0.5.4 "regression" was stale state from previous testing (old sockets, stale lock files, leftover routing rules), not a code bug. A clean install (`uninstall` + fresh install) resolved all issues. When troubleshooting, always try a clean install before assuming a code regression.
 
 ## rtesip Integration
 
