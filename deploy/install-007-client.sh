@@ -349,6 +349,9 @@ if [[ -n "${BOND_ROUTES:-}" ]]; then
     done
 fi
 
+# Clear bond path state — sockets are new after service restart
+rm -f /var/lib/007/bond-paths.state
+
 # Add bond paths for all available interfaces
 /opt/007/add-bond-paths.sh || true
 SETUP_EOF
