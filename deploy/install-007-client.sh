@@ -580,6 +580,20 @@ MOTDEOF
     ok "Login welcome screen created"
 fi
 
+# ─── ARP flux fix ─────────────────────────────────────────────────────────
+# When multiple interfaces share the same subnet (e.g. eth0 + wlan0 on
+# the same home router), Linux's weak host model causes ARP responses
+# from the wrong interface. The router learns the wrong MAC for one IP
+# and delivers all return traffic to a single interface.
+info "Configuring ARP for multi-interface..."
+cat > /etc/sysctl.d/007-arp.conf << EOF
+net.ipv4.conf.all.arp_filter=1
+net.ipv4.conf.all.arp_announce=2
+net.ipv4.conf.all.arp_ignore=1
+EOF
+sysctl -p /etc/sysctl.d/007-arp.conf > /dev/null 2>&1
+ok "ARP multi-interface fix applied"
+
 # ─── Enable and start ────────────────────────────────────────────────────
 info "Enabling and starting services..."
 systemctl enable "$SERVICE_NAME" > /dev/null 2>&1
