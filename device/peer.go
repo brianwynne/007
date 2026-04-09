@@ -224,6 +224,18 @@ func (peer *Peer) SendBuffers(buffers [][]byte) error {
 // The localIP determines which physical interface the traffic exits through.
 // The dest endpoint is the remote address to send to on this path.
 func (peer *Peer) AddBondPath(dest conn.Endpoint, localIP netip.Addr) error {
+	// Idempotent: if a bond path with this local IP already exists, skip.
+	// This allows the management script to always add without clearing,
+	// preserving existing sockets and NAT pinholes.
+	peer.endpoint.Lock()
+	for _, bp := range peer.endpoint.bondPaths {
+		if bp.LocalIP == localIP {
+			peer.endpoint.Unlock()
+			return nil // already exists
+		}
+	}
+	peer.endpoint.Unlock()
+
 	// Create UDP socket bound to the local IP
 	var network string
 	var localAddr *net.UDPAddr
