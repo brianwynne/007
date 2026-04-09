@@ -456,6 +456,13 @@ type discoveredEndpoint struct {
 	lastSeen time.Time
 }
 
+// maxEndpointsPerIP limits how many distinct port mappings we track per
+// unique source IP. A client with N bond paths behind the same NAT will
+// produce N different source ports on the same public IP — we keep the
+// N most recently seen. When NAT ports rotate, old entries are replaced
+// rather than accumulated.
+const maxEndpointsPerIP = 3
+
 func (peer *Peer) SetEndpointFromPacket(endpoint conn.Endpoint) {
 	peer.endpoint.Lock()
 	defer peer.endpoint.Unlock()
@@ -466,23 +473,51 @@ func (peer *Peer) SetEndpointFromPacket(endpoint conn.Endpoint) {
 	peer.endpoint.val = endpoint
 
 	// Track this source address for multi-path send.
-	// When a client sends from eth0 and wlan0, both addresses are
-	// recorded. SendBuffers sends to ALL discovered endpoints.
+	// Key by IP:port so each NAT mapping is a distinct entry, but
+	// cap the number of entries per unique IP to maxEndpointsPerIP.
+	// This prevents accumulation when NAT ports rotate while still
+	// supporting multiple bond paths behind the same NAT.
 	key := endpoint.DstToString()
+	ipKey := endpoint.DstIP().String()
+	now := time.Now()
+
 	if peer.endpoint.discovered == nil {
 		peer.endpoint.discovered = make(map[string]discoveredEndpoint)
 	}
 	peer.endpoint.discovered[key] = discoveredEndpoint{
 		endpoint: endpoint,
-		lastSeen: time.Now(),
+		lastSeen: now,
 	}
 
 	// Evict endpoints not seen in the last 60 seconds
-	now := time.Now()
 	for k, de := range peer.endpoint.discovered {
 		if now.Sub(de.lastSeen) > 60*time.Second {
 			delete(peer.endpoint.discovered, k)
 		}
+	}
+
+	// Cap endpoints per IP: if more than maxEndpointsPerIP entries share
+	// the same source IP, evict the oldest until we're at the limit.
+	for {
+		var sameIPKeys []string
+		for k, de := range peer.endpoint.discovered {
+			if de.endpoint.DstIP().String() == ipKey {
+				sameIPKeys = append(sameIPKeys, k)
+			}
+		}
+		if len(sameIPKeys) <= maxEndpointsPerIP {
+			break
+		}
+		// Find the oldest entry for this IP and remove it
+		oldestKey := sameIPKeys[0]
+		oldestTime := peer.endpoint.discovered[oldestKey].lastSeen
+		for _, k := range sameIPKeys[1:] {
+			if peer.endpoint.discovered[k].lastSeen.Before(oldestTime) {
+				oldestKey = k
+				oldestTime = peer.endpoint.discovered[k].lastSeen
+			}
+		}
+		delete(peer.endpoint.discovered, oldestKey)
 	}
 }
 
