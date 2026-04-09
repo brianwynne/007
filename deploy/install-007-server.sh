@@ -339,7 +339,7 @@ SyslogIdentifier=007-enroll
 NoNewPrivileges=true
 ProtectHome=true
 ProtectSystem=strict
-ReadWritePaths=$CONFIG_DIR/tokens /var/run/wireguard
+ReadWritePaths=$CONFIG_DIR/tokens $CONFIG_DIR/peers /var/run/wireguard
 
 [Install]
 WantedBy=multi-user.target
