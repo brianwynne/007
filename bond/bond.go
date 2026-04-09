@@ -258,6 +258,7 @@ type Manager struct {
 	arqRetransmitMiss atomic.Uint64
 	arqReceived      atomic.Uint64 // retransmissions received from peer
 	arqDeadlineSkip  atomic.Uint64
+	probeCount       int
 
 	// Lifecycle
 	running atomic.Bool
@@ -574,6 +575,33 @@ func (m *Manager) ProcessOutbound(peerID uint32, packet []byte, nonce uint64) []
 // isNonUDP returns true for valid IP packets that are NOT UDP.
 // These bypass the entire bond recovery pipeline (FEC, ARQ, jitter buffer).
 // Only UDP (RTP audio) needs the full recovery chain.
+// isRawIPPacket validates that a packet is a genuine IP packet by checking
+// both the version nibble AND the total length field. This prevents FEC
+// packets from being misclassified when their blockID high byte collides
+// with IPv4/IPv6 version nibbles (e.g. blockID 0x4500 looks like IPv4).
+func isRawIPPacket(pkt []byte) bool {
+	if len(pkt) < 20 {
+		return false
+	}
+	switch pkt[0] >> 4 {
+	case 4:
+		ihl := int(pkt[0] & 0x0F)
+		if ihl < 5 {
+			return false
+		}
+		totalLen := int(pkt[2])<<8 | int(pkt[3])
+		return totalLen == len(pkt)
+	case 6:
+		if len(pkt) < 40 {
+			return false
+		}
+		payloadLen := int(pkt[4])<<8 | int(pkt[5])
+		return payloadLen+40 == len(pkt)
+	default:
+		return false
+	}
+}
+
 // Returns false for non-IP packets, short packets, and UDP — those go
 // through the normal pipeline.
 func isNonUDP(pkt []byte) bool {
@@ -597,6 +625,13 @@ func isNonUDP(pkt []byte) bool {
 // Returns IP packets ready for TUN delivery, or nil if buffered.
 func (m *Manager) ProcessInbound(peerID uint32, packet []byte, nonce uint64, pathID int) [][]byte {
 	m.rxPackets.Add(1)
+	if m.rxPackets.Load()%500 == 1 {
+		hdr := byte(0)
+		if len(packet) > 0 {
+			hdr = packet[0]
+		}
+		m.logger.Info("ProcessInbound sample", "peerID", peerID, "len", len(packet), "hdr", hdr, "nonce", nonce, "pathID", pathID)
+	}
 
 	ps := m.getPeerState(peerID)
 
@@ -611,12 +646,10 @@ func (m *Manager) ProcessInbound(peerID uint32, packet []byte, nonce uint64, pat
 		return m.handleControl(ps, packet, pathID)
 	}
 
-	// Non-FEC packets (TCP, ICMP) bypass the entire recovery pipeline.
-	// These were sent raw by ProcessOutbound (no FEC header).
-	// Raw IP packets start with version nibble 4 (IPv4, min 20 bytes)
-	// or 6 (IPv6, min 40 bytes). FEC packets start with 0x01/0x02
-	// (sliding) or a blockID (block). Control = 0xFF (handled above).
-	if isNonUDP(packet) {
+	// Raw IP packets (TCP, ICMP) bypass the entire recovery pipeline.
+	// Uses strong IP validation to avoid misclassifying FEC packets
+	// whose blockID high byte collides with IPv4 version nibble.
+	if isRawIPPacket(packet) && isNonUDP(packet) {
 		return [][]byte{packet}
 	}
 
@@ -1057,6 +1090,30 @@ func (m *Manager) probeLoop() {
 						w.fn(buildProbePacket(p.PathID))
 					}
 				}
+			}
+
+			// Log jitter buffer stats every 5 probe cycles
+			m.probeCount++
+			if m.probeCount%5 == 0 {
+				m.peersMu.Lock()
+				for _, ps := range m.peers {
+					if ps.jitterBuf != nil {
+						s := ps.jitterBuf.Stats()
+						if s.Delivered > 0 || s.Late > 0 || s.Jumps > 0 {
+							m.logger.Info("jitter stats",
+								"delivered", s.Delivered,
+								"late", s.Late,
+								"jumps", s.Jumps,
+								"misses", s.Misses,
+								"dupes", s.Duplicates,
+								"fec_fills", s.FECFills,
+								"arq_fills", s.ARQFills,
+								"depth_ms", s.DepthMs,
+								"buf_size", s.BufferSize)
+						}
+					}
+				}
+				m.peersMu.Unlock()
 			}
 		}
 	}
