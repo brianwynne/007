@@ -597,6 +597,23 @@ if [ "$ACTION" = "up" ] || [ "$ACTION" = "dhcp4-change" ]; then
 fi
 GARP
     chmod 755 /etc/NetworkManager/dispatcher.d/007-gratuitous-arp
+
+    # Immediate bond path reconfiguration on interface change.
+    # The 30s timer handles steady-state, but IP changes (DHCP renewal,
+    # cable replug, WiFi roam) need immediate bond path update.
+    cat > /etc/NetworkManager/dispatcher.d/007-bond-paths << 'BONDPATHS'
+#!/bin/bash
+IFACE=$1
+ACTION=$2
+# Reconfigure bond paths on any IP-affecting event
+if [ "$ACTION" = "up" ] || [ "$ACTION" = "dhcp4-change" ] || [ "$ACTION" = "down" ]; then
+    # Skip the bond interface itself
+    [ "$IFACE" = "bond0" ] && exit 0
+    # Run in background to not block NetworkManager
+    /opt/007/add-bond-paths.sh > /dev/null 2>&1 &
+fi
+BONDPATHS
+    chmod 755 /etc/NetworkManager/dispatcher.d/007-bond-paths
 fi
 ok "ARP multi-interface fix applied"
 
