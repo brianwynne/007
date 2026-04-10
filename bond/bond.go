@@ -1108,10 +1108,13 @@ func (m *Manager) probeLoop() {
 								"jumps", s.Jumps,
 								"jump_from", s.LastJumpFrom,
 								"jump_to", s.LastJumpTo,
+								"jump_filled", s.LastJumpFilled,
+								"jump_overdue_ms", s.LastJumpOverdue,
 								"misses", s.Misses,
 								"dupes", s.Duplicates,
 								"fec_fills", s.FECFills,
 								"arq_fills", s.ARQFills,
+								"occupancy", s.Occupancy,
 								"depth_ms", s.DepthMs,
 								"buf_size", s.BufferSize)
 						}

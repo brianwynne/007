@@ -57,6 +57,8 @@ type JitterBuffer struct {
 	jumpCount      uint64
 	lastJumpFrom   uint64
 	lastJumpTo     uint64
+	lastJumpFilled int
+	lastJumpOverdue time.Duration
 }
 
 type jitterSlot struct {
@@ -179,6 +181,23 @@ func (jb *JitterBuffer) Insert(data []byte, dataSeq uint64, source packetSource)
 
 	// Too far ahead: sequence jump
 	if dataSeq >= jb.baseSeq+uint64(jb.bufSize) {
+		// Diagnostics: slots filled + time since oldest packet was inserted
+		filled := 0
+		var oldestDeadline time.Time
+		for offset := uint64(0); offset < uint64(jb.bufSize); offset++ {
+			slotIdx := (jb.baseSeq + offset) % maxJitterSlots
+			s := &jb.slots[slotIdx]
+			if s.filled && s.dataSeq == jb.baseSeq+offset {
+				filled++
+				if oldestDeadline.IsZero() || (!s.deadline.IsZero() && s.deadline.Before(oldestDeadline)) {
+					oldestDeadline = s.deadline
+				}
+			}
+		}
+		jb.lastJumpFilled = filled
+		if !oldestDeadline.IsZero() {
+			jb.lastJumpOverdue = now.Sub(oldestDeadline)
+		}
 		jb.handleSequenceJump(dataSeq, now)
 	}
 
@@ -302,6 +321,19 @@ func (jb *JitterBuffer) findNextFilled() uint64 {
 	return 0
 }
 
+// occupancy returns the number of filled slots between baseSeq and writeHead.
+// Must be called with jb.mu held.
+func (jb *JitterBuffer) occupancy() int {
+	count := 0
+	for seq := jb.baseSeq; seq < jb.writeHead; seq++ {
+		idx := seq % maxJitterSlots
+		if jb.slots[idx].filled && jb.slots[idx].dataSeq == seq {
+			count++
+		}
+	}
+	return count
+}
+
 // handleSequenceJump resets the buffer for a large gap.
 func (jb *JitterBuffer) handleSequenceJump(newSeq uint64, now time.Time) {
 	jb.jumpCount++
@@ -365,8 +397,11 @@ type JitterStats struct {
 	FECFills   uint64
 	ARQFills   uint64
 	Jumps        uint64
-	LastJumpFrom uint64
-	LastJumpTo   uint64
+	LastJumpFrom   uint64
+	LastJumpTo     uint64
+	LastJumpFilled  int
+	LastJumpOverdue int64 // ms overdue when jump triggered
+	Occupancy    int   // current slots filled
 	DepthMs      int64
 	BufferSize int
 }
@@ -382,8 +417,11 @@ func (jb *JitterBuffer) Stats() JitterStats {
 		FECFills:   jb.fecFillCount,
 		ARQFills:   jb.arqFillCount,
 		Jumps:        jb.jumpCount,
-		LastJumpFrom: jb.lastJumpFrom,
-		LastJumpTo:   jb.lastJumpTo,
+		LastJumpFrom:   jb.lastJumpFrom,
+		LastJumpTo:     jb.lastJumpTo,
+		LastJumpFilled:  jb.lastJumpFilled,
+		LastJumpOverdue: jb.lastJumpOverdue.Milliseconds(),
+		Occupancy:  jb.occupancy(),
 		DepthMs:    jb.bufferDepth.Milliseconds(),
 		BufferSize: jb.bufSize,
 	}
