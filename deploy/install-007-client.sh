@@ -438,14 +438,15 @@ Type=simple
 User=$SERVICE_USER
 Group=$SERVICE_USER
 EnvironmentFile=$CONFIG_DIR/.env
-ExecStartPre=+/bin/sh -c 'ip link del ${INTERFACE} 2>/dev/null; rm -f /var/run/wireguard/${INTERFACE}.sock; true'
+ExecStartPre=+/bin/sh -c 'rm -f /var/run/wireguard/${INTERFACE}.sock; true'
 # Go runtime tuning — reduce GC frequency, cap memory
 Environment=GOGC=200
 Environment=GOMEMLIMIT=64MiB
 ExecStart=$INSTALL_DIR/007 -f \${INTERFACE}
 ExecStartPost=+$INSTALL_DIR/setup-wg.sh
 ExecReload=/bin/kill -HUP \$MAINPID
-ExecStopPost=+/bin/sh -c 'ip link del ${INTERFACE} 2>/dev/null; rm -f /var/run/wireguard/${INTERFACE}.sock; true'
+# Don't destroy TUN on stop — it's persistent. Only clean up UAPI socket.
+ExecStopPost=+/bin/sh -c 'rm -f /var/run/wireguard/${INTERFACE}.sock; true'
 
 # Restart policy
 Restart=on-failure

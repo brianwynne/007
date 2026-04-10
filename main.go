@@ -181,24 +181,29 @@ func main() {
 
 	tdev, err := func() (tun.Device, error) {
 		tunFdStr := os.Getenv(ENV_WG_TUN_FD)
-		if tunFdStr == "" {
-			return tun.CreateTUN(interfaceName, device.DefaultMTU)
+		if tunFdStr != "" {
+			// construct tun device from supplied fd
+			fd, err := strconv.ParseUint(tunFdStr, 10, 32)
+			if err != nil {
+				return nil, err
+			}
+			err = unix.SetNonblock(int(fd), true)
+			if err != nil {
+				return nil, err
+			}
+			file := os.NewFile(uintptr(fd), "")
+			return tun.CreateTUNFromFile(file, device.DefaultMTU)
 		}
 
-		// construct tun device from supplied fd
-
-		fd, err := strconv.ParseUint(tunFdStr, 10, 32)
-		if err != nil {
-			return nil, err
+		// Check if TUN already exists (persistent from previous run).
+		// Reattach without destroying it — preserves IP, routes, connections.
+		if _, err := os.Stat(fmt.Sprintf("/sys/class/net/%s", interfaceName)); err == nil {
+			fmt.Printf("Reattaching to persistent TUN %s\n", interfaceName)
+			return tun.OpenTUN(interfaceName)
 		}
 
-		err = unix.SetNonblock(int(fd), true)
-		if err != nil {
-			return nil, err
-		}
-
-		file := os.NewFile(uintptr(fd), "")
-		return tun.CreateTUNFromFile(file, device.DefaultMTU)
+		// First run — create new persistent TUN
+		return tun.CreateTUN(interfaceName, device.DefaultMTU)
 	}()
 
 	if err == nil {

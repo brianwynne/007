@@ -569,6 +569,14 @@ func CreateTUN(name string, mtu int) (Device, error) {
 		return nil, err
 	}
 
+	// Make TUN persistent — survives process exit so connections above
+	// (SIP TLS, SSH) are preserved across bond service restarts.
+	_, _, errno := syscall.Syscall(syscall.SYS_IOCTL, uintptr(nfd), uintptr(0x400454cb), 1) // TUNSETPERSIST
+	if errno != 0 {
+		unix.Close(nfd)
+		return nil, fmt.Errorf("TUNSETPERSIST failed: %v", errno)
+	}
+
 	err = unix.SetNonblock(nfd, true)
 	if err != nil {
 		unix.Close(nfd)
@@ -580,6 +588,39 @@ func CreateTUN(name string, mtu int) (Device, error) {
 	fd := os.NewFile(uintptr(nfd), cloneDevicePath)
 	return CreateTUNFromFile(fd, mtu)
 }
+
+// OpenTUN reattaches to an existing persistent TUN device.
+// The interface must already exist with its IP and routes configured.
+// Used for graceful restart — preserves all connections above the tunnel.
+func OpenTUN(name string) (Device, error) {
+	nfd, err := unix.Open(cloneDevicePath, unix.O_RDWR|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return nil, err
+	}
+
+	ifr, err := unix.NewIfreq(name)
+	if err != nil {
+		unix.Close(nfd)
+		return nil, err
+	}
+	ifr.SetUint16(unix.IFF_TUN | unix.IFF_NO_PI | unix.IFF_VNET_HDR)
+	err = unix.IoctlIfreq(nfd, unix.TUNSETIFF, ifr)
+	if err != nil {
+		unix.Close(nfd)
+		return nil, fmt.Errorf("OpenTUN(%q) failed — interface may not exist: %v", name, err)
+	}
+
+	err = unix.SetNonblock(nfd, true)
+	if err != nil {
+		unix.Close(nfd)
+		return nil, err
+	}
+
+	fd := os.NewFile(uintptr(nfd), cloneDevicePath)
+	return CreateTUNFromFile(fd, DefaultMTU)
+}
+
+const DefaultMTU = 1420
 
 // CreateTUNFromFile creates a Device from an os.File with the provided MTU.
 func CreateTUNFromFile(file *os.File, mtu int) (Device, error) {

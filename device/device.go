@@ -432,7 +432,10 @@ func (device *Device) Close() {
 	device.state.state.Store(uint32(deviceStateClosed))
 	device.log.Verbosef("Device closing")
 
-	device.tun.device.Close()
+	// Don't close the TUN device — it's persistent.
+	// Closing it would destroy the interface (IP, routes, connections).
+	// The TUN fd is released when the process exits, but the kernel
+	// keeps the persistent interface alive.
 	device.downLocked()
 
 	// Remove peers before closing queues,
