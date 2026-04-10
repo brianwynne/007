@@ -55,6 +55,8 @@ type JitterBuffer struct {
 	fecFillCount   uint64
 	arqFillCount   uint64
 	jumpCount      uint64
+	lastJumpFrom   uint64
+	lastJumpTo     uint64
 }
 
 type jitterSlot struct {
@@ -303,6 +305,8 @@ func (jb *JitterBuffer) findNextFilled() uint64 {
 // handleSequenceJump resets the buffer for a large gap.
 func (jb *JitterBuffer) handleSequenceJump(newSeq uint64, now time.Time) {
 	jb.jumpCount++
+	jb.lastJumpFrom = jb.baseSeq
+	jb.lastJumpTo = newSeq
 	jb.baseSeq = newSeq
 	jb.writeHead = newSeq
 	for i := range jb.slots {
@@ -360,8 +364,10 @@ type JitterStats struct {
 	Misses     uint64
 	FECFills   uint64
 	ARQFills   uint64
-	Jumps      uint64
-	DepthMs    int64
+	Jumps        uint64
+	LastJumpFrom uint64
+	LastJumpTo   uint64
+	DepthMs      int64
 	BufferSize int
 }
 
@@ -375,7 +381,9 @@ func (jb *JitterBuffer) Stats() JitterStats {
 		Misses:     jb.missCount,
 		FECFills:   jb.fecFillCount,
 		ARQFills:   jb.arqFillCount,
-		Jumps:      jb.jumpCount,
+		Jumps:        jb.jumpCount,
+		LastJumpFrom: jb.lastJumpFrom,
+		LastJumpTo:   jb.lastJumpTo,
 		DepthMs:    jb.bufferDepth.Milliseconds(),
 		BufferSize: jb.bufSize,
 	}

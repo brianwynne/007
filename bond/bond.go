@@ -1106,6 +1106,8 @@ func (m *Manager) probeLoop() {
 								"delivered", s.Delivered,
 								"late", s.Late,
 								"jumps", s.Jumps,
+								"jump_from", s.LastJumpFrom,
+								"jump_to", s.LastJumpTo,
 								"misses", s.Misses,
 								"dupes", s.Duplicates,
 								"fec_fills", s.FECFills,
