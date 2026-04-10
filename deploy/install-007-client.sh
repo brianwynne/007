@@ -580,6 +580,24 @@ net.ipv4.conf.all.arp_announce=2
 net.ipv4.conf.all.arp_ignore=1
 EOF
 sysctl -p /etc/sysctl.d/007-arp.conf > /dev/null 2>&1
+
+# Gratuitous ARP on link-up: when eth0 is unplugged and replugged while
+# wlan0 is on the same subnet, the router's ARP cache goes stale.
+# This dispatcher script sends a gratuitous ARP to update it.
+if [ -d /etc/NetworkManager/dispatcher.d ]; then
+    cat > /etc/NetworkManager/dispatcher.d/007-gratuitous-arp << 'GARP'
+#!/bin/bash
+IFACE=$1
+ACTION=$2
+if [ "$ACTION" = "up" ] || [ "$ACTION" = "dhcp4-change" ]; then
+    IP=$(ip -4 addr show "$IFACE" | grep -oP 'inet \K[0-9.]+' | head -1)
+    if [ -n "$IP" ]; then
+        arping -c 3 -A -I "$IFACE" "$IP" > /dev/null 2>&1 &
+    fi
+fi
+GARP
+    chmod 755 /etc/NetworkManager/dispatcher.d/007-gratuitous-arp
+fi
 ok "ARP multi-interface fix applied"
 
 # ─── Enable and start ────────────────────────────────────────────────────

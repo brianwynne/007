@@ -590,13 +590,15 @@ func isRawIPPacket(pkt []byte) bool {
 			return false
 		}
 		totalLen := int(pkt[2])<<8 | int(pkt[3])
-		return totalLen == len(pkt)
+		// totalLen must be valid (>= 20 byte header) and not exceed packet.
+		// Use <= because WireGuard may pad packets for privacy.
+		return totalLen >= 20 && totalLen <= len(pkt)
 	case 6:
 		if len(pkt) < 40 {
 			return false
 		}
 		payloadLen := int(pkt[4])<<8 | int(pkt[5])
-		return payloadLen+40 == len(pkt)
+		return payloadLen+40 >= 40 && payloadLen+40 <= len(pkt)
 	default:
 		return false
 	}
@@ -647,8 +649,8 @@ func (m *Manager) ProcessInbound(peerID uint32, packet []byte, nonce uint64, pat
 	}
 
 	// Raw IP packets (TCP, ICMP) bypass the entire recovery pipeline.
-	// Uses strong IP validation to avoid misclassifying FEC packets
-	// whose blockID high byte collides with IPv4 version nibble.
+	// Uses IP total length validation to distinguish raw IP from FEC packets
+	// whose blockID can collide with IPv4 version nibble (block FEC).
 	if isRawIPPacket(packet) && isNonUDP(packet) {
 		return [][]byte{packet}
 	}
