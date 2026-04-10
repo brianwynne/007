@@ -399,16 +399,18 @@ fi
 SERVER_PUB_HEX=$(cat "$CONFIG_DIR/server.pub" | base64 -d | xxd -p -c 32)
 UAPI_CMD="set=1\npublic_key=${SERVER_PUB_HEX}\nclear_bond_endpoints=true\n"
 
+IDX=0
 while IFS=: read -r iface local_ip; do
     [[ -z "$iface" ]] && continue
+    IDX=$((IDX + 1))
     echo "  Bond path: $iface ($local_ip) -> ${SERVER_IP_SAVED}:${SERVER_PORT}"
     UAPI_CMD="${UAPI_CMD}bond_endpoint=${SERVER_IP_SAVED}:${SERVER_PORT}@${local_ip}\n"
 
-    # Policy routing
-    TABLE=$((100 + COUNT))
+    # Policy routing — each interface gets its own table
+    TABLE=$((100 + IDX))
     GW=$(ip route show default dev "$iface" 2>/dev/null | awk '{print $3}' | head -1)
     if [[ -n "$GW" ]]; then
-        ip rule add from "$local_ip" table "$TABLE" prio $((32700 + COUNT)) 2>/dev/null || true
+        ip rule add from "$local_ip" table "$TABLE" prio $((32700 + IDX)) 2>/dev/null || true
         ip route replace default via "$GW" dev "$iface" table "$TABLE" 2>/dev/null || true
         ip route replace "${local_ip%.*}.0/24" dev "$iface" scope link table "$TABLE" 2>/dev/null || true
     fi
