@@ -356,6 +356,13 @@ func main() {
 					logger.Verbosef("Reloaded preset: %s", preset)
 				}
 			}
+			// FEC mode change
+			fecMode := os.Getenv("BOND_FEC_MODE")
+			if fecMode != "" {
+				if err := bondMgr.SetFECMode(fecMode); err != nil {
+					logger.Errorf("Reload FEC mode failed: %v", err)
+				}
+			}
 			logger.Verbosef("Config reload complete")
 		}
 	}()

@@ -458,7 +458,8 @@ func (m *Manager) SetPreset(name string) error {
 		"latency_budget_ms", cfg.LatencyBudgetMs,
 		"jitter_depth_ms", depthMs)
 
-	// Signal peers so they change their jitter buffer for us
+	// Signal peers to change their preset
+
 	m.peersMu.Lock()
 	peerCount := len(m.peers)
 	sentCount := 0
@@ -474,6 +475,55 @@ func (m *Manager) SetPreset(name string) error {
 	m.peersMu.Unlock()
 	m.logger.Info("preset signalled", "peers", peerCount, "sent", sentCount)
 
+	return nil
+}
+
+// SetFECMode changes the FEC mode (sliding/block) at runtime.
+// Swaps encoders and decoders on all existing peers without restart.
+func (m *Manager) SetFECMode(mode string) error {
+	if mode != "sliding" && mode != "block" {
+		return fmt.Errorf("unknown FEC mode: %s (use sliding or block)", mode)
+	}
+	if mode == m.config.FECMode {
+		return nil // no change
+	}
+
+	oldMode := m.config.FECMode
+	m.config.FECMode = mode
+
+	m.peersMu.Lock()
+	for id, ps := range m.peers {
+		switch mode {
+		case "sliding":
+			// Clear block FEC
+			ps.encoder = nil
+			ps.decoder = nil
+			// Create sliding FEC
+			ps.slidingEnc = NewSlidingFECEncoder(m.config.SlidingWindowSize)
+			ps.slidingDec = NewSlidingFECDecoder(DefaultMaxRepairs, DefaultRepairMaxAge)
+			m.logger.Info("switched to sliding FEC", "peer", id)
+		case "block":
+			// Clear sliding FEC
+			ps.slidingEnc = nil
+			ps.slidingDec = nil
+			// Create block FEC
+			enc, err := NewFECEncoder(m.config)
+			if err != nil {
+				m.logger.Error("failed to create block FEC encoder", "peer", id, "err", err)
+				continue
+			}
+			ps.encoder = enc
+			blockTimeout := m.config.FECBlockTimeoutMs
+			if blockTimeout <= 0 {
+				blockTimeout = m.config.FECLowK*m.config.PacketIntervalMs + 50
+			}
+			ps.decoder = NewFECDecoder(blockTimeout, 256)
+			m.logger.Info("switched to block FEC", "peer", id)
+		}
+	}
+	m.peersMu.Unlock()
+
+	m.logger.Info("FEC mode changed", "from", oldMode, "to", mode)
 	return nil
 }
 
