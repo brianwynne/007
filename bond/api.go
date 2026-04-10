@@ -9,8 +9,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"os"
 	"strings"
 	"time"
+
+	"golang.org/x/sys/unix"
 )
 
 // API provides a REST management interface for monitoring and controlling
@@ -47,6 +50,7 @@ func NewAPI(mgr *Manager, listenAddr, apiKey string) *API {
 	mux.HandleFunc("/api/paths", a.auth(a.handlePaths))
 	mux.HandleFunc("/api/config", a.auth(a.handleConfig))
 	mux.HandleFunc("/api/preset", a.auth(a.handlePreset))
+	mux.HandleFunc("/api/reload", a.auth(a.handleReload))
 	mux.HandleFunc("/api/health", a.handleHealth) // health check unauthenticated
 
 	a.server = &http.Server{
@@ -254,6 +258,24 @@ func (a *API) handlePreset(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, map[string]string{"status": "ok", "preset": req.Preset})
+}
+
+func (a *API) handleReload(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	// Send SIGHUP to self to trigger config reload
+	p, err := os.FindProcess(os.Getpid())
+	if err != nil {
+		writeJSON(w, map[string]string{"error": err.Error()})
+		return
+	}
+	if err := p.Signal(unix.SIGHUP); err != nil {
+		writeJSON(w, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, map[string]string{"status": "ok", "message": "config reload triggered"})
 }
 
 func (a *API) handleHealth(w http.ResponseWriter, r *http.Request) {

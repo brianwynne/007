@@ -444,6 +444,7 @@ Environment=GOGC=200
 Environment=GOMEMLIMIT=64MiB
 ExecStart=$INSTALL_DIR/007 -f \${INTERFACE}
 ExecStartPost=+$INSTALL_DIR/setup-wg.sh
+ExecReload=/bin/kill -HUP \$MAINPID
 ExecStopPost=+/bin/sh -c 'ip link del ${INTERFACE} 2>/dev/null; rm -f /var/run/wireguard/${INTERFACE}.sock; true'
 
 # Restart policy

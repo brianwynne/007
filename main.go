@@ -8,12 +8,14 @@
 package main
 
 import (
+	"bufio"
 	"fmt"
 	"log"
 	"os"
 	"os/signal"
 	"runtime"
 	"strconv"
+	"strings"
 
 	"golang.org/x/sys/unix"
 	"golang.zx2c4.com/wireguard/bond"
@@ -60,6 +62,64 @@ func printUsage() {
 	fmt.Printf("  GET /api/paths      Per-path health (RTT, loss, jitter)\n")
 	fmt.Printf("  GET /api/config     Current configuration\n")
 	fmt.Printf("  GET /api/health     Health check\n")
+	fmt.Printf("  POST /api/reload    Reload config from /etc/007/.env\n")
+}
+
+// loadEnvFile reads a KEY=VALUE environment file and returns the values as a map.
+func loadEnvFile(path string) map[string]string {
+	env := make(map[string]string)
+	f, err := os.Open(path)
+	if err != nil {
+		return env
+	}
+	defer f.Close()
+	scanner := bufio.NewScanner(f)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		parts := strings.SplitN(line, "=", 2)
+		if len(parts) == 2 {
+			env[parts[0]] = parts[1]
+		}
+	}
+	return env
+}
+
+// loadBondConfig builds a bond.Config from environment variables.
+func loadBondConfig() bond.Config {
+	var cfg bond.Config
+	switch os.Getenv("BOND_PRESET") {
+	case "broadcast":
+		cfg = bond.BroadcastPreset()
+	case "studio":
+		cfg = bond.StudioPreset()
+	case "field":
+		cfg = bond.FieldPreset()
+	default:
+		cfg = bond.DefaultConfig()
+	}
+	if os.Getenv("BOND_FEC") == "0" {
+		cfg.FECEnabled = false
+	}
+	if os.Getenv("BOND_FEC_MODE") == "sliding" {
+		cfg.FECMode = "sliding"
+	}
+	if os.Getenv("BOND_JITTER") == "0" {
+		cfg.JitterEnabled = false
+		cfg.ReorderEnabled = true
+		cfg.ReorderBufSize = 64
+		cfg.ReorderWindowMs = 80
+		cfg.ReorderMinMs = 20
+		cfg.ReorderMaxMs = 200
+		cfg.ReorderFlushMs = 10
+		cfg.ReorderAdaptSec = 1
+	}
+	if os.Getenv("BOND_REORDER") == "0" {
+		cfg.ReorderEnabled = false
+	}
+	return cfg
 }
 
 func main() {
@@ -233,39 +293,7 @@ func main() {
 	dev := device.NewDevice(tdev, conn.NewDefaultBind(), logger)
 
 	// 007 Bond: Create and attach bond manager
-	// Preset selects base configuration; individual BOND_* vars override.
-	var bondCfg bond.Config
-	switch os.Getenv("BOND_PRESET") {
-	case "broadcast":
-		bondCfg = bond.BroadcastPreset() // 40ms latency, K=2 M=2
-	case "studio":
-		bondCfg = bond.StudioPreset() // 80ms latency, K=2 M=2
-	case "field":
-		bondCfg = bond.FieldPreset() // 200ms latency, K=2 M=4
-	default:
-		bondCfg = bond.DefaultConfig() // field preset
-	}
-	// Allow disabling bond features via environment
-	if os.Getenv("BOND_FEC") == "0" {
-		bondCfg.FECEnabled = false
-	}
-	if os.Getenv("BOND_FEC_MODE") == "sliding" {
-		bondCfg.FECMode = "sliding"
-	}
-	if os.Getenv("BOND_JITTER") == "0" {
-		bondCfg.JitterEnabled = false
-		bondCfg.ReorderEnabled = true
-		bondCfg.ReorderBufSize = 64
-		bondCfg.ReorderWindowMs = 80
-		bondCfg.ReorderMinMs = 20
-		bondCfg.ReorderMaxMs = 200
-		bondCfg.ReorderFlushMs = 10
-		bondCfg.ReorderAdaptSec = 1
-	}
-	// BOND_REORDER last — overrides any fallback enabling above
-	if os.Getenv("BOND_REORDER") == "0" {
-		bondCfg.ReorderEnabled = false
-	}
+	bondCfg := loadBondConfig()
 	bondLogger := bond.NewStdLogger(log.New(os.Stderr, fmt.Sprintf("(%s) ", interfaceName), log.LstdFlags))
 	bondMgr, err := bond.NewManager(bondCfg, bondLogger)
 	if err != nil {
@@ -307,6 +335,30 @@ func main() {
 	}()
 
 	logger.Verbosef("UAPI listener started")
+
+	// SIGHUP: reload config without restart
+	reload := make(chan os.Signal, 1)
+	signal.Notify(reload, unix.SIGHUP)
+	go func() {
+		for range reload {
+			logger.Verbosef("SIGHUP received, reloading config...")
+			// Re-read env file into process environment
+			envFile := "/etc/007/.env"
+			for k, v := range loadEnvFile(envFile) {
+				os.Setenv(k, v)
+			}
+			// Apply new preset
+			preset := os.Getenv("BOND_PRESET")
+			if preset != "" {
+				if err := bondMgr.SetPreset(preset); err != nil {
+					logger.Errorf("Reload preset failed: %v", err)
+				} else {
+					logger.Verbosef("Reloaded preset: %s", preset)
+				}
+			}
+			logger.Verbosef("Config reload complete")
+		}
+	}()
 
 	// wait for program to terminate
 
