@@ -48,14 +48,26 @@ func NewAPI(mgr *Manager, listenAddr, apiKey string) *API {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/stats", a.auth(a.handleStats))
 	mux.HandleFunc("/api/paths", a.auth(a.handlePaths))
-	mux.HandleFunc("/api/config", a.auth(a.handleConfig))
-	mux.HandleFunc("/api/preset", a.auth(a.handlePreset))
+	mux.HandleFunc("/api/config", a.handleConfig) // unauthenticated — LAN-only device
+	mux.HandleFunc("/api/preset", a.handlePreset) // unauthenticated — LAN-only device
 	mux.HandleFunc("/api/reload", a.auth(a.handleReload))
-	mux.HandleFunc("/api/health", a.handleHealth) // health check unauthenticated
+	mux.HandleFunc("/api/health", a.handleHealth)
+
+	// CORS wrapper — frontend on port 80 calls bond API on port 8007
+	corsHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, X-API-Key")
+		if r.Method == "OPTIONS" {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		mux.ServeHTTP(w, r)
+	})
 
 	a.server = &http.Server{
 		Addr:         listenAddr,
-		Handler:      mux,
+		Handler:      corsHandler,
 		ReadTimeout:  5 * time.Second,
 		WriteTimeout: 5 * time.Second,
 	}
@@ -213,9 +225,13 @@ func (a *API) handlePaths(w http.ResponseWriter, r *http.Request) {
 }
 
 type configResponse struct {
-	FECEnabled     bool `json:"fec_enabled"`
-	FECAdaptive    bool `json:"fec_adaptive"`
-	ReorderEnabled bool `json:"reorder_enabled"`
+	Preset          string `json:"preset"`
+	FECEnabled      bool   `json:"fec_enabled"`
+	FECMode         string `json:"fec_mode"`
+	FECAdaptive     bool   `json:"fec_adaptive"`
+	JitterEnabled   bool   `json:"jitter_enabled"`
+	ReorderEnabled  bool   `json:"reorder_enabled"`
+	LatencyBudgetMs int    `json:"latency_budget_ms"`
 }
 
 func (a *API) handleConfig(w http.ResponseWriter, r *http.Request) {
@@ -224,10 +240,25 @@ func (a *API) handleConfig(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Derive preset name from latency budget
+	preset := "custom"
+	switch a.mgr.config.LatencyBudgetMs {
+	case 40:
+		preset = "broadcast"
+	case 80:
+		preset = "studio"
+	case 200:
+		preset = "field"
+	}
+
 	resp := configResponse{
-		FECEnabled:     a.mgr.config.FECEnabled,
-		FECAdaptive:    a.mgr.config.FECAdaptive,
-		ReorderEnabled: a.mgr.config.ReorderEnabled,
+		Preset:          preset,
+		FECEnabled:      a.mgr.config.FECEnabled,
+		FECMode:         a.mgr.config.FECMode,
+		FECAdaptive:     a.mgr.config.FECAdaptive,
+		JitterEnabled:   a.mgr.config.JitterEnabled,
+		ReorderEnabled:  a.mgr.config.ReorderEnabled,
+		LatencyBudgetMs: a.mgr.config.LatencyBudgetMs,
 	}
 
 	writeJSON(w, resp)
@@ -239,6 +270,7 @@ func (a *API) handlePreset(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, map[string]interface{}{
 			"preset":            s.Preset,
 			"latency_budget_ms": s.LatencyBudgetMs,
+			"fec_mode":          a.mgr.config.FECMode,
 		})
 		return
 	}
@@ -247,17 +279,26 @@ func (a *API) handlePreset(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req struct {
-		Preset string `json:"preset"`
+		Preset  string `json:"preset"`
+		FECMode string `json:"fec_mode"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, "invalid JSON", http.StatusBadRequest)
 		return
 	}
-	if err := a.mgr.SetPreset(req.Preset); err != nil {
-		writeJSON(w, map[string]string{"error": err.Error()})
-		return
+	if req.Preset != "" {
+		if err := a.mgr.SetPreset(req.Preset); err != nil {
+			writeJSON(w, map[string]string{"error": err.Error()})
+			return
+		}
 	}
-	writeJSON(w, map[string]string{"status": "ok", "preset": req.Preset})
+	if req.FECMode != "" {
+		if err := a.mgr.SetFECMode(req.FECMode); err != nil {
+			writeJSON(w, map[string]string{"error": err.Error()})
+			return
+		}
+	}
+	writeJSON(w, map[string]string{"status": "ok"})
 }
 
 func (a *API) handleReload(w http.ResponseWriter, r *http.Request) {
