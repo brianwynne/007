@@ -11,9 +11,8 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"syscall"
 	"time"
-
-	"golang.org/x/sys/unix"
 )
 
 // API provides a REST management interface for monitoring and controlling
@@ -306,13 +305,12 @@ func (a *API) handleReload(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	// Send SIGHUP to self to trigger config reload
 	p, err := os.FindProcess(os.Getpid())
 	if err != nil {
 		writeJSON(w, map[string]string{"error": err.Error()})
 		return
 	}
-	if err := p.Signal(unix.SIGHUP); err != nil {
+	if err := p.Signal(syscall.SIGHUP); err != nil {
 		writeJSON(w, map[string]string{"error": err.Error()})
 		return
 	}
