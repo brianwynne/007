@@ -209,7 +209,19 @@ func (jb *JitterBuffer) Insert(data []byte, dataSeq uint64, source packetSource)
 		if !oldestDeadline.IsZero() {
 			jb.lastJumpOverdue = now.Sub(oldestDeadline)
 		}
-		jb.handleSequenceJump(dataSeq, now)
+
+		if filled == 0 {
+			// Buffer is idle (fully drained) — this is a resumption after
+			// a gap (between calls, or CPU scheduling stall). Reset silently
+			// without counting a jump so pjsua doesn't see phantom loss.
+			jb.baseSeq = dataSeq
+			jb.writeHead = dataSeq
+			for i := range jb.slots {
+				jb.slots[i] = jitterSlot{}
+			}
+		} else {
+			jb.handleSequenceJump(dataSeq, now)
+		}
 	}
 
 	idx := dataSeq % maxJitterSlots
