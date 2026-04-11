@@ -117,6 +117,7 @@ func TestManager_ProcessInbound_WithReorder(t *testing.T) {
 
 func TestManager_PerPeerIsolation(t *testing.T) {
 	cfg := DefaultConfig()
+	cfg.FECMode = "block" // test uses block FEC K+M packet count
 	cfg.JitterEnabled = false
 	cfg.ReorderEnabled = false
 	cfg.FECLowK = 8
