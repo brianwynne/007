@@ -44,6 +44,7 @@ type JitterBuffer struct {
 
 	// Delivery callback
 	deliverFunc func([]byte)
+	deliverBuf  [][]byte // reusable buffer for lock-free delivery
 
 	// Early NACK
 	earlyNACK []uint64
@@ -125,6 +126,7 @@ func NewJitterBuffer(cfg JitterConfig) *JitterBuffer {
 		packetInterval: cfg.PacketInterval,
 		tickInterval:   time.Millisecond, // check every 1ms for playable packets
 		deliverFunc:    cfg.DeliverFunc,
+		deliverBuf:     make([][]byte, 0, bufSize),
 		stopCh:       make(chan struct{}),
 	}
 }
@@ -281,9 +283,8 @@ func (jb *JitterBuffer) playoutLoop() {
 // the lock so Insert() is never blocked by TUN write latency.
 func (jb *JitterBuffer) playoutReady() {
 	// Phase 1: collect deliverable packets under lock
-	var toDeliver [][]byte
-
 	jb.mu.Lock()
+	toDeliver := jb.deliverBuf[:0] // reuse pre-allocated slice
 
 	if !jb.initialized {
 		jb.mu.Unlock()
@@ -335,6 +336,7 @@ func (jb *JitterBuffer) playoutReady() {
 		}
 	}
 
+	jb.deliverBuf = toDeliver // save for reuse (may have grown)
 	jb.mu.Unlock()
 
 	// Phase 2: deliver outside lock — TUN writes don't block Insert()
