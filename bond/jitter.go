@@ -277,11 +277,16 @@ func (jb *JitterBuffer) playoutLoop() {
 }
 
 // playoutReady delivers all packets whose deadline has passed.
+// Collects deliverable packets under the lock, then delivers outside
+// the lock so Insert() is never blocked by TUN write latency.
 func (jb *JitterBuffer) playoutReady() {
+	// Phase 1: collect deliverable packets under lock
+	var toDeliver [][]byte
+
 	jb.mu.Lock()
-	defer jb.mu.Unlock()
 
 	if !jb.initialized {
+		jb.mu.Unlock()
 		return
 	}
 
@@ -302,9 +307,9 @@ func (jb *JitterBuffer) playoutReady() {
 			if slot.data != nil && now.Before(slot.deadline) {
 				break // not time yet
 			}
-			// Deliver (skip nil data slots — they were bypassed packets)
-			if jb.deliverFunc != nil && slot.data != nil {
-				jb.deliverFunc(slot.data)
+			// Collect for delivery (skip nil data slots — they were bypassed packets)
+			if slot.data != nil {
+				toDeliver = append(toDeliver, slot.data)
 				jb.deliveredCount++
 			}
 			slot.data = nil
@@ -327,6 +332,15 @@ func (jb *JitterBuffer) playoutReady() {
 			// Next packet is past deadline — this gap is genuine loss
 			jb.missCount++
 			jb.baseSeq++
+		}
+	}
+
+	jb.mu.Unlock()
+
+	// Phase 2: deliver outside lock — TUN writes don't block Insert()
+	if jb.deliverFunc != nil {
+		for _, pkt := range toDeliver {
+			jb.deliverFunc(pkt)
 		}
 	}
 }
